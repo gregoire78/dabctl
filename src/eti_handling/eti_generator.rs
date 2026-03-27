@@ -1,5 +1,7 @@
 // ETI Generator - converted from eti-generator.cpp (eti-cmdline)
 
+use tracing::warn;
+
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -178,7 +180,6 @@ impl EtiGenerator {
     }
 
     pub fn start_processing(&self) {
-        eprintln!("yes, here we go");
         self.processing.store(true, Ordering::SeqCst);
     }
 
@@ -254,7 +255,7 @@ impl EtiGenerator {
             };
 
             if blkno != expected_block {
-                eprintln!("got {}, expected {}", blkno, expected_block);
+                warn!("got {}, expected {}", blkno, expected_block);
                 expected_block = 2;
                 index_out = 0;
                 amount = 0;

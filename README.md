@@ -204,25 +204,31 @@ eti-rtlsdr-rust [OPTIONS]
 ### Recevoir et sauvegarder un fichier ETI
 
 ```bash
-./target/release/eti-rtlsdr-rust -C 11C -G 80 -O "11C_$(date +%F_%H%M).eti"
+sudo ./target/release/eti-rtlsdr-rust -C 6C -G 20 -O "6C_$(date +%F_%H%M).eti"
 ```
 
 ### Pipeline vers dablin
 
 ```bash
-./target/release/eti-rtlsdr-rust -S -C 11C -G 80 | dablin_gtk -L
+sudo ./target/release/eti-rtlsdr-rust -S -C 6C -G 20 | dablin_gtk -L
 ```
 
 ### dablin CLI avec sélection de service
 
 ```bash
-./target/release/eti-rtlsdr-rust -S -C 11C -G 80 | dablin -F -s 0xF221 -p
+sudo ./target/release/eti-rtlsdr-rust -S -C 6C -G 20 | dablin -F -s 0xF2F8 -p
 ```
 
 ### Enregistrement limité à 60 secondes
 
 ```bash
-./target/release/eti-rtlsdr-rust -C 5A -G 70 -t 60 -O capture.eti
+sudo ./target/release/eti-rtlsdr-rust -C 6C -G 20 -t 60 -O capture.eti
+```
+
+### Exporter en WAV (via dablin)
+
+```bash
+sudo ./target/release/eti-rtlsdr-rust -S -C 6C -G 20 -t 15 | dablin -s 0xF2F8 -w > output.wav
 ```
 
 ### Test fonctionnel automatisé
@@ -298,10 +304,10 @@ Le fichier ETI peut être relu plus tard avec dablin sans le dongle.
 
 ```bash
 # Écouter un programme spécifique (ex: NRJ, SID 0xF2F8)
-./eti-rtlsdr-rust.sh -S -C 6C -G 20 | dablin -s 0xF2F8
+sudo ./target/release/eti-rtlsdr-rust -S -C 6C -G 20 | dablin -s 0xF2F8
 
 # Ou avec l'interface graphique (sélection visuelle du programme)
-./eti-rtlsdr-rust.sh -S -C 6C -G 20 | dablin_gtk
+sudo ./target/release/eti-rtlsdr-rust -S -C 6C -G 20 | dablin_gtk
 ```
 
 > **Astuce** : lancez d'abord sans `-S` pour voir les SID des programmes disponibles dans stderr, puis relancez avec `-S` et `-s 0xSID`.

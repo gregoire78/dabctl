@@ -6,6 +6,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use tracing::{info, warn};
 
 const READLEN_DEFAULT: u32 = 8192;
 const INPUT_RATE: u32 = 2048000;
@@ -62,7 +63,7 @@ impl RtlsdrHandler {
             }
 
             let actual_rate = rtlsdr_sys::rtlsdr_get_sample_rate(device);
-            eprintln!("samplerate set to {}", actual_rate);
+            info!("samplerate set to {}", actual_rate);
 
             rtlsdr_sys::rtlsdr_set_tuner_gain_mode(device, 0);
 
@@ -70,19 +71,16 @@ impl RtlsdrHandler {
             let mut gains = vec![0i32; gains_count as usize];
             rtlsdr_sys::rtlsdr_get_tuner_gains(device, gains.as_mut_ptr());
 
-            eprint!("Supported gain values ({}): ", gains_count);
-            for g in &gains {
-                eprint!("{}.{} ", g / 10, g % 10);
-            }
-            eprintln!();
+            let gains_str: Vec<String> = gains.iter().map(|g| format!("{}.{}", g / 10, g % 10)).collect();
+            info!("Supported gain values ({}): {}", gains_count, gains_str.join(" "));
 
             if ppm_offset != 0 {
                 let r = rtlsdr_sys::rtlsdr_set_freq_correction(device, ppm_offset);
                 if r == 0 {
                     let corr = rtlsdr_sys::rtlsdr_get_freq_correction(device);
-                    eprintln!("Frequency correction set to {} ppm", corr);
+                    info!("Frequency correction set to {} ppm", corr);
                 } else {
-                    eprintln!("Setting frequency correction failed");
+                    warn!("Setting frequency correction failed");
                 }
             }
 
@@ -94,11 +92,7 @@ impl RtlsdrHandler {
             let effective_gain = gains[gain_index.min(gains.len() - 1)];
             let set_index = (gain as usize * gains_count as usize) / 100;
             let set_gain = gains[set_index.min(gains.len() - 1)];
-            eprintln!(
-                "effective gain: {}.{}",
-                set_gain / 10,
-                set_gain % 10
-            );
+            info!("effective gain: {}.{}", set_gain / 10, set_gain % 10);
             rtlsdr_sys::rtlsdr_set_tuner_gain(device, set_gain);
 
             Ok(RtlsdrHandler {

@@ -2,6 +2,43 @@
 
 use crate::dab_constants::*;
 
+/// Convert EBU Latin charset byte to UTF-8 char (EN 300 401, Table 1)
+fn ebu_to_char(ch: u8) -> char {
+    // EBU Latin differs from ISO 8859-1 in the 0x80..0xFF range
+    static EBU_TABLE: [char; 128] = [
+        // 0x80..0x8F
+        '\u{00E1}', '\u{00E0}', '\u{00E9}', '\u{00E8}', '\u{00ED}', '\u{00EC}', '\u{00F3}', '\u{00F2}',
+        '\u{00FA}', '\u{00F9}', '\u{00D1}', '\u{00C7}', '\u{015E}', '\u{00DF}', '\u{00A1}', '\u{0132}',
+        // 0x90..0x9F
+        '\u{00E2}', '\u{00E4}', '\u{00EA}', '\u{00EB}', '\u{00EE}', '\u{00EF}', '\u{00F4}', '\u{00F6}',
+        '\u{00FB}', '\u{00FC}', '\u{00F1}', '\u{00E7}', '\u{015F}', '\u{011F}', '\u{0131}', '\u{0133}',
+        // 0xA0..0xAF
+        '\u{00AA}', '\u{03B1}', '\u{00A9}', '\u{2030}', '\u{011E}', '\u{011B}', '\u{0148}', '\u{0151}',
+        '\u{03C0}', '\u{20AC}', '\u{00A3}', '\u{0024}', '\u{2190}', '\u{2191}', '\u{2192}', '\u{2193}',
+        // 0xB0..0xBF
+        '\u{00BA}', '\u{00B9}', '\u{00B2}', '\u{00B3}', '\u{00B1}', '\u{0130}', '\u{0144}', '\u{0171}',
+        '\u{00B5}', '\u{00BF}', '\u{00F7}', '\u{00B0}', '\u{00BC}', '\u{00BD}', '\u{00BE}', '\u{00A7}',
+        // 0xC0..0xCF
+        '\u{00C1}', '\u{00C0}', '\u{00C9}', '\u{00C8}', '\u{00CD}', '\u{00CC}', '\u{00D3}', '\u{00D2}',
+        '\u{00DA}', '\u{00D9}', '\u{0158}', '\u{010C}', '\u{0160}', '\u{017D}', '\u{00D0}', '\u{013F}',
+        // 0xD0..0xDF
+        '\u{00C2}', '\u{00C4}', '\u{00CA}', '\u{00CB}', '\u{00CE}', '\u{00CF}', '\u{00D4}', '\u{00D6}',
+        '\u{00DB}', '\u{00DC}', '\u{0159}', '\u{010D}', '\u{0161}', '\u{017E}', '\u{0111}', '\u{0140}',
+        // 0xE0..0xEF
+        '\u{00C3}', '\u{00C5}', '\u{00C6}', '\u{0152}', '\u{0177}', '\u{00DD}', '\u{00D5}', '\u{00D8}',
+        '\u{00DE}', '\u{014A}', '\u{0154}', '\u{0106}', '\u{015A}', '\u{0179}', '\u{0166}', '\u{00F0}',
+        // 0xF0..0xFF
+        '\u{00E3}', '\u{00E5}', '\u{00E6}', '\u{0153}', '\u{0175}', '\u{00FD}', '\u{00F5}', '\u{00F8}',
+        '\u{00FE}', '\u{014B}', '\u{0155}', '\u{0107}', '\u{015B}', '\u{017A}', '\u{0167}', '\u{00FF}',
+    ];
+
+    if ch < 0x80 {
+        ch as char
+    } else {
+        EBU_TABLE[(ch - 0x80) as usize]
+    }
+}
+
 // UEP protection level table (ETSI EN 300 401 Page 50)
 static PROT_LEVEL: [[i32; 3]; 64] = [
     [16,5,32],[21,4,32],[24,3,32],[29,2,32],[35,1,32],
@@ -179,7 +216,7 @@ impl FibProcessor {
                     for i in 0..16 {
                         let ch = get_bits_8(d, base + 32 + 8 * i) as u8;
                         if ch != 0 {
-                            label.push(ch as char);
+                            label.push(ebu_to_char(ch));
                         }
                     }
                     if let Some(ref cb) = self.ensemble_name_cb {
@@ -198,7 +235,7 @@ impl FibProcessor {
                         for i in 0..16 {
                             let ch = get_bits_8(d, base + 32 + 8 * i) as u8;
                             if ch != 0 {
-                                label.push(ch as char);
+                                label.push(ebu_to_char(ch));
                             }
                         }
                         self.list_of_services[svc].service_label.label = label.clone();
@@ -219,7 +256,7 @@ impl FibProcessor {
                         for i in 0..16 {
                             let ch = get_bits_8(d, base + 48 + 8 * i) as u8;
                             if ch != 0 {
-                                label.push(ch as char);
+                                label.push(ebu_to_char(ch));
                             }
                         }
                         label.push_str(" (data)");
@@ -278,5 +315,38 @@ impl FibProcessor {
         for svc in self.list_of_services.iter_mut() {
             *svc = ServiceId::default();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ebu_to_char_ascii() {
+        assert_eq!(ebu_to_char(b'A'), 'A');
+        assert_eq!(ebu_to_char(b' '), ' ');
+        assert_eq!(ebu_to_char(b'0'), '0');
+    }
+
+    #[test]
+    fn test_ebu_to_char_metropolitain() {
+        // 0x82 = 'é' in EBU Latin (was printed as \u{82} before fix)
+        assert_eq!(ebu_to_char(0x82), 'é');
+    }
+
+    #[test]
+    fn test_ebu_to_char_accented() {
+        assert_eq!(ebu_to_char(0x80), 'á'); // a accent aigu
+        assert_eq!(ebu_to_char(0x81), 'à'); // a accent grave
+        assert_eq!(ebu_to_char(0x83), 'è'); // e accent grave
+        assert_eq!(ebu_to_char(0x90), 'â'); // a circumflex
+        assert_eq!(ebu_to_char(0x91), 'ä'); // a umlaut
+        assert_eq!(ebu_to_char(0x9B), 'ç'); // c cedilla
+    }
+
+    #[test]
+    fn test_ebu_to_char_euro() {
+        assert_eq!(ebu_to_char(0xA9), '€');
     }
 }
