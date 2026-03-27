@@ -7,6 +7,8 @@ use std::sync::Arc;
 use std::thread;
 
 use clap::Parser;
+use tracing::{error, info, warn};
+use tracing_subscriber::EnvFilter;
 
 use eti_rtlsdr_rust::dab_constants::BAND_III;
 use eti_rtlsdr_rust::device::rtlsdr_handler::RtlsdrHandler;
@@ -61,6 +63,18 @@ struct Args {
 fn main() {
     let args = Args::parse();
 
+    // Configure tracing: INFO by default, OFF in silent mode
+    let filter = if args.silent {
+        EnvFilter::new("off")
+    } else {
+        EnvFilter::new("info")
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .with_writer(std::io::stderr)
+        .init();
+
     // Shared state for callbacks
     let run = Arc::new(AtomicBool::new(false));
     let time_synced = Arc::new(AtomicBool::new(false));
@@ -73,7 +87,7 @@ fn main() {
     let run_ctrlc = run.clone();
     let running_ctrlc = running.clone();
     ctrlc::set_handler(move || {
-        eprintln!("\n\nSignal caught, terminating!");
+        warn!("Signal caught, terminating!");
         run_ctrlc.store(false, Ordering::SeqCst);
         running_ctrlc.store(false, Ordering::SeqCst);
     }).expect("Error setting Ctrl-C handler");
@@ -82,14 +96,13 @@ fn main() {
     let channel = args.channel.to_uppercase();
     let freq = band_handler::frequency(BAND_III, &channel);
     if freq == -1 {
-        eprintln!("Cannot handle channel {}", channel);
+        error!("Cannot handle channel {}", channel);
         std::process::exit(4);
     }
     let frequency = freq as u32;
-    eprintln!("tunedFrequency = {}", frequency);
+    info!("tunedFrequency = {}", frequency);
 
     // Create output writer
-    let silent = args.silent;
     let eti_writer: EtiWriterFn = if let Some(ref path) = args.output {
         if path == "-" {
             let counter = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -98,10 +111,8 @@ fn main() {
                 let mut lock = stdout.lock();
                 let _ = lock.write_all(data);
                 let _ = lock.flush();
-                if !silent {
-                    let c = counter.fetch_add(1, Ordering::Relaxed);
-                    eprint!("{}\r", c);
-                }
+                let c = counter.fetch_add(1, Ordering::Relaxed);
+                info!(frame = c, "ETI frame written");
             })
         } else {
             let file = std::fs::File::create(path).expect("Cannot create output file");
@@ -110,10 +121,8 @@ fn main() {
             Box::new(move |data: &[u8]| {
                 let mut f = file.lock().unwrap();
                 let _ = f.write_all(data);
-                if !silent {
-                    let c = counter.fetch_add(1, Ordering::Relaxed);
-                    eprint!("{}\r", c);
-                }
+                let c = counter.fetch_add(1, Ordering::Relaxed);
+                info!(frame = c, "ETI frame written");
             })
         }
     } else {
@@ -124,10 +133,8 @@ fn main() {
             let mut lock = stdout.lock();
             let _ = lock.write_all(data);
             let _ = lock.flush();
-            if !silent {
-                let c = counter.fetch_add(1, Ordering::Relaxed);
-                eprint!("{}\r", c);
-            }
+            let c = counter.fetch_add(1, Ordering::Relaxed);
+            info!(frame = c, "ETI frame written");
         })
     };
 
@@ -141,7 +148,7 @@ fn main() {
     ) {
         Ok(dev) => dev,
         Err(e) => {
-            eprintln!("Installing device failed: {}", e);
+            error!("Installing device failed: {}", e);
             std::process::exit(3);
         }
     };
@@ -150,12 +157,12 @@ fn main() {
     let er = ensemble_recognized.clone();
     let ensemble_cb: Option<Box<dyn Fn(&str, u32) + Send>> = Some(Box::new(move |name: &str, _eid: u32| {
         if !er.load(Ordering::SeqCst) {
-            eprintln!("ensemble {} detected", name);
+            info!("ensemble {} detected", name);
             er.store(true, Ordering::SeqCst);
         }
     }));
-    let program_cb: Option<Box<dyn Fn(&str, i32) + Send>> = Some(Box::new(|name: &str, sid: i32| {
-        eprintln!("program\t {}\t 0x{:X} is in the list", name.trim(), sid);
+    let program_cb: Option<Box<dyn Fn(&str, i32) + Send>> = Some(Box::new(move |name: &str, sid: i32| {
+        info!("program\t {}\t 0x{:X} is in the list", name.trim(), sid);
     }));
     let eti_generator = EtiGenerator::new(1, eti_writer, ensemble_cb, program_cb);
     let eti_processing_flag = eti_generator.processing_flag();
@@ -178,7 +185,7 @@ fn main() {
 
     // Start reading from device
     if !input_device.restart_reader() {
-        eprintln!("Failed to start RTL-SDR reader");
+        error!("Failed to start RTL-SDR reader");
         std::process::exit(5);
     }
 
@@ -198,24 +205,23 @@ fn main() {
     }
 
     if !time_synced.load(Ordering::SeqCst) {
-        eprintln!("There does not seem to be a DAB signal here");
+        warn!("There does not seem to be a DAB signal here");
         running.store(false, Ordering::SeqCst);
         let _ = ofdm_thread.join();
         std::process::exit(1);
     }
-    eprintln!("there might be a DAB signal here");
+    info!("there might be a DAB signal here");
 
     // Wait for ensemble recognition
     let mut freq_sync_time = args.detect_time;
     while freq_sync_time > 0 {
-        eprint!("still at most {} seconds to wait\r", freq_sync_time);
+        info!("still at most {} seconds to wait", freq_sync_time);
         thread::sleep(std::time::Duration::from_secs(1));
         freq_sync_time -= 1;
         if ensemble_recognized.load(Ordering::SeqCst) {
             break;
         }
     }
-    eprintln!();
 
     // Note: In the C++ version, ensemble_recognized is set by the FIB processor
     // callback. In our architecture, we trust that after the detect_time,
@@ -223,20 +229,16 @@ fn main() {
     // The ETI generator starts processing regardless.
 
     // Start ETI processing via the shared flag
-    eprintln!("Starting ETI processing...");
+    info!("Starting ETI processing...");
     eti_processing_flag.store(true, Ordering::SeqCst);
-    eprintln!("yes, here we go");
 
     // Main run loop
     run.store(true, Ordering::SeqCst);
     let mut record_time = args.record_time;
     while run.load(Ordering::SeqCst) && (record_time == -1 || record_time > 0) {
-        if !args.silent {
-            eprint!("\t\testimated snr: {:2}, fibquality {:3}\r",
-                signal_noise.load(Ordering::SeqCst),
-                fic_success.load(Ordering::SeqCst),
-            );
-        }
+        info!(snr = signal_noise.load(Ordering::SeqCst),
+              fib_quality = fic_success.load(Ordering::SeqCst),
+              "status");
         thread::sleep(std::time::Duration::from_secs(1));
         if record_time != -1 {
             record_time -= 1;
@@ -245,7 +247,7 @@ fn main() {
 
     // Stop
     running.store(false, Ordering::SeqCst);
-    eprintln!("\n\nterminating");
+    info!("terminating");
 
     let result = ofdm_thread.join();
     if let Ok((mut dev, _eti)) = result {
