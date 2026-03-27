@@ -158,7 +158,7 @@ mod tests {
     #[test]
     fn test_pipeline_sync_state() {
         let config = DabConfig::default();
-        let mut pipeline = EtiPipeline::new(config, CallbackHub::new()).unwrap();
+        let pipeline = EtiPipeline::new(config, CallbackHub::new()).unwrap();
         assert!(!pipeline.is_synced());
         pipeline.signal_sync();
         assert!(pipeline.is_synced());

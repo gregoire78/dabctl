@@ -1,153 +1,283 @@
-use crate::pipeline::{
-    bits_to_bytes,
-    FicBlockCandidate,
-    FibCandidate,
-    FibExtractor,
-    FigCandidate,
-    FigDetails,
-    FigType0Details,
-    SignallingDecoder,
-    SignallingSnapshot,
-    Type0ExtensionSummary,
-    DAB_FIB_BITS,
-    DAB_FIB_BYTES,
-};
-use std::collections::BTreeMap;
+// FIB processor - converted from fib-processor.cpp (eti-cmdline)
+// Copyright (C) 2025 Jan van Katwijk - Lazy Chair Computing
 
-impl Default for FibExtractor {
-    fn default() -> Self {
-        Self::new()
-    }
+use crate::dab_constants::*;
+
+// UEP protection level table (ETSI EN 300 401 Page 50)
+static PROT_LEVEL: [[i32; 3]; 64] = [
+    [16,5,32],[21,4,32],[24,3,32],[29,2,32],[35,1,32],
+    [24,5,48],[29,4,48],[35,3,48],[42,2,48],[52,1,48],
+    [29,5,56],[35,4,56],[42,3,56],[52,2,56],
+    [32,5,64],[42,4,64],[48,3,64],[58,2,64],[70,1,64],
+    [40,5,80],[52,4,80],[58,3,80],[70,2,80],[84,1,80],
+    [48,5,96],[58,4,96],[70,3,96],[84,2,96],[104,1,96],
+    [58,5,112],[70,4,112],[84,3,112],[104,2,112],
+    [64,5,128],[84,4,128],[96,3,128],[116,2,128],[140,1,128],
+    [80,5,160],[104,4,160],[116,3,160],[140,2,160],[168,1,160],
+    [96,5,192],[116,4,192],[140,3,192],[168,2,192],[208,1,192],
+    [116,5,224],[140,4,224],[168,3,224],[208,2,224],[232,1,224],
+    [128,5,256],[168,4,256],[192,3,256],[232,2,256],[280,1,256],
+    [160,5,320],[208,4,320],[280,2,320],
+    [192,5,384],[280,3,384],[416,1,384],
+];
+
+#[derive(Clone, Default)]
+struct SubChannel {
+    in_use: bool,
+    id: i16,
+    start_cu: i16,
+    uep_flag: bool,
+    uep_index: i16,
+    protlev: i16,
+    size: i16,
+    bitrate: i16,
 }
 
-impl FibExtractor {
+#[derive(Clone, Default)]
+struct ServiceLabel {
+    has_name: bool,
+    label: String,
+}
+
+#[derive(Clone, Default)]
+struct ServiceId {
+    in_use: bool,
+    service_id: i32,
+    service_label: ServiceLabel,
+}
+
+pub struct FibProcessor {
+    sub_channels: [SubChannel; 64],
+    list_of_services: Vec<ServiceId>,
+    cif_count_hi: i16,
+    cif_count_lo: i16,
+    is_synced: bool,
+    // Callbacks
+    pub ensemble_name_cb: Option<Box<dyn Fn(&str, u32) + Send>>,
+    pub program_name_cb: Option<Box<dyn Fn(&str, i32) + Send>>,
+}
+
+impl FibProcessor {
     pub fn new() -> Self {
-        Self
+        FibProcessor {
+            sub_channels: std::array::from_fn(|_| SubChannel::default()),
+            list_of_services: vec![ServiceId::default(); 64],
+            cif_count_hi: -1,
+            cif_count_lo: -1,
+            is_synced: false,
+            ensemble_name_cb: None,
+            program_name_cb: None,
+        }
     }
 
-    pub fn extract_fibs(&self, blocks: &[FicBlockCandidate]) -> Vec<FibCandidate> {
-        blocks
-            .iter()
-            .filter(|block| block.crc_ok && block.bit_count == DAB_FIB_BITS)
-            .map(|block| FibCandidate {
-                frame_start_sample: block.frame_start_sample,
-                block_index: block.block_index,
-                crc_ok: block.crc_ok,
-                bytes: bits_to_bytes(&block.bits),
-            })
-            .filter(|fib| fib.bytes.len() == DAB_FIB_BYTES)
-            .collect()
-    }
-
-    pub fn extract_figs(&self, fibs: &[FibCandidate]) -> Vec<FigCandidate> {
-        let mut figs = Vec::new();
-
-        for fib in fibs {
-            let data_len = fib.bytes.len().saturating_sub(2);
-            let mut offset = 0usize;
-
-            while offset < data_len {
-                let header = fib.bytes[offset];
-                if header == 0xFF {
-                    break;
-                }
-
-                let fig_type = header >> 5;
-                let payload_len = (header & 0x1F) as usize;
-                if payload_len == 0 {
-                    offset += 1;
-                    continue;
-                }
-
-                let payload_start = offset + 1;
-                let payload_end = payload_start + payload_len;
-                if payload_end > data_len {
-                    break;
-                }
-
-                let extension = fib.bytes.get(payload_start).copied();
-                let payload = fib.bytes[payload_start..payload_end].to_vec();
-                let details = if fig_type == 0 {
-                    let control = payload[0];
-                    let extension = control & 0x1F;
-                    FigDetails::Type0(FigType0Details {
-                        cn: (control & 0x80) != 0,
-                        oe: (control & 0x40) != 0,
-                        pd: (control & 0x20) != 0,
-                        extension,
-                        body: payload[1..].to_vec(),
-                    })
-                } else {
-                    FigDetails::Raw
-                };
-                figs.push(FigCandidate {
-                    frame_start_sample: fib.frame_start_sample,
-                    block_index: fib.block_index,
-                    fig_type,
-                    extension,
-                    payload_len,
-                    payload,
-                    details,
-                });
-
-                offset = payload_end;
+    pub fn process_fib(&mut self, p: &[u8], _fib: u16) {
+        let mut processed_bytes: i32 = 0;
+        while processed_bytes < 30 {
+            let offset = processed_bytes as usize * 8;
+            let fig_type = get_bits_3(p, offset);
+            match fig_type {
+                0 => self.process_fig0(p, offset),
+                1 => self.process_fig1(p, offset),
+                7 => return,
+                _ => {}
             }
+            let length = get_bits_5(p, offset + 3) as i32;
+            processed_bytes += length + 1;
+        }
+    }
+
+    fn process_fig0(&mut self, d: &[u8], base: usize) {
+        let extension = get_bits_5(d, base + 8 + 3);
+        match extension {
+            0 => self.fig0_extension0(d, base),
+            1 => self.fig0_extension1(d, base),
+            _ => {}
+        }
+    }
+
+    fn fig0_extension0(&mut self, d: &[u8], base: usize) {
+        self.cif_count_hi = (get_bits_5(d, base + 16 + 19) % 20) as i16;
+        self.cif_count_lo = (get_bits_8(d, base + 16 + 24) % 250) as i16;
+    }
+
+    fn fig0_extension1(&mut self, d: &[u8], base: usize) {
+        let mut used: usize = 2;
+        let length = get_bits_5(d, base + 3) as usize;
+        let pd_bit = get_bits_1(d, base + 8 + 2);
+        while used < length.saturating_sub(1) {
+            used = self.handle_fig0_ext1(d, base, used, pd_bit as u8);
+        }
+    }
+
+    fn handle_fig0_ext1(&mut self, d: &[u8], base: usize, offset: usize, _pd: u8) -> usize {
+        let bit_offset = base + offset * 8;
+        let sub_ch_id = get_bits_6(d, bit_offset) as usize;
+        let start_cu = get_bits(d, bit_offset + 6, 10) as i16;
+
+        self.sub_channels[sub_ch_id].id = sub_ch_id as i16;
+        self.sub_channels[sub_ch_id].start_cu = start_cu;
+        self.sub_channels[sub_ch_id].uep_flag = get_bits_1(d, bit_offset + 16) == 0;
+
+        if self.sub_channels[sub_ch_id].uep_flag {
+            // Short form (UEP)
+            let uep_index = get_bits_6(d, bit_offset + 18) as usize;
+            self.sub_channels[sub_ch_id].uep_index = uep_index as i16;
+            if uep_index < 64 {
+                self.sub_channels[sub_ch_id].size = PROT_LEVEL[uep_index][0] as i16;
+                self.sub_channels[sub_ch_id].protlev = PROT_LEVEL[uep_index][1] as i16;
+                self.sub_channels[sub_ch_id].bitrate = PROT_LEVEL[uep_index][2] as i16;
+            }
+            self.sub_channels[sub_ch_id].in_use = true;
+            return offset + 3; // 24 bits = 3 bytes
         }
 
-        figs
-    }
-}
+        // Long form (EEP)
+        let option = get_bits_3(d, bit_offset + 17) as i16;
+        let prot_level = get_bits(d, bit_offset + 20, 2) as i16;
+        let sub_chan_size = get_bits(d, bit_offset + 22, 10) as i16;
+        self.sub_channels[sub_ch_id].size = sub_chan_size;
 
-impl Default for SignallingDecoder {
-    fn default() -> Self {
-        Self::new()
+        if option == 0 {
+            // A Level protection
+            self.sub_channels[sub_ch_id].protlev = prot_level;
+            self.sub_channels[sub_ch_id].bitrate = match prot_level {
+                0 => sub_chan_size / 12 * 8,
+                1 => sub_chan_size / 8 * 8,
+                2 => sub_chan_size / 6 * 8,
+                3 => sub_chan_size / 4 * 8,
+                _ => 0,
+            };
+        } else if option == 1 {
+            // B Level protection
+            self.sub_channels[sub_ch_id].protlev = prot_level + (1 << 2);
+            self.sub_channels[sub_ch_id].bitrate = match prot_level {
+                0 => sub_chan_size / 27 * 32,
+                1 => sub_chan_size / 21 * 32,
+                2 => sub_chan_size / 18 * 32,
+                3 => sub_chan_size / 15 * 32,
+                _ => 0,
+            };
+        }
+        self.sub_channels[sub_ch_id].in_use = true;
+        offset + 4 // 32 bits = 4 bytes
     }
-}
 
-impl SignallingDecoder {
-    pub fn new() -> Self {
-        Self
-    }
+    fn process_fig1(&mut self, d: &[u8], base: usize) {
+        let char_set = get_bits_4(d, base + 8);
+        let oe = get_bits_1(d, base + 8 + 4);
+        let extension = get_bits_3(d, base + 8 + 5);
 
-    pub fn decode(&self, figs: &[FigCandidate]) -> Option<SignallingSnapshot> {
-        if figs.is_empty() {
-            return None;
+        if oe == 1 {
+            return;
         }
 
-        let mut type0_extensions = BTreeMap::<u8, Type0ExtensionSummary>::new();
-        let mut type1_count = 0usize;
-
-        for fig in figs {
-            match &fig.details {
-                FigDetails::Type0(details) => {
-                    let entry = type0_extensions
-                        .entry(details.extension)
-                        .or_insert_with(|| Type0ExtensionSummary {
-                            extension: details.extension,
-                            count: 0,
-                            cn: false,
-                            oe: false,
-                            pd: false,
-                            last_body: Vec::new(),
-                        });
-                    entry.count += 1;
-                    entry.cn |= details.cn;
-                    entry.oe |= details.oe;
-                    entry.pd |= details.pd;
-                    entry.last_body = details.body.clone();
+        match extension {
+            0 => {
+                // Ensemble label
+                let sid = get_bits(d, base + 16, 16) as u32;
+                if char_set <= 16 {
+                    let mut label = String::with_capacity(16);
+                    for i in 0..16 {
+                        let ch = get_bits_8(d, base + 32 + 8 * i) as u8;
+                        if ch != 0 {
+                            label.push(ch as char);
+                        }
+                    }
+                    if let Some(ref cb) = self.ensemble_name_cb {
+                        cb(&label, sid);
+                    }
+                    self.is_synced = true;
                 }
-                FigDetails::Raw => {
-                    if fig.fig_type == 1 {
-                        type1_count += 1;
+            }
+            1 => {
+                // Service label (16-bit SId)
+                let sid = get_bits(d, base + 16, 16) as i32;
+                if char_set <= 16 {
+                    let svc = self.find_service_id(sid);
+                    if !self.list_of_services[svc].service_label.has_name {
+                        let mut label = String::with_capacity(16);
+                        for i in 0..16 {
+                            let ch = get_bits_8(d, base + 32 + 8 * i) as u8;
+                            if ch != 0 {
+                                label.push(ch as char);
+                            }
+                        }
+                        self.list_of_services[svc].service_label.label = label.clone();
+                        self.list_of_services[svc].service_label.has_name = true;
+                        if let Some(ref cb) = self.program_name_cb {
+                            cb(&label, sid);
+                        }
                     }
                 }
             }
+            5 => {
+                // Service label (32-bit SId)
+                let sid = get_lbits(d, base + 16, 32) as i32;
+                if char_set <= 16 {
+                    let svc = self.find_service_id(sid);
+                    if !self.list_of_services[svc].service_label.has_name {
+                        let mut label = String::with_capacity(16);
+                        for i in 0..16 {
+                            let ch = get_bits_8(d, base + 48 + 8 * i) as u8;
+                            if ch != 0 {
+                                label.push(ch as char);
+                            }
+                        }
+                        label.push_str(" (data)");
+                        self.list_of_services[svc].service_label.label = label.clone();
+                        self.list_of_services[svc].service_label.has_name = true;
+                        if let Some(ref cb) = self.program_name_cb {
+                            cb(&label, sid);
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
+    }
 
-        Some(SignallingSnapshot {
-            fig_count: figs.len(),
-            type1_count,
-            type0_extensions: type0_extensions.into_values().collect(),
-        })
+    fn find_service_id(&mut self, service_id: i32) -> usize {
+        // Find existing
+        for i in 0..64 {
+            if self.list_of_services[i].in_use && self.list_of_services[i].service_id == service_id {
+                return i;
+            }
+        }
+        // Find free slot
+        for i in 0..64 {
+            if !self.list_of_services[i].in_use {
+                self.list_of_services[i].in_use = true;
+                self.list_of_services[i].service_id = service_id;
+                self.list_of_services[i].service_label.has_name = false;
+                return i;
+            }
+        }
+        0
+    }
+
+    pub fn get_channel_info(&self, n: usize) -> ChannelData {
+        let sc = &self.sub_channels[n];
+        ChannelData {
+            in_use: sc.in_use,
+            id: sc.id,
+            start_cu: sc.start_cu,
+            uep_flag: sc.uep_flag,
+            protlev: sc.protlev,
+            size: sc.size,
+            bitrate: sc.bitrate,
+        }
+    }
+
+    pub fn get_cif_count(&self) -> (i16, i16) {
+        (self.cif_count_hi, self.cif_count_lo)
+    }
+
+    pub fn clear_ensemble(&mut self) {
+        for sc in self.sub_channels.iter_mut() {
+            *sc = SubChannel::default();
+        }
+        for svc in self.list_of_services.iter_mut() {
+            *svc = ServiceId::default();
+        }
     }
 }
