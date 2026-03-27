@@ -164,7 +164,11 @@ fn main() {
     let program_cb: Option<Box<dyn Fn(&str, i32) + Send>> = Some(Box::new(move |name: &str, sid: i32| {
         info!("program\t {}\t 0x{:X} is in the list", name.trim(), sid);
     }));
-    let eti_generator = EtiGenerator::new(1, eti_writer, ensemble_cb, program_cb);
+    let fs = fic_success.clone();
+    let fic_quality_cb: Option<Box<dyn Fn(i16) + Send>> = Some(Box::new(move |quality: i16| {
+        fs.store(quality, Ordering::SeqCst);
+    }));
+    let eti_generator = EtiGenerator::new(1, eti_writer, ensemble_cb, program_cb, fic_quality_cb);
     let eti_processing_flag = eti_generator.processing_flag();
 
     // Create OFDM processor

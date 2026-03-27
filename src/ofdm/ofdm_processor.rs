@@ -331,8 +331,7 @@ impl OfdmProcessor {
             loop {
                 // SyncOnPhase: copy remaining data from sync
                 let remaining = self.t_u - start_index;
-                let tmp: Vec<Complex32> = self.ofdm_buffer[start_index..self.t_u].to_vec();
-                self.ofdm_buffer[..remaining].copy_from_slice(&tmp);
+                self.ofdm_buffer.copy_within(start_index..self.t_u, 0);
                 let ofdm_buffer_index = remaining;
 
                 eti_generator.new_frame();
