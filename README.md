@@ -56,6 +56,30 @@ sudo apt install -y cmake libusb-1.0-0-dev pkg-config build-essential clang libc
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
+### Bibliothèques liées
+
+| Bibliothèque | Version | Rôle | Lien |
+|---|---|---|---|
+| **librtlsdr** | 0.6+ | Pilote RTL-SDR (compilé automatiquement via `build.rs`) | [osmocom/rtl-sdr](https://github.com/osmocom/rtl-sdr) |
+| **libusb-1.0** | 1.0+ | Backend USB pour librtlsdr | [libusb.info](https://libusb.info) |
+
+> **Note :** `librtlsdr` est incluse dans le dépôt (`rtl-sdr/`) et compilée statiquement par `build.rs` via CMake. Seule `libusb` doit être installée sur le système.
+
+### Crates Rust
+
+| Crate | Version | Rôle |
+|---|---|---|
+| `clap` | 4.4 | Parsing des arguments CLI |
+| `rustfft` | 6.4 | FFT pour démodulation OFDM |
+| `num-complex` | 0.4 | Types complexes (IQ) |
+| `rayon` | 1.10 | Parallélisation des sous-canaux |
+| `tracing` | 0.1 | Logging structuré |
+| `tracing-subscriber` | 0.3 | Formatage et filtrage des logs |
+| `anyhow` | 1.0 | Gestion d'erreurs |
+| `ctrlc` | 3.4 | Handler Ctrl-C |
+| `bindgen` | 0.69 | Génération FFI C → Rust (build) |
+| `cmake` | 0.1 | Compilation librtlsdr (build) |
+
 ### Matériel
 
 - Dongle RTL-SDR (RTL2832U / R820T2)
@@ -171,6 +195,38 @@ codegen-units = 1
 ```bash
 scp target/aarch64-unknown-linux-gnu/release/eti-rtlsdr-rust user@rpi:/usr/local/bin/
 ```
+
+### Packaging release (.tar.gz)
+
+#### AMD64
+
+```bash
+cargo build --release
+VERSION=$(cargo metadata --no-deps --format-version 1 | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4)
+LIB_DIR=$(find target/release/build -path '*/out/lib/librtlsdr.so.0' | head -1 | xargs dirname)
+tar -czf eti-rtlsdr-rust-${VERSION}-x86_64-linux.tar.gz \
+  -C target/release eti-rtlsdr-rust \
+  -C "$(pwd)/${LIB_DIR}" librtlsdr.so.0
+```
+
+#### ARM64
+
+```bash
+cargo build --release --target aarch64-unknown-linux-gnu
+VERSION=$(cargo metadata --no-deps --format-version 1 | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4)
+LIB_DIR=$(find target/aarch64-unknown-linux-gnu/release/build -path '*/out/lib/librtlsdr.so.0' | head -1 | xargs dirname)
+tar -czf eti-rtlsdr-rust-${VERSION}-aarch64-linux.tar.gz \
+  -C target/aarch64-unknown-linux-gnu/release eti-rtlsdr-rust \
+  -C "$(pwd)/${LIB_DIR}" librtlsdr.so.0
+```
+
+> Les archives contiennent le binaire et `librtlsdr.so.0`. Sur la cible, installer `libusb-1.0-0` puis :
+> ```bash
+> tar xzf eti-rtlsdr-rust-*-linux.tar.gz
+> sudo cp eti-rtlsdr-rust /usr/local/bin/
+> sudo cp librtlsdr.so.0 /usr/local/lib/
+> sudo ldconfig
+> ```
 
 ---
 
