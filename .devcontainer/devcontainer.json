@@ -1,7 +1,7 @@
 // For format details, see https://aka.ms/devcontainer.json. For config options, see the
 // README at: https://github.com/devcontainers/templates/tree/main/src/rust
 {
-	"name": "Rust",
+	"name": "eti-rtlsdr-rust",
 	// Or use a Dockerfile or Docker Compose file. More info: https://containers.dev/guide/dockerfile
 	"image": "mcr.microsoft.com/devcontainers/rust:2-1-trixie",
 
@@ -20,7 +20,7 @@
 			"upgradePackages": true
 		},
 		"ghcr.io/devcontainers-extra/features/apt-packages:1": {
-			"packages": "cmake pkg-config build-essential libusb-1.0-0-dev clang libclang-dev llvm-dev gcc-aarch64-linux-gnu gcc-x86-64-linux-gnu"
+			"packages": "cmake pkg-config build-essential libusb-1.0-0-dev clang libclang-dev llvm-dev gcc-aarch64-linux-gnu libc6-dev-arm64-cross"
 		}
 	},
 
@@ -31,7 +31,7 @@
 	"privileged": true,
 
 	// Use 'postCreateCommand' to run commands after the container is created.
-	"postCreateCommand": "bash -lc 'set -euo pipefail; rustup update stable; rustup target add x86_64-pc-windows-msvc; rustup target add aarch64-unknown-linux-gnu; rustup target add x86_64-unknown-linux-gnu; rustup component add llvm-tools; cargo install --locked cargo-xwin || true; cargo --version; rustc --version'",
+	"postCreateCommand": "bash -lc 'set -euo pipefail; sudo dpkg --add-architecture arm64 && sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev:arm64; rustup update stable; rustup target add aarch64-unknown-linux-gnu; rustup component add llvm-tools; cargo --version; rustc --version'",
 
 	"containerEnv": {
 		"LIBCLANG_PATH": "/usr/lib/llvm-19/lib"

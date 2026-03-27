@@ -1,5 +1,4 @@
 // Puncturing tables - converted from protTables.cpp (eti-cmdline)
-// Copyright (C) 2013 Jan van Katwijk - Lazy Chair Computing
 
 /// P_Codes table - 24 puncturing patterns of 32 bits each
 static P_CODES: [[i8; 32]; 24] = [
@@ -31,4 +30,43 @@ static P_CODES: [[i8; 32]; 24] = [
 
 pub fn get_pcodes(index: usize) -> &'static [i8; 32] {
     &P_CODES[index]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_24_valid() {
+        for i in 0..24 {
+            let pcode = get_pcodes(i);
+            assert_eq!(pcode.len(), 32);
+            for &v in pcode.iter() {
+                assert!(v == 0 || v == 1, "P_Code[{}] has invalid value {}", i, v);
+            }
+        }
+    }
+
+    #[test]
+    fn first_is_least_punctured() {
+        let first_ones: i32 = get_pcodes(0).iter().map(|&v| v as i32).sum();
+        let last_ones: i32 = get_pcodes(23).iter().map(|&v| v as i32).sum();
+        assert!(first_ones <= last_ones);
+    }
+
+    #[test]
+    fn last_is_all_ones() {
+        assert!(get_pcodes(23).iter().all(|&v| v == 1));
+    }
+
+    #[test]
+    fn monotonic_ones_count() {
+        let mut prev_count = 0i32;
+        for i in 0..24 {
+            let count: i32 = get_pcodes(i).iter().map(|&v| v as i32).sum();
+            assert!(count >= prev_count,
+                "P_Code[{}] has {} ones, but prev had {}", i, count, prev_count);
+            prev_count = count;
+        }
+    }
 }

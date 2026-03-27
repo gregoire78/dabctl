@@ -1,5 +1,4 @@
 // Phase reference - converted from phasereference.cpp (eti-cmdline)
-// Copyright (C) 2016, 2017 Jan van Katwijk - Lazy Chair Computing
 
 use num_complex::Complex32;
 use rustfft::{FftPlanner, Fft};

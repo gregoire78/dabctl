@@ -51,3 +51,43 @@ impl<T: Clone + Default> RingBuffer<T> {
         self.inner.lock().unwrap().clear();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn basic() {
+        let rb: RingBuffer<u8> = RingBuffer::new(100);
+        assert_eq!(rb.available_read(), 0);
+        assert_eq!(rb.available_write(), 100);
+    }
+
+    #[test]
+    fn put_get() {
+        let rb: RingBuffer<u8> = RingBuffer::new(100);
+        let data = vec![1u8, 2, 3, 4, 5];
+        assert_eq!(rb.put_data(&data), 5);
+        assert_eq!(rb.available_read(), 5);
+        let mut out = vec![0u8; 5];
+        assert_eq!(rb.get_data(&mut out), 5);
+        assert_eq!(out, vec![1, 2, 3, 4, 5]);
+        assert_eq!(rb.available_read(), 0);
+    }
+
+    #[test]
+    fn overflow() {
+        let rb: RingBuffer<u8> = RingBuffer::new(3);
+        assert_eq!(rb.put_data(&[1, 2, 3, 4, 5]), 3);
+        assert_eq!(rb.available_read(), 3);
+    }
+
+    #[test]
+    fn flush() {
+        let rb: RingBuffer<u8> = RingBuffer::new(100);
+        rb.put_data(&[1, 2, 3]);
+        assert_eq!(rb.available_read(), 3);
+        rb.flush();
+        assert_eq!(rb.available_read(), 0);
+    }
+}

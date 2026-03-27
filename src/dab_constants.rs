@@ -1,6 +1,4 @@
 // DAB constants - converted from dab-constants.h (eti-cmdline)
-// Copyright (C) 2016, 2017 Jan van Katwijk - Lazy Chair Computing
-// Rust port
 
 use num_complex::Complex32;
 
@@ -157,4 +155,84 @@ pub fn calc_crc(data: &[u8], offset: usize, length: usize) -> u16 {
         crc = CRC_TAB_1021[temp as usize] ^ (crc << 8);
     }
     crc & 0xffff
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_rate() {
+        assert_eq!(INPUT_RATE, 2_048_000);
+    }
+
+    #[test]
+    fn jan_abs_manhattan() {
+        let z = Complex32::new(3.0, 4.0);
+        assert!((jan_abs(z) - 7.0).abs() < 1e-6);
+        let z2 = Complex32::new(-1.0, -2.0);
+        assert!((jan_abs(z2) - 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn get_bits_basic() {
+        let data: Vec<u8> = vec![1, 0, 1, 1, 0, 0, 1, 0];
+        assert_eq!(get_bits(&data, 0, 4), 0b1011);
+        assert_eq!(get_bits(&data, 4, 4), 0b0010);
+        assert_eq!(get_bits(&data, 0, 8), 0b10110010);
+    }
+
+    #[test]
+    fn get_bits_1_values() {
+        assert_eq!(get_bits_1(&[0], 0), 0);
+        assert_eq!(get_bits_1(&[1], 0), 1);
+        assert_eq!(get_bits_1(&[0xFF], 0), 1);
+    }
+
+    #[test]
+    fn check_crc_bits_valid() {
+        let mut bits = vec![0u8; 24];
+        let mut crc: u16 = 0xFFFF;
+        for _i in 0..8 {
+            if ((crc >> 15) ^ 0u16) & 1 != 0 {
+                crc = (crc << 1) ^ 0x1021;
+            } else {
+                crc <<= 1;
+            }
+        }
+        crc = !crc & 0xFFFF;
+        for i in 0..16 {
+            bits[8 + i] = ((crc >> (15 - i)) & 1) as u8;
+        }
+        assert!(check_crc_bits(&bits, 24));
+    }
+
+    #[test]
+    fn check_crc_bits_invalid() {
+        let bits = vec![0u8; 24];
+        assert!(!check_crc_bits(&bits, 24));
+    }
+
+    #[test]
+    fn channel_data_defaults() {
+        let cd = ChannelData::default();
+        assert!(!cd.in_use);
+        assert_eq!(cd.id, 0);
+        assert_eq!(cd.start_cu, 0);
+        assert!(!cd.uep_flag);
+        assert_eq!(cd.protlev, 0);
+        assert_eq!(cd.size, 0);
+        assert_eq!(cd.bitrate, 0);
+    }
+
+    #[test]
+    fn calc_crc_empty() {
+        assert_eq!(calc_crc(&[0u8; 0], 0, 0), 0xFFFF);
+    }
+
+    #[test]
+    fn calc_crc_known_value() {
+        let data = b"123456789";
+        assert_eq!(calc_crc(data, 0, 9), 0x29B1);
+    }
 }

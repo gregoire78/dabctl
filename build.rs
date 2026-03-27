@@ -15,13 +15,33 @@ fn main() {
     let build_dir = out_path.join("rtlsdr-build");
     std::fs::create_dir_all(&build_dir).ok();
 
-    let cmake_status = Command::new("cmake")
+    let target = env::var("TARGET").unwrap_or_default();
+    let is_cross_aarch64 = target.contains("aarch64");
+
+    let mut cmake_cmd = Command::new("cmake");
+    cmake_cmd
         .arg("-S")
         .arg(rtlsdr_dir)
         .arg("-B")
         .arg(&build_dir)
         .arg("-DCMAKE_BUILD_TYPE=Release")
-        .arg(format!("-DCMAKE_INSTALL_PREFIX={}", out_path.display()))
+        .arg(format!("-DCMAKE_INSTALL_PREFIX={}", out_path.display()));
+
+    if is_cross_aarch64 {
+        cmake_cmd
+            .arg("-DCMAKE_SYSTEM_NAME=Linux")
+            .arg("-DCMAKE_SYSTEM_PROCESSOR=aarch64")
+            .arg("-DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc")
+            .arg("-DCMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu;/usr")
+            .arg("-DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY")
+            .arg("-DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=BOTH")
+            .arg("-DLIBUSB_LIBRARIES=/usr/lib/aarch64-linux-gnu/libusb-1.0.so")
+            .arg("-DLIBUSB_INCLUDE_DIRS=/usr/include/libusb-1.0")
+            .env("PKG_CONFIG_PATH", "/usr/lib/aarch64-linux-gnu/pkgconfig")
+            .env("PKG_CONFIG_LIBDIR", "/usr/lib/aarch64-linux-gnu/pkgconfig");
+    }
+
+    let cmake_status = cmake_cmd
         .status()
         .expect("Failed to run cmake configure");
 
@@ -60,19 +80,30 @@ fn main() {
     println!("cargo:rustc-link-lib=rtlsdr");
 
     // Chercher libusb
+    if is_cross_aarch64 {
+        println!("cargo:rustc-link-search=native=/usr/lib/aarch64-linux-gnu");
+    }
     println!("cargo:rustc-link-lib=usb-1.0");
 
     // Générer les bindings avec bindgen
     let header_path = format!("{}/include/rtl-sdr.h", rtlsdr_dir);
     let include_path = format!("{}/include", rtlsdr_dir);
     
-    let bindings = Builder::default()
+    let mut builder = Builder::default()
         .header(&header_path)
         .clang_arg(format!("-I{}", include_path))
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         .allowlist_function("rtlsdr.*")
         .allowlist_type("rtlsdr.*")
-        .allowlist_var("RTLSDR.*")
+        .allowlist_var("RTLSDR.*");
+
+    if is_cross_aarch64 {
+        builder = builder
+            .clang_arg("--sysroot=/usr/aarch64-linux-gnu")
+            .clang_arg("--target=aarch64-linux-gnu");
+    }
+
+    let bindings = builder
         .generate()
         .expect("Unable to generate bindings");
 

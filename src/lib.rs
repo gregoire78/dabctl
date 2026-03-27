@@ -1,4 +1,4 @@
-// ETI-RTL-SDR Rust - faithful conversion of eti-cmdline (C++) by Jan van Katwijk
+// ETI-RTL-SDR Rust - conversion of eti-cmdline (C++)
 
 pub mod dab_constants;
 pub mod rtlsdr_sys;

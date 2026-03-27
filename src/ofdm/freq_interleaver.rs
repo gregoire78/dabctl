@@ -1,5 +1,4 @@
 // Frequency interleaver - converted from freq-interleaver.cpp (eti-cmdline)
-// Copyright (C) 2013 Jan van Katwijk - Lazy Chair Computing
 // Section 14.6 of the DAB standard
 
 use crate::support::dab_params::DabParams;
@@ -49,5 +48,58 @@ impl FreqInterleaver {
     #[inline]
     pub fn map_in(&self, n: usize) -> i16 {
         self.perm_table[n]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::support::dab_params::DabParams;
+
+    #[test]
+    fn mode1_size() {
+        let params = DabParams::new(1);
+        let fi = FreqInterleaver::new(&params);
+        for i in 0..params.k as usize {
+            let _mapped = fi.map_in(i);
+        }
+    }
+
+    #[test]
+    fn mode1_range() {
+        let params = DabParams::new(1);
+        let fi = FreqInterleaver::new(&params);
+        let half_k = params.k / 2;
+        for i in 0..params.k as usize {
+            let m = fi.map_in(i);
+            assert!(m >= -half_k && m <= half_k, "map_in({}) = {} out of range", i, m);
+            assert_ne!(m, 0, "DC carrier should never appear");
+        }
+    }
+
+    #[test]
+    fn mode1_no_duplicates() {
+        let params = DabParams::new(1);
+        let fi = FreqInterleaver::new(&params);
+        let k = params.k as usize;
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..k {
+            let m = fi.map_in(i);
+            assert!(seen.insert(m), "Duplicate mapping at index {}: {}", i, m);
+        }
+        assert_eq!(seen.len(), k);
+    }
+
+    #[test]
+    fn all_modes() {
+        for mode in [1, 2, 3, 4] {
+            let params = DabParams::new(mode);
+            let fi = FreqInterleaver::new(&params);
+            let mut set = std::collections::HashSet::new();
+            for i in 0..params.k as usize {
+                set.insert(fi.map_in(i));
+            }
+            assert_eq!(set.len(), params.k as usize, "Mode {} should have K unique mappings", mode);
+        }
     }
 }

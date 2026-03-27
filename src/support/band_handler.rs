@@ -1,5 +1,4 @@
 // Band handler - converted from band-handler.cpp (eti-cmdline)
-// Copyright (C) 2013-2017 Jan van Katwijk - Lazy Chair Computing
 
 use crate::dab_constants::BAND_III;
 
@@ -83,4 +82,52 @@ pub fn frequency(dab_band: u8, channel: &str) -> i32 {
     }
     // Default: return first entry
     table[0].f_khz * 1000
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dab_constants::{BAND_III, L_BAND};
+
+    #[test]
+    fn known_channel_11c() {
+        assert_eq!(frequency(BAND_III, "11C"), 220352 * 1000);
+    }
+
+    #[test]
+    fn channel_5a() {
+        assert_eq!(frequency(BAND_III, "5A"), 174928 * 1000);
+    }
+
+    #[test]
+    fn case_insensitive() {
+        assert_eq!(frequency(BAND_III, "11c"), frequency(BAND_III, "11C"));
+    }
+
+    #[test]
+    fn lband() {
+        assert_eq!(frequency(L_BAND, "LA"), 1452960 * 1000);
+    }
+
+    #[test]
+    fn unknown_returns_first() {
+        assert_eq!(frequency(BAND_III, "UNKNOWN"), 174928 * 1000);
+    }
+
+    #[test]
+    fn all_band_iii_increasing() {
+        let channels = [
+            "5A", "5B", "5C", "5D", "6A", "6B", "6C", "6D",
+            "7A", "7B", "7C", "7D", "8A", "8B", "8C", "8D",
+            "9A", "9B", "9C", "9D", "10A", "10B", "10C", "10D",
+            "11A", "11B", "11C", "11D", "12A", "12B", "12C", "12D",
+            "13A", "13B", "13C", "13D", "13E", "13F",
+        ];
+        let mut prev = 0i32;
+        for ch in &channels {
+            let f = frequency(BAND_III, ch);
+            assert!(f > prev, "Frequency for {} should be > prev ({})", ch, prev);
+            prev = f;
+        }
+    }
 }

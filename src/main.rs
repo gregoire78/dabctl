@@ -1,6 +1,5 @@
 // main.rs - CLI entry point for eti-rtlsdr-rust
 // Faithful conversion of main.cpp + eti-class.cpp from eti-cmdline
-// Copyright (C) 2017..2025 Jan van Katwijk - Lazy Chair Computing
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicI16, Ordering};

@@ -1,0 +1,234 @@
+.\" Man page for eti-rtlsdr-rust
+.\" Copyright (C) 2025 — GPL-2.0
+.TH ETI-RTLSDR-RUST 1 "2026-03-27" "0.3.0" "DAB ETI Generator"
+.SH NAME
+eti\-rtlsdr\-rust \- receive DAB radio via RTL-SDR and output ETI frames
+.SH SYNOPSIS
+.B eti\-rtlsdr\-rust
+.RB [ \-C
+.IR channel ]
+.RB [ \-G
+.IR gain ]
+.RB [ \-p
+.IR ppm ]
+.RB [ \-Q ]
+.RB [ \-d
+.IR seconds ]
+.RB [ \-D
+.IR seconds ]
+.RB [ \-O
+.IR file ]
+.RB [ \-t
+.IR seconds ]
+.RB [ \-S ]
+.RB [ \-\-device\-index
+.IR n ]
+.SH DESCRIPTION
+.B eti\-rtlsdr\-rust
+is a DAB (Digital Audio Broadcasting) to ETI (Ensemble Transport Interface) converter.
+It receives DAB signals from an RTL-SDR dongle, demodulates the OFDM signal,
+decodes the FIC (Fast Information Channel), and outputs ETI-NI frames
+(6144 bytes each) suitable for decoding with
+.BR dablin (1)
+or similar software.
+.PP
+The program is a faithful port of
+.I eti\-cmdline
+(C++) to Rust.
+.SH OPTIONS
+.TP
+.BR \-C ", " \-\-channel " " \fIchannel\fR
+DAB channel to tune to. Examples: 5A, 6C, 11C, 12C.
+Band III channels (5A\-13F, 174\-240 MHz) and L-Band channels (LA\-LP, 1452\-1478 MHz) are supported.
+Default:
+.BR 11C .
+.TP
+.BR \-G ", " \-\-gain " " \fIpercent\fR
+Tuner gain as a percentage from 0 to 100. Mapped to the nearest supported gain value of the RTL-SDR hardware.
+Default:
+.BR 50 .
+.TP
+.BR \-p ", " \-\-ppm " " \fIppm\fR
+Frequency correction in parts per million.
+Default:
+.BR 0 .
+.TP
+.BR \-Q ", " \-\-autogain
+Enable automatic gain control (AGC). Overrides
+.BR \-G .
+.TP
+.BR \-d ", " \-\-sync\-time " " \fIseconds\fR
+Timeout in seconds to wait for time synchronization (null symbol detection).
+If no DAB signal is found within this time, the program exits with code 1.
+Default:
+.BR 5 .
+.TP
+.BR \-D ", " \-\-detect\-time " " \fIseconds\fR
+Timeout in seconds to wait for ensemble detection (FIC decoding).
+Default:
+.BR 10 .
+.TP
+.BR \-O ", " \-\-output " " \fIfile\fR
+Output file path. Use
+.B \-
+for stdout (same as default).
+Default: stdout.
+.TP
+.BR \-t ", " \-\-record\-time " " \fIseconds\fR
+Recording duration in seconds.
+.B \-1
+means record indefinitely until interrupted (Ctrl-C).
+Default:
+.BR \-1 .
+.TP
+.BR \-S ", " \-\-silent
+Silent mode. Suppress status messages on stderr (SNR, FIC quality).
+Useful when piping ETI to another program.
+.TP
+.BI \-\-device\-index " n"
+RTL-SDR device index when multiple dongles are connected.
+Default:
+.BR 0 .
+.SH EXIT STATUS
+.TP
+.B 0
+Normal termination (Ctrl-C or record time reached).
+.TP
+.B 1
+No DAB signal found within sync timeout.
+.TP
+.B 3
+RTL-SDR device initialization failed.
+.TP
+.B 4
+Invalid channel name.
+.TP
+.B 5
+Failed to start RTL-SDR reader.
+.SH EXAMPLES
+.PP
+.B Save ETI to a file:
+.RS
+.nf
+eti\-rtlsdr\-rust \-C 6C \-G 20 \-O capture.eti
+.fi
+.RE
+.PP
+.B Pipe to dablin for live listening:
+.RS
+.nf
+eti\-rtlsdr\-rust \-S \-C 6C \-G 20 | dablin \-s 0xF2F8
+.fi
+.RE
+.PP
+.B Pipe to dablin_gtk for graphical selection:
+.RS
+.nf
+eti\-rtlsdr\-rust \-S \-C 11C \-G 80 | dablin_gtk
+.fi
+.RE
+.PP
+.B Record 60 seconds:
+.RS
+.nf
+eti\-rtlsdr\-rust \-C 5A \-G 70 \-t 60 \-O capture.eti
+.fi
+.RE
+.PP
+.B Replay a captured ETI file:
+.RS
+.nf
+dablin \-s 0xF211 < capture.eti
+.fi
+.RE
+.PP
+.B Run the automated test:
+.RS
+.nf
+sudo bash test\-capture.sh 6C 20
+.fi
+.RE
+.SH ETI FORMAT
+Each ETI-NI frame is exactly 6144 bytes and contains:
+.TP
+.B SYNC (4 bytes)
+Frame synchronization word.
+.TP
+.B LIDATA
+FIC data (96 bytes of FIB) followed by MSC subchannel data.
+.TP
+.B EOF (4 bytes)
+CRC-16 and padding.
+.TP
+.B TIST (4 bytes)
+Timestamp (set to 0xFFFFFFFF).
+.TP
+.B Padding
+Remaining bytes filled with 0x55.
+.PP
+At 24 frames per second, the ETI bitrate is approximately 1.2 Mbit/s.
+.SH DAB CHANNELS (BAND III)
+.TS
+l l l l.
+5A	174.928 MHz	9A	202.928 MHz
+5B	176.640 MHz	9B	204.640 MHz
+5C	178.352 MHz	9C	206.352 MHz
+5D	180.064 MHz	10A	209.936 MHz
+6A	181.936 MHz	10B	211.648 MHz
+6B	183.648 MHz	10C	213.360 MHz
+6C	185.360 MHz	10D	215.072 MHz
+6D	187.072 MHz	11A	216.928 MHz
+7A	188.928 MHz	11B	218.640 MHz
+7B	190.640 MHz	11C	220.352 MHz
+7C	192.352 MHz	11D	222.064 MHz
+7D	194.064 MHz	12A	223.936 MHz
+8A	195.936 MHz	12B	225.648 MHz
+8B	197.648 MHz	12C	227.360 MHz
+8C	199.360 MHz	12D	229.072 MHz
+8D	201.072 MHz	13A\-13F	230\-239 MHz
+.TE
+.SH ENVIRONMENT
+.TP
+.B LD_LIBRARY_PATH
+Must include the directory containing
+.I librtlsdr.so.0
+(built by cargo in
+.IR target/*/build/*/out/rtlsdr-build/src ).
+The helper script
+.B eti\-rtlsdr\-rust.sh
+sets this automatically.
+.SH FILES
+.TP
+.I eti\-rtlsdr\-rust.sh
+Shell wrapper that sets LD_LIBRARY_PATH and runs the binary.
+.TP
+.I test\-capture.sh
+Automated functional test script.
+.SH HARDWARE
+Requires an RTL-SDR dongle (RTL2832U chipset with R820T/R820T2 tuner)
+and a DAB antenna for Band III reception (174\-240 MHz).
+.PP
+The
+.B dvb_usb_rtl28xxu
+kernel module must be blacklisted:
+.RS
+.nf
+echo "blacklist dvb_usb_rtl28xxu" | sudo tee /etc/modprobe.d/rtlsdr.conf
+sudo rmmod dvb_usb_rtl28xxu
+.fi
+.RE
+.SH SEE ALSO
+.BR dablin (1),
+.BR dablin_gtk (1),
+.BR rtl_test (1),
+.BR rtl_sdr (1)
+.PP
+.UR https://github.com/JvanKatwijk/eti-stuff
+eti-stuff (C++ reference implementation)
+.UE
+.PP
+.UR https://github.com/Opendigitalradio/dablin
+dablin (ETI decoder)
+.UE
+.SH LICENSE
+GPL-2.0 — même licence que librtlsdr.

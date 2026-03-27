@@ -1,5 +1,4 @@
 // OFDM processor - converted from ofdm-processor.cpp (eti-cmdline)
-// Copyright (C) 2016, 2017 Jan van Katwijk - Lazy Chair Computing
 
 use num_complex::Complex32;
 use rustfft::{FftPlanner, Fft};
@@ -29,12 +28,11 @@ pub struct OfdmProcessor {
     fft_buffer: Vec<Complex32>,
     reference_phase: Vec<Complex32>,
     ofdm_buffer: Vec<Complex32>,
-    oscillator_table: Vec<Complex32>,
+    nco_phase: f32,
     fine_corrector: f32,
     coarse_corrector: i32,
     f2_correction: bool,
     s_level: f32,
-    local_phase: i32,
     buffer_content: i32,
     running: Arc<AtomicBool>,
     // Callbacks
@@ -72,12 +70,7 @@ impl OfdmProcessor {
         let mut planner = FftPlanner::new();
         let fft = planner.plan_fft_forward(t_u);
 
-        // Precompute oscillator table
-        let mut oscillator_table = vec![Complex32::new(0.0, 0.0); INPUT_RATE as usize];
-        for i in 0..INPUT_RATE as usize {
-            let angle = 2.0 * std::f32::consts::PI * i as f32 / INPUT_RATE as f32;
-            oscillator_table[i] = Complex32::new(angle.cos(), angle.sin());
-        }
+        // NCO: no table needed, phase tracked incrementally
 
         OfdmProcessor {
             _params: params.clone(),
@@ -88,12 +81,11 @@ impl OfdmProcessor {
             fft_buffer: vec![Complex32::new(0.0, 0.0); t_u],
             reference_phase: vec![Complex32::new(0.0, 0.0); t_u],
             ofdm_buffer: vec![Complex32::new(0.0, 0.0); 2 * t_s],
-            oscillator_table,
+            nco_phase: 0.0,
             fine_corrector: 0.0,
             coarse_corrector: 0,
             f2_correction: true,
             s_level: 0.0,
-            local_phase: 0,
             buffer_content: 0,
             running,
             sync_signal: None,
@@ -145,10 +137,13 @@ impl OfdmProcessor {
         device.get_samples(&mut temp);
         self.buffer_content -= 1;
 
-        // Apply frequency correction
-        self.local_phase -= phase;
-        self.local_phase = ((self.local_phase % INPUT_RATE as i32) + INPUT_RATE as i32) % INPUT_RATE as i32;
-        let corrected = temp[0] * self.oscillator_table[self.local_phase as usize];
+        // Apply frequency correction via NCO
+        let delta = -2.0 * std::f32::consts::PI * phase as f32 / INPUT_RATE as f32;
+        self.nco_phase += delta;
+        // Keep phase in [-PI, PI] to avoid precision loss
+        if self.nco_phase > std::f32::consts::PI { self.nco_phase -= 2.0 * std::f32::consts::PI; }
+        if self.nco_phase < -std::f32::consts::PI { self.nco_phase += 2.0 * std::f32::consts::PI; }
+        let corrected = temp[0] * Complex32::new(self.nco_phase.cos(), self.nco_phase.sin());
         self.s_level = 0.00001 * jan_abs(corrected) + (1.0 - 0.00001) * self.s_level;
         Ok(corrected)
     }
@@ -173,10 +168,12 @@ impl OfdmProcessor {
         device.get_samples(v);
         self.buffer_content -= n;
 
+        let delta = -2.0 * std::f32::consts::PI * phase as f32 / INPUT_RATE as f32;
         for sample in v.iter_mut() {
-            self.local_phase -= phase;
-            self.local_phase = ((self.local_phase % INPUT_RATE as i32) + INPUT_RATE as i32) % INPUT_RATE as i32;
-            *sample = *sample * self.oscillator_table[self.local_phase as usize];
+            self.nco_phase += delta;
+            if self.nco_phase > std::f32::consts::PI { self.nco_phase -= 2.0 * std::f32::consts::PI; }
+            if self.nco_phase < -std::f32::consts::PI { self.nco_phase += 2.0 * std::f32::consts::PI; }
+            *sample = *sample * Complex32::new(self.nco_phase.cos(), self.nco_phase.sin());
             self.s_level = 0.00001 * jan_abs(*sample) + (1.0 - 0.00001) * self.s_level;
         }
         Ok(())
@@ -204,13 +201,6 @@ impl OfdmProcessor {
         }
     }
 
-    /// Process block 0 (phase reference symbol)
-    fn process_block_0(&mut self, vi: &[Complex32]) {
-        self.fft_buffer[..self.t_u].copy_from_slice(&vi[..self.t_u]);
-        self.fft.process(&mut self.fft_buffer);
-        self.reference_phase[..self.t_u].copy_from_slice(&self.fft_buffer[..self.t_u]);
-    }
-
     /// Main processing loop - runs in its own thread
     /// This is the faithful translation of ofdmProcessor::run() from C++
     #[allow(unused_assignments)]
@@ -224,14 +214,20 @@ impl OfdmProcessor {
         let mut ibits = vec![0i16; 2 * self.carriers];
         let mut snr: f32 = 0.0;
         let mut snr_count = 0;
+        let mut null_buf = vec![Complex32::new(0.0, 0.0); self.t_null];
+        let mut check_buf = vec![Complex32::new(0.0, 0.0); self.t_u];
+        let mut block_buf = vec![Complex32::new(0.0, 0.0); self.t_s];
         let _phase = self.coarse_corrector + self.fine_corrector as i32;
 
-        // Initialize signal level
+        // Initialize signal level (batch read in chunks)
         self.s_level = 0.0;
-        for _ in 0..(self.t_f / 2) {
-            match self.get_sample(device, 0) {
-                Ok(s) => { jan_abs(s); },
-                Err(_) => return,
+        {
+            let init_count = self.t_f / 2;
+            let mut read = 0;
+            while read < init_count {
+                let chunk = (init_count - read).min(block_buf.len());
+                if self.get_samples(device, &mut block_buf[..chunk], 0).is_err() { return; }
+                read += chunk;
             }
         }
 
@@ -240,10 +236,13 @@ impl OfdmProcessor {
             current_strength = 0.0;
             self.s_level = 0.0;
 
-            for _ in 0..self.t_f {
-                match self.get_sample(device, 0) {
-                    Ok(s) => { jan_abs(s); },
-                    Err(_) => return,
+            {
+                let skip_count = self.t_f;
+                let mut read = 0;
+                while read < skip_count {
+                    let chunk = (skip_count - read).min(block_buf.len());
+                    if self.get_samples(device, &mut block_buf[..chunk], 0).is_err() { return; }
+                    read += chunk;
                 }
             }
 
@@ -314,13 +313,9 @@ impl OfdmProcessor {
                 continue; // notSynced
             }
 
-            // Read T_u samples for phase synchronization
-            for i in 0..self.t_u {
-                self.ofdm_buffer[i] = match self.get_sample(device, phase) {
-                    Ok(s) => s,
-                    Err(_) => return,
-                };
-            }
+            // Read T_u samples for phase synchronization (batch via temp buffer)
+            if self.get_samples(device, &mut check_buf[..self.t_u], phase).is_err() { return; }
+            self.ofdm_buffer[..self.t_u].copy_from_slice(&check_buf[..self.t_u]);
 
             let start_index = self.phase_synchronizer.find_index(
                 &self.ofdm_buffer[..self.t_u], 2
@@ -345,11 +340,14 @@ impl OfdmProcessor {
                 // Block 0: read remaining samples and process
                 let phase = self.coarse_corrector + self.fine_corrector as i32;
                 let needed = self.t_u - ofdm_buffer_index;
-                let mut tmp = vec![Complex32::new(0.0, 0.0); needed];
-                if self.get_samples(device, &mut tmp, phase).is_err() { return; }
-                self.ofdm_buffer[ofdm_buffer_index..self.t_u].copy_from_slice(&tmp);
+                // Use check_buf as temp scratch for remaining samples (avoids alloc)
+                if self.get_samples(device, &mut check_buf[..needed], phase).is_err() { return; }
+                self.ofdm_buffer[ofdm_buffer_index..self.t_u].copy_from_slice(&check_buf[..needed]);
                 
-                self.process_block_0(&self.ofdm_buffer[..self.t_u].to_vec());
+                // Process block 0 inline (avoid borrow conflict with to_vec)
+                self.fft_buffer[..self.t_u].copy_from_slice(&self.ofdm_buffer[..self.t_u]);
+                self.fft.process(&mut self.fft_buffer);
+                self.reference_phase[..self.t_u].copy_from_slice(&self.fft_buffer[..self.t_u]);
 
                 if self.f2_correction {
                     let correction = self.phase_synchronizer.estimate_offset(
@@ -366,7 +364,7 @@ impl OfdmProcessor {
                 // Data blocks (symbols 2..L)
                 let mut freq_corr = Complex32::new(0.0, 0.0);
                 for symbol_count in 2..=(self.nr_blocks as u16) {
-                    let mut block_buf = vec![Complex32::new(0.0, 0.0); self.t_s];
+                    block_buf.fill(Complex32::new(0.0, 0.0));
                     let phase = self.coarse_corrector + self.fine_corrector as i32;
                     if self.get_samples(device, &mut block_buf, phase).is_err() { return; }
                     
@@ -384,7 +382,7 @@ impl OfdmProcessor {
                     * (self.carrier_diff as f32 / 2.0);
 
                 // Skip null symbol and compute SNR
-                let mut null_buf = vec![Complex32::new(0.0, 0.0); self.t_null];
+                null_buf.fill(Complex32::new(0.0, 0.0));
                 let phase = self.coarse_corrector + self.fine_corrector as i32;
                 if self.get_samples(device, &mut null_buf, phase).is_err() { return; }
 
@@ -406,7 +404,7 @@ impl OfdmProcessor {
                 }
 
                 // Check_endOfNull: verify sync on next frame
-                let mut check_buf = vec![Complex32::new(0.0, 0.0); self.t_u];
+                check_buf.fill(Complex32::new(0.0, 0.0));
                 let phase = self.coarse_corrector + self.fine_corrector as i32;
                 if self.get_samples(device, &mut check_buf, phase).is_err() { return; }
 

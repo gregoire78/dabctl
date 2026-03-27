@@ -1,5 +1,4 @@
 // FIB processor - converted from fib-processor.cpp (eti-cmdline)
-// Copyright (C) 2025 Jan van Katwijk - Lazy Chair Computing
 
 use crate::dab_constants::*;
 

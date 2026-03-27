@@ -1,5 +1,4 @@
 // FIC handler - converted from fic-handler.cpp (eti-cmdline)
-// Copyright (C) 2024 Jan van Katwijk - Lazy Chair Computing
 
 use crate::dab_constants::{check_crc_bits, ChannelData};
 use crate::eti_handling::prot_tables::get_pcodes;
@@ -153,5 +152,53 @@ impl FicHandler {
         } else {
             0
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::support::dab_params::DabParams;
+
+    #[test]
+    fn creation_mode1() {
+        let params = DabParams::new(1);
+        let fh = FicHandler::new(&params);
+        assert_eq!(fh.get_fic_quality(), 0);
+    }
+
+    #[test]
+    fn creation_mode2() {
+        let params = DabParams::new(2);
+        let _fh = FicHandler::new(&params);
+    }
+
+    #[test]
+    fn channel_data_initially_unused() {
+        let params = DabParams::new(1);
+        let fh = FicHandler::new(&params);
+        for i in 0..64 {
+            assert!(!fh.get_channel_info(i).in_use, "Channel {} should not be in use initially", i);
+        }
+    }
+
+    #[test]
+    fn cif_count_initial() {
+        let params = DabParams::new(1);
+        let fh = FicHandler::new(&params);
+        let (hi, lo) = fh.get_cif_count();
+        assert_eq!(hi, -1);
+        assert_eq!(lo, -1);
+    }
+
+    #[test]
+    fn process_zero_block() {
+        let params = DabParams::new(1);
+        let mut fh = FicHandler::new(&params);
+        let bits_per_block = 2 * params.k as usize;
+        let data = vec![0i16; bits_per_block * 3];
+        let mut out = vec![0u8; 768];
+        let mut valid = vec![false; 4];
+        fh.process_fic_block(&data, &mut out, &mut valid);
     }
 }

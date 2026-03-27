@@ -1,15 +1,85 @@
 // ETI Generator - converted from eti-generator.cpp (eti-cmdline)
-// Copyright (C) 2016 .. 2020 Jan van Katwijk - Lazy Chair Computing
 
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 
 use crate::eti_handling::fic_handler::FicHandler;
 use crate::eti_handling::protection::{EepProtection, Protection, UepProtection};
 use crate::support::dab_params::DabParams;
+use rayon::prelude::*;
+
+// ---------- SPSC ring buffer (zero-copy between OFDM and ETI threads) ----------
+
+const RING_CAPACITY: usize = 512;
+
+struct RingSlot {
+    blkno: i16,
+    data: Vec<i16>, // pre-allocated to bits_per_block
+}
+
+struct SpscRing {
+    slots: Vec<std::cell::UnsafeCell<RingSlot>>,
+    write_pos: AtomicUsize,
+    read_pos: AtomicUsize,
+    slot_size: usize,
+}
+
+// Safe: single-producer single-consumer with atomic fences
+unsafe impl Sync for SpscRing {}
+unsafe impl Send for SpscRing {}
+
+impl SpscRing {
+    fn new(slot_size: usize) -> Self {
+        let mut slots = Vec::with_capacity(RING_CAPACITY);
+        for _ in 0..RING_CAPACITY {
+            slots.push(std::cell::UnsafeCell::new(RingSlot {
+                blkno: 0,
+                data: vec![0i16; slot_size],
+            }));
+        }
+        SpscRing {
+            slots,
+            write_pos: AtomicUsize::new(0),
+            read_pos: AtomicUsize::new(0),
+            slot_size,
+        }
+    }
+
+    /// Producer: write data into next slot. Returns false if full.
+    fn try_push(&self, blkno: i16, src: &[i16]) -> bool {
+        let wp = self.write_pos.load(Ordering::Relaxed);
+        let rp = self.read_pos.load(Ordering::Acquire);
+        let next = (wp + 1) % RING_CAPACITY;
+        if next == rp {
+            return false; // full
+        }
+        let slot = unsafe { &mut *self.slots[wp].get() };
+        slot.blkno = blkno;
+        let len = src.len().min(self.slot_size);
+        slot.data[..len].copy_from_slice(&src[..len]);
+        self.write_pos.store(next, Ordering::Release);
+        true
+    }
+
+    /// Consumer: read next slot. Returns None if empty.
+    fn try_pop(&self) -> Option<(i16, &[i16])> {
+        let rp = self.read_pos.load(Ordering::Relaxed);
+        let wp = self.write_pos.load(Ordering::Acquire);
+        if rp == wp {
+            return None; // empty
+        }
+        let slot = unsafe { &*self.slots[rp].get() };
+        Some((slot.blkno, &slot.data[..self.slot_size]))
+    }
+
+    /// Consumer: advance read pointer after processing
+    fn pop_commit(&self) {
+        let rp = self.read_pos.load(Ordering::Relaxed);
+        self.read_pos.store((rp + 1) % RING_CAPACITY, Ordering::Release);
+    }
+}
 
 static CRC_TAB_1021: [u16; 256] = [
     0x0000, 0x1021, 0x2042, 0x3063, 0x4084, 0x50a5, 0x60c6, 0x70e7,
@@ -57,15 +127,10 @@ fn calc_crc(data: &[u8], initial: u16) -> u16 {
 
 const CU_SIZE: usize = 4 * 16;
 
-struct BufferElement {
-    blkno: i16,
-    data: Vec<i16>,
-}
-
 pub type EtiWriterFn = Box<dyn Fn(&[u8]) + Send>;
 
 pub struct EtiGenerator {
-    tx: mpsc::SyncSender<BufferElement>,
+    ring: Arc<SpscRing>,
     thread_handle: Option<thread::JoinHandle<()>>,
     running: Arc<AtomicBool>,
     processing: Arc<AtomicBool>,
@@ -84,17 +149,18 @@ impl EtiGenerator {
         let running = Arc::new(AtomicBool::new(true));
         let processing = Arc::new(AtomicBool::new(false));
 
-        let (tx, rx) = mpsc::sync_channel::<BufferElement>(512);
+        let ring = Arc::new(SpscRing::new(bits_per_block));
 
         let r = running.clone();
         let p = processing.clone();
+        let ring_rx = ring.clone();
 
         let thread_handle = thread::spawn(move || {
-            Self::run_loop(rx, r, p, params, eti_writer, ensemble_cb, program_cb);
+            Self::run_loop(ring_rx, r, p, params, eti_writer, ensemble_cb, program_cb);
         });
 
         EtiGenerator {
-            tx,
+            ring,
             thread_handle: Some(thread_handle),
             running,
             processing,
@@ -107,10 +173,8 @@ impl EtiGenerator {
     }
 
     pub fn process_block(&self, softbits: &[i16], blkno: i16) {
-        let mut data = vec![0i16; self.bits_per_block];
         let copy_len = softbits.len().min(self.bits_per_block);
-        data[..copy_len].copy_from_slice(&softbits[..copy_len]);
-        let _ = self.tx.try_send(BufferElement { blkno, data });
+        let _ = self.ring.try_push(blkno, &softbits[..copy_len]);
     }
 
     pub fn start_processing(&self) {
@@ -125,13 +189,13 @@ impl EtiGenerator {
 
     pub fn reset(&mut self, eti_writer: EtiWriterFn) {
         self.running.store(false, Ordering::SeqCst);
-        // Drop old sender to unblock the receiver
-        let (tx, rx) = mpsc::sync_channel::<BufferElement>(512);
-        self.tx = tx;
 
         if let Some(handle) = self.thread_handle.take() {
             let _ = handle.join();
         }
+
+        let ring = Arc::new(SpscRing::new(self.bits_per_block));
+        self.ring = ring.clone();
 
         self.running.store(true, Ordering::SeqCst);
         self.processing.store(false, Ordering::SeqCst);
@@ -141,12 +205,12 @@ impl EtiGenerator {
         let params = DabParams::new(1);
 
         self.thread_handle = Some(thread::spawn(move || {
-            Self::run_loop(rx, r, p, params, eti_writer, None, None);
+            Self::run_loop(ring, r, p, params, eti_writer, None, None);
         }));
     }
 
     fn run_loop(
-        rx: mpsc::Receiver<BufferElement>,
+        ring: Arc<SpscRing>,
         running: Arc<AtomicBool>,
         processing: Arc<AtomicBool>,
         params: DabParams,
@@ -181,18 +245,21 @@ impl EtiGenerator {
         my_fic_handler.fib_processor.program_name_cb = program_cb;
 
         while running.load(Ordering::SeqCst) {
-            let b = match rx.recv_timeout(std::time::Duration::from_millis(100)) {
-                Ok(b) => b,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            let (blkno, bdata) = match ring.try_pop() {
+                Some(v) => v,
+                None => {
+                    std::thread::sleep(std::time::Duration::from_micros(100));
+                    continue;
+                }
             };
 
-            if b.blkno != expected_block {
-                eprintln!("got {}, expected {}", b.blkno, expected_block);
+            if blkno != expected_block {
+                eprintln!("got {}, expected {}", blkno, expected_block);
                 expected_block = 2;
                 index_out = 0;
                 amount = 0;
                 minor = 0;
+                ring.pop_commit();
                 continue;
             }
 
@@ -202,13 +269,13 @@ impl EtiGenerator {
             }
 
             // Blocks 2..4 are FIC blocks
-            if (2..=4).contains(&b.blkno) {
-                let offset = (b.blkno - 2) as usize * bits_per_block;
-                let copy_len = bits_per_block.min(b.data.len());
+            if (2..=4).contains(&blkno) {
+                let offset = (blkno - 2) as usize * bits_per_block;
+                let copy_len = bits_per_block.min(bdata.len());
                 fib_input[offset..offset + copy_len]
-                    .copy_from_slice(&b.data[..copy_len]);
+                    .copy_from_slice(&bdata[..copy_len]);
 
-                if b.blkno == 4 {
+                if blkno == 4 {
                     let mut valid = [false; 4];
                     let mut fibs_bytes = vec![0u8; 4 * 768];
                     my_fic_handler.process_fic_block(
@@ -233,15 +300,17 @@ impl EtiGenerator {
                     cif_count_hi = hi;
                     cif_count_lo = lo;
                 }
+                ring.pop_commit();
                 continue;
             }
 
             // MSC blocks
-            let cif_index = ((b.blkno - 5) as usize) % number_of_blocks_per_cif;
+            let cif_index = ((blkno - 5) as usize) % number_of_blocks_per_cif;
             let offset = cif_index * bits_per_block;
-            let copy_len = bits_per_block.min(b.data.len());
+            let copy_len = bits_per_block.min(bdata.len());
             cif_in[offset..offset + copy_len]
-                .copy_from_slice(&b.data[..copy_len]);
+                .copy_from_slice(&bdata[..copy_len]);
+            ring.pop_commit();
 
             if cif_index == number_of_blocks_per_cif - 1 {
                 // CIF complete - do interleaving
@@ -427,11 +496,50 @@ fn init_eti(
 fn process_cif(
     input: &[i16],
     output: &mut [u8],
-    mut offset: usize,
+    offset: usize,
     fic_handler: &FicHandler,
     prot_table: &mut [Option<Protection>],
     descrambler: &mut [Option<Vec<u8>>],
 ) -> usize {
+    // Phase 1: ensure all active subchannels have protection + descrambler initialized
+    // (must be done sequentially on first CIF, then becomes a no-op)
+    for i in 0..64 {
+        let data = fic_handler.get_channel_info(i);
+        if data.in_use && prot_table[i].is_none() {
+            let bit_rate = data.bitrate as usize;
+            let out_size = bit_rate * 24;
+
+            prot_table[i] = Some(if data.uep_flag {
+                Protection::Uep(UepProtection::new(data.bitrate as i16, data.protlev as i16))
+            } else {
+                Protection::Eep(EepProtection::new(data.bitrate as i16, data.protlev as i16))
+            });
+
+            let mut shift_register = [1u8; 9];
+            let mut desc = vec![0u8; out_size];
+            for j in 0..out_size {
+                let b = shift_register[8] ^ shift_register[4];
+                for k in (1..9).rev() {
+                    shift_register[k] = shift_register[k - 1];
+                }
+                shift_register[0] = b;
+                desc[j] = b;
+            }
+            descrambler[i] = Some(desc);
+        }
+    }
+
+    // Phase 2: collect active subchannel jobs with pre-computed output offsets
+    struct SubchJob {
+        idx: usize,
+        start: usize,
+        size: usize,
+        out_size: usize,
+        byte_size: usize,
+        out_offset: usize,
+    }
+    let mut jobs = Vec::new();
+    let mut cur_offset = offset;
     for i in 0..64 {
         let data = fic_handler.get_channel_info(i);
         if data.in_use {
@@ -440,58 +548,103 @@ fn process_cif(
             let bit_rate = data.bitrate as usize;
             let out_size = bit_rate * 24;
             let byte_size = out_size / 8;
-
-            // Create protection + descrambler if needed
-            if prot_table[i].is_none() {
-                prot_table[i] = Some(if data.uep_flag {
-                    Protection::Uep(UepProtection::new(
-                        data.bitrate as i16,
-                        data.protlev as i16,
-                    ))
-                } else {
-                    Protection::Eep(EepProtection::new(
-                        data.bitrate as i16,
-                        data.protlev as i16,
-                    ))
-                });
-
-                // Build descrambler (energy dispersal)
-                let mut shift_register = [1u8; 9];
-                let mut desc = vec![0u8; out_size];
-                for j in 0..out_size {
-                    let b = shift_register[8] ^ shift_register[4];
-                    for k in (1..9).rev() {
-                        shift_register[k] = shift_register[k - 1];
-                    }
-                    shift_register[0] = b;
-                    desc[j] = b;
-                }
-                descrambler[i] = Some(desc);
-            }
-
-            // Deconvolve
-            let mut out_vector = vec![0u8; out_size];
-            if let Some(ref mut prot) = prot_table[i] {
-                prot.deconvolve(&input[start..start + size], &mut out_vector);
-            }
-
-            // Descramble (energy dispersal)
-            if let Some(ref desc) = descrambler[i] {
-                for j in 0..out_size {
-                    out_vector[j] ^= desc[j];
-                }
-            }
-
-            // Pack bits to bytes
-            for j in 0..byte_size {
-                let mut temp: u8 = 0;
-                for k in 0..8 {
-                    temp = (temp << 1) | (out_vector[j * 8 + k] & 0x01);
-                }
-                output[offset + j] = temp;
-            }
-            offset += byte_size;
+            jobs.push(SubchJob { idx: i, start, size, out_size, byte_size, out_offset: cur_offset });
+            cur_offset += byte_size;
         }
     }
-    offset
+
+    if jobs.is_empty() {
+        return offset;
+    }
+
+    // Phase 3: parallel deconvolve + descramble + pack
+    // Safety: each job accesses disjoint prot_table[idx], descrambler[idx],
+    // and output[out_offset..out_offset+byte_size] ranges.
+    // We pass raw addresses as usize to satisfy Send+Sync bounds.
+    let input_ref: &[i16] = input;
+    let prot_addr = prot_table.as_mut_ptr() as usize;
+    let desc_addr = descrambler.as_ptr() as usize;
+    let out_addr = output.as_mut_ptr() as usize;
+
+    jobs.par_iter().for_each(|job| {
+        let mut out_vector = vec![0u8; job.out_size];
+
+        // Deconvolve (each Protection has independent mutable state)
+        let prot = unsafe { &mut *(prot_addr as *mut Option<Protection>).add(job.idx) };
+        if let Some(ref mut p) = prot {
+            p.deconvolve(&input_ref[job.start..job.start + job.size], &mut out_vector);
+        }
+
+        // Descramble
+        let desc = unsafe { &*(desc_addr as *const Option<Vec<u8>>).add(job.idx) };
+        if let Some(ref d) = desc {
+            for j in 0..job.out_size {
+                out_vector[j] ^= d[j];
+            }
+        }
+
+        // Pack bits to bytes into output slice
+        let out_slice = unsafe {
+            std::slice::from_raw_parts_mut((out_addr as *mut u8).add(job.out_offset), job.byte_size)
+        };
+        pack_bits(&out_vector[..job.out_size], out_slice);
+    });
+
+    cur_offset
+}
+
+/// Pack bit array (0/1 bytes) into packed bytes
+fn pack_bits(bits: &[u8], out: &mut [u8]) {
+    for (j, byte) in out.iter_mut().enumerate() {
+        let base = j * 8;
+        let mut val: u8 = 0;
+        for k in 0..8 {
+            val = (val << 1) | (bits[base + k] & 0x01);
+        }
+        *byte = val;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spsc_ring_push_pop() {
+        let ring = SpscRing::new(4);
+        assert!(ring.try_pop().is_none());
+
+        assert!(ring.try_push(7, &[1, 2, 3, 4]));
+        let (blkno, data) = ring.try_pop().unwrap();
+        assert_eq!(blkno, 7);
+        assert_eq!(&data[..4], &[1, 2, 3, 4]);
+        ring.pop_commit();
+
+        assert!(ring.try_pop().is_none());
+    }
+
+    #[test]
+    fn spsc_ring_full() {
+        let ring = SpscRing::new(2);
+        // Fill all slots (capacity - 1 usable)
+        for i in 0..(RING_CAPACITY - 1) {
+            assert!(ring.try_push(i as i16, &[0, 0]), "push {} failed", i);
+            ring.try_pop(); // need to read before commit
+            ring.pop_commit();
+        }
+    }
+
+    #[test]
+    fn spsc_ring_wraparound() {
+        let ring = SpscRing::new(1);
+        for round in 0..3 {
+            for i in 0..(RING_CAPACITY - 1) {
+                assert!(ring.try_push(i as i16, &[round as i16]), "round {} push {} failed", round, i);
+                let (blkno, data) = ring.try_pop().unwrap();
+                assert_eq!(blkno, i as i16);
+                assert_eq!(data[0], round as i16);
+                ring.pop_commit();
+            }
+        }
+    }
 }

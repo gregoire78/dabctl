@@ -1,5 +1,4 @@
 // RTL-SDR handler - converted from rtlsdr-handler.cpp (eti-cmdline)
-// Copyright (C) 2010..2013 Jan van Katwijk - Lazy Chair Computing
 
 use crate::rtlsdr_sys;
 use num_complex::Complex32;

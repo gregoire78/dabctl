@@ -1,5 +1,4 @@
 // Viterbi decoder - converted from viterbi-spiral.cpp (eti-cmdline)
-// Copyright (C) 2020 Jan van Katwijk - Lazy Chair Computing
 //
 // This implements the "spiral" Viterbi decoder used for both FIC and MSC.
 // Polynomials: {0155, 0117, 0123, 0155} (octal, same as C++)
@@ -77,35 +76,6 @@ impl ViterbiSpiral {
         }
     }
 
-    fn butterfly(branchtab: &[u8], i: usize, s: usize, syms: &[u8],
-                 old_metrics: &[u32], new_metrics: &mut [u32],
-                 dec: &mut [u32]) {
-        let mut metric: u32 = 0;
-        for j in 0..RATE {
-            metric += ((branchtab[j * NUM_STATES / 2 + i] ^ syms[s * RATE + j]) as u32) >> 0;
-        }
-        let max = RATE as u32 * 255;
-
-        let m0 = old_metrics[i] + metric;
-        let m1 = old_metrics[i + NUM_STATES / 2] + (max - metric);
-        let m2 = old_metrics[i] + (max - metric);
-        let m3 = old_metrics[i + NUM_STATES / 2] + metric;
-
-        let decision0 = if m0 > m1 { 1u32 } else { 0 };
-        let decision1 = if m2 > m3 { 1u32 } else { 0 };
-
-        new_metrics[2 * i] = if decision0 != 0 { m1 } else { m0 };
-        new_metrics[2 * i + 1] = if decision1 != 0 { m3 } else { m2 };
-
-        let words_per_decision = (NUM_STATES + 31) / 32;
-        let dec_offset = s * words_per_decision;
-        let word_idx = i / 16;
-        let bit_pos = (2 * i) % 32;
-        if dec_offset + word_idx < dec.len() {
-            dec[dec_offset + word_idx] |= (decision0 | (decision1 << 1)) << bit_pos;
-        }
-    }
-
     fn renormalize(metrics: &mut [u32]) {
         if metrics[0] > RENORMALIZE_THRESHOLD {
             let min = *metrics.iter().min().unwrap();
@@ -120,25 +90,58 @@ impl ViterbiSpiral {
         let words_per_decision = (NUM_STATES + 31) / 32;
 
         // Clear decisions
-        for i in 0..nbits * words_per_decision {
-            if i < self.decisions.len() {
-                self.decisions[i] = 0;
-            }
+        for d in self.decisions[..nbits * words_per_decision].iter_mut() {
+            *d = 0;
         }
 
+        let max = RATE as u32 * 255;
         let mut use_metrics1_as_old = true;
         for s in 0..nbits {
-            if use_metrics1_as_old {
-                let (old, new) = (&self.metrics1.clone(), &mut self.metrics2);
-                for i in 0..NUM_STATES / 2 {
-                    Self::butterfly(&self.branchtab, i, s, &self.symbols, old, new, &mut self.decisions);
+            let sym_base = s * RATE;
+
+            // Destructure to split borrows on disjoint fields
+            let Self { metrics1, metrics2, branchtab, symbols, decisions, .. } = self;
+            let (old, new): (&[u32], &mut [u32]) = if use_metrics1_as_old {
+                (metrics1.as_slice(), metrics2.as_mut_slice())
+            } else {
+                (metrics2.as_slice(), metrics1.as_mut_slice())
+            };
+
+            let dec_offset = s * words_per_decision;
+
+            // Batch butterfly: process all NUM_STATES/2 states
+            // Written as a tight loop for auto-vectorization
+            for i in 0..NUM_STATES / 2 {
+                // Compute branch metric
+                let mut metric: u32 = 0;
+                for j in 0..RATE {
+                    metric += (branchtab[j * NUM_STATES / 2 + i] ^ symbols[sym_base + j]) as u32;
                 }
+
+                let m0 = old[i].wrapping_add(metric);
+                let m1 = old[i + NUM_STATES / 2].wrapping_add(max - metric);
+                let m2 = old[i].wrapping_add(max - metric);
+                let m3 = old[i + NUM_STATES / 2].wrapping_add(metric);
+
+                // Branchless select (helps auto-vectorization)
+                let d0 = (m0 > m1) as u32;
+                let d1 = (m2 > m3) as u32;
+
+                // Equivalent to: new[2*i] = if d0 { m1 } else { m0 }
+                // Using branchless: min(m0, m1) when d0 means m0 > m1
+                new[2 * i] = m0 ^ ((m0 ^ m1) & (0u32.wrapping_sub(d0)));
+                new[2 * i + 1] = m2 ^ ((m2 ^ m3) & (0u32.wrapping_sub(d1)));
+
+                // Pack decisions
+                let word_idx = i / 16;
+                let bit_pos = (2 * i) % 32;
+                decisions[dec_offset + word_idx] |= (d0 | (d1 << 1)) << bit_pos;
+            }
+
+            // Renormalize
+            if use_metrics1_as_old {
                 Self::renormalize(&mut self.metrics2);
             } else {
-                let (old, new) = (&self.metrics2.clone(), &mut self.metrics1);
-                for i in 0..NUM_STATES / 2 {
-                    Self::butterfly(&self.branchtab, i, s, &self.symbols, old, new, &mut self.decisions);
-                }
                 Self::renormalize(&mut self.metrics1);
             }
             use_metrics1_as_old = !use_metrics1_as_old;
@@ -197,5 +200,52 @@ impl ViterbiSpiral {
             let bit_pos = 7 - (i & 7);
             output[i] = (self.data[byte_idx] >> bit_pos) & 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_does_not_panic() {
+        let _v = ViterbiSpiral::new(768);
+    }
+
+    #[test]
+    fn zero_input_produces_zero_output() {
+        let mut v = ViterbiSpiral::new(32);
+        let input = vec![0i16; 152];
+        let mut output = vec![0u8; 32];
+        v.deconvolve(&input, &mut output);
+        assert!(output.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn output_is_binary() {
+        let mut v = ViterbiSpiral::new(64);
+        let input: Vec<i16> = (0..280).map(|i| if i % 3 == 0 { 127 } else { -127 }).collect();
+        let mut output = vec![0u8; 64];
+        v.deconvolve(&input, &mut output);
+        assert!(output.iter().all(|&b| b == 0 || b == 1));
+    }
+
+    #[test]
+    fn different_word_lengths() {
+        for wl in [16, 32, 64, 128, 768] {
+            let mut v = ViterbiSpiral::new(wl);
+            let input = vec![0i16; (wl + 6) * 4];
+            let mut output = vec![0u8; wl];
+            v.deconvolve(&input, &mut output);
+        }
+    }
+
+    #[test]
+    fn strong_encoded_ones() {
+        let mut v = ViterbiSpiral::new(32);
+        let input = vec![127i16; 152];
+        let mut output = vec![0u8; 32];
+        v.deconvolve(&input, &mut output);
+        assert!(output.iter().all(|&b| b == 0 || b == 1));
     }
 }

@@ -1,5 +1,4 @@
 // Protection (EEP + UEP) - converted from eep-protection.cpp + uep-protection.cpp (eti-cmdline)
-// Copyright (C) 2013, 2017 Jan van Katwijk - Lazy Chair Computing
 
 use crate::eti_handling::prot_tables::get_pcodes;
 use crate::eti_handling::viterbi_handler::ViterbiSpiral;
@@ -236,5 +235,48 @@ impl Protection {
             Protection::Eep(p) => p.deconvolve(v, out_buffer),
             Protection::Uep(p) => p.deconvolve(v, out_buffer),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eep_creation_a1() { let _p = EepProtection::new(64, 0); }
+
+    #[test]
+    fn eep_creation_a2() { let _p = EepProtection::new(128, 1); }
+
+    #[test]
+    fn eep_creation_a3() { let _p = EepProtection::new(64, 2); }
+
+    #[test]
+    fn eep_creation_a4() { let _p = EepProtection::new(64, 3); }
+
+    #[test]
+    fn eep_creation_b_profiles() {
+        for level in 4..8 {
+            let _p = EepProtection::new(64, level);
+        }
+    }
+
+    #[test]
+    fn eep_deconvolve_zero_input() {
+        let mut p = EepProtection::new(64, 0);
+        let in_size = 24 * 64;
+        let input = vec![0i16; in_size * 4 + 24];
+        let mut output = vec![0u8; in_size];
+        p.deconvolve(&input, &mut output);
+        assert!(output.iter().all(|&b| b == 0 || b == 1));
+    }
+
+    #[test]
+    fn protection_enum_eep() {
+        let mut prot = Protection::Eep(EepProtection::new(64, 0));
+        let in_size = 24 * 64;
+        let input = vec![0i16; in_size * 4 + 24];
+        let mut output = vec![0u8; in_size];
+        prot.deconvolve(&input, &mut output);
     }
 }

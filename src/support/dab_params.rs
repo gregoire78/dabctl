@@ -1,5 +1,4 @@
 // DAB parameters - converted from dab-params.cpp (eti-cmdline)
-// Copyright (C) 2013-2017 Jan van Katwijk - Lazy Chair Computing
 
 #[derive(Clone, Debug)]
 pub struct DabParams {
@@ -38,4 +37,77 @@ impl DabParams {
 
     pub fn get_carriers(&self) -> usize { self.k as usize }
     pub fn get_l(&self) -> usize { self.l as usize }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mode1_defaults() {
+        let p = DabParams::new(1);
+        assert_eq!(p.dab_mode, 1);
+        assert_eq!(p.l, 76);
+        assert_eq!(p.k, 1536);
+        assert_eq!(p.t_u, 2048);
+        assert_eq!(p.t_s, 2552);
+        assert_eq!(p.t_g, 504);
+        assert_eq!(p.t_null, 2656);
+        assert_eq!(p.t_f, 196608);
+        assert_eq!(p.carrier_diff, 1000);
+    }
+
+    #[test]
+    fn mode2() {
+        let p = DabParams::new(2);
+        assert_eq!(p.dab_mode, 2);
+        assert_eq!(p.l, 76);
+        assert_eq!(p.k, 384);
+        assert_eq!(p.t_u, 512);
+    }
+
+    #[test]
+    fn mode3() {
+        let p = DabParams::new(3);
+        assert_eq!(p.dab_mode, 3);
+        assert_eq!(p.l, 153);
+        assert_eq!(p.k, 192);
+        assert_eq!(p.t_u, 256);
+    }
+
+    #[test]
+    fn mode4() {
+        let p = DabParams::new(4);
+        assert_eq!(p.dab_mode, 4);
+        assert_eq!(p.l, 76);
+        assert_eq!(p.k, 768);
+        assert_eq!(p.t_u, 1024);
+    }
+
+    #[test]
+    fn invalid_defaults_to_mode1() {
+        let p = DabParams::new(99);
+        assert_eq!(p.dab_mode, 1);
+        assert_eq!(p.k, 1536);
+    }
+
+    #[test]
+    fn get_carriers() {
+        assert_eq!(DabParams::new(1).get_carriers(), 1536);
+        assert_eq!(DabParams::new(2).get_carriers(), 384);
+    }
+
+    #[test]
+    fn get_l() {
+        assert_eq!(DabParams::new(1).get_l(), 76);
+        assert_eq!(DabParams::new(3).get_l(), 153);
+    }
+
+    #[test]
+    fn symbol_length_is_tu_plus_tg() {
+        for mode in [1, 2, 3, 4] {
+            let p = DabParams::new(mode);
+            assert_eq!(p.t_s, p.t_u + p.t_g, "t_s != t_u + t_g for mode {}", mode);
+        }
+    }
 }

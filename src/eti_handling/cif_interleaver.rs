@@ -50,3 +50,46 @@ impl CifInterleaver {
         out
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new() {
+        let _ci = CifInterleaver::new();
+    }
+
+    #[test]
+    fn returns_none_before_primed() {
+        let mut ci = CifInterleaver::new();
+        for _ in 0..15 {
+            assert!(ci.push_and_interleave(&[1, 2, 3, 4]).is_none());
+        }
+    }
+
+    #[test]
+    fn returns_some_after_primed() {
+        let mut ci = CifInterleaver::new();
+        for i in 0..16 {
+            let result = ci.push_and_interleave(&[i as u8; 8]);
+            if i < 15 {
+                assert!(result.is_none());
+            } else {
+                assert!(result.is_some());
+                assert_eq!(result.unwrap().len(), 8);
+            }
+        }
+    }
+
+    #[test]
+    fn output_length_matches_input() {
+        let mut ci = CifInterleaver::new();
+        for i in 0..20 {
+            let payload = vec![i as u8; 32];
+            if let Some(out) = ci.push_and_interleave(&payload) {
+                assert_eq!(out.len(), 32);
+            }
+        }
+    }
+}

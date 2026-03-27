@@ -1,10 +1,10 @@
 // Phase table - converted from phasetable.cpp (eti-cmdline)
-// Copyright (C) 2013 Jan van Katwijk - Lazy Chair Computing
 
 use std::f32::consts::PI;
 
 struct PhaseTableElement {
     kmin: i32,
+    #[allow(dead_code)]
     kmax: i32,
     i: i32,
     n: i32,
@@ -94,14 +94,56 @@ impl PhaseTable {
     }
 
     pub fn get_phi(&self, k: i32) -> f32 {
-        for entry in self.table {
-            if entry.kmin <= k && k <= entry.kmax {
-                let k_prime = entry.kmin;
-                let i = entry.i;
-                let n = entry.n;
-                return PI / 2.0 * (h_table(i, k - k_prime) + n) as f32;
-            }
+        // O(1) direct index: each entry spans 32 carriers
+        let idx = if k < 0 {
+            ((k + 768) / 32) as usize       // entries 0..24
+        } else if k > 0 {
+            ((k - 1) / 32 + 24) as usize    // entries 24..48
+        } else {
+            return 0.0; // k=0 is DC, not used
+        };
+        if idx >= self.table.len() {
+            return 0.0;
         }
-        0.0
+        let entry = &self.table[idx];
+        let k_prime = entry.kmin;
+        let i = entry.i;
+        let n = entry.n;
+        PI / 2.0 * (h_table(i, k - k_prime) + n) as f32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mode1_creation() {
+        let _pt = PhaseTable::new(1);
+    }
+
+    #[test]
+    fn get_phi_returns_multiples_of_pi_over_2() {
+        let pt = PhaseTable::new(1);
+        for k in [-768, -500, -100, 1, 100, 500, 768] {
+            let phi = pt.get_phi(k);
+            let ratio = phi / (PI / 2.0);
+            let rounded = ratio.round();
+            assert!((ratio - rounded).abs() < 1e-5,
+                "get_phi({}) = {} is not a multiple of PI/2", k, phi);
+        }
+    }
+
+    #[test]
+    fn dc_carrier_returns_zero() {
+        let pt = PhaseTable::new(1);
+        assert_eq!(pt.get_phi(0), 0.0);
+    }
+
+    #[test]
+    fn out_of_range() {
+        let pt = PhaseTable::new(1);
+        assert_eq!(pt.get_phi(5000), 0.0);
+        assert_eq!(pt.get_phi(-5000), 0.0);
     }
 }
