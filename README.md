@@ -474,6 +474,16 @@ export LD_LIBRARY_PATH=$(find target -name "librtlsdr.so.0" 2>/dev/null | head -
 - **Viterbi branchless** : réécriture de `update_viterbi()` avec sélection branchless (`XOR + mask`) pour auto-vectorisation LLVM
 - **Parallel subchannel** : déconvolution Viterbi des sous-canaux en parallèle via `rayon::par_iter` dans `process_cif()`
 
+### Fait (v0.4)
+
+- **Logging structuré** : migration complète `eprintln!` → `tracing` (info/warn/error) avec filtrage par niveau (`-S` = off)
+- **EBU Latin → UTF-8** : conversion charset EN 300 401 pour les noms d'ensembles et services DAB
+- **FIC quality callback** : remontée en temps réel de la qualité FIB (CRC) depuis le thread ETI vers l'affichage
+- **Zero-alloc OFDM sync** : remplacement de `.to_vec()` (16 KB/frame) par `copy_within()` dans la boucle de synchronisation
+- **FIB buffer hoisting** : `fibs_bytes` (3 KB) sorti de la boucle ETI, réutilisé via `.fill(0)`
+- **Thread-local subchannel buffers** : `out_vector` par job rayon via `thread_local!` (évite ~384 KB d'allocs par CIF)
+- **Strip + panic=abort** : binaire release strippé (2.4 MB), `panic = "abort"` élimine le code d'unwinding
+
 ### Axes restants (roadmap)
 
 | Axe | Description | Impact estimé |

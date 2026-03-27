@@ -145,6 +145,7 @@ impl EtiGenerator {
         eti_writer: EtiWriterFn,
         ensemble_cb: Option<Box<dyn Fn(&str, u32) + Send>>,
         program_cb: Option<Box<dyn Fn(&str, i32) + Send>>,
+        fic_quality_cb: Option<Box<dyn Fn(i16) + Send>>,
     ) -> Self {
         let params = DabParams::new(dab_mode);
         let bits_per_block = 2 * params.get_carriers();
@@ -158,7 +159,7 @@ impl EtiGenerator {
         let ring_rx = ring.clone();
 
         let thread_handle = thread::spawn(move || {
-            Self::run_loop(ring_rx, r, p, params, eti_writer, ensemble_cb, program_cb);
+            Self::run_loop(ring_rx, r, p, params, eti_writer, ensemble_cb, program_cb, fic_quality_cb);
         });
 
         EtiGenerator {
@@ -206,7 +207,7 @@ impl EtiGenerator {
         let params = DabParams::new(1);
 
         self.thread_handle = Some(thread::spawn(move || {
-            Self::run_loop(ring, r, p, params, eti_writer, None, None);
+            Self::run_loop(ring, r, p, params, eti_writer, None, None, None);
         }));
     }
 
@@ -218,6 +219,7 @@ impl EtiGenerator {
         eti_writer: EtiWriterFn,
         ensemble_cb: Option<Box<dyn Fn(&str, u32) + Send>>,
         program_cb: Option<Box<dyn Fn(&str, i32) + Send>>,
+        fic_quality_cb: Option<Box<dyn Fn(i16) + Send>>,
     ) {
         let bits_per_block = 2 * params.get_carriers();
         let number_of_blocks_per_cif: usize = 18; // mode I
@@ -244,6 +246,8 @@ impl EtiGenerator {
         let mut my_fic_handler = FicHandler::new(&params);
         my_fic_handler.fib_processor.ensemble_name_cb = ensemble_cb;
         my_fic_handler.fib_processor.program_name_cb = program_cb;
+
+        let mut fibs_bytes = vec![0u8; 4 * 768];
 
         while running.load(Ordering::SeqCst) {
             let (blkno, bdata) = match ring.try_pop() {
@@ -278,7 +282,7 @@ impl EtiGenerator {
 
                 if blkno == 4 {
                     let mut valid = [false; 4];
-                    let mut fibs_bytes = vec![0u8; 4 * 768];
+                    fibs_bytes.fill(0);
                     my_fic_handler.process_fic_block(
                         &fib_input,
                         &mut fibs_bytes,
@@ -300,6 +304,9 @@ impl EtiGenerator {
                     let (hi, lo) = my_fic_handler.get_cif_count();
                     cif_count_hi = hi;
                     cif_count_lo = lo;
+                    if let Some(ref cb) = fic_quality_cb {
+                        cb(my_fic_handler.get_fic_quality());
+                    }
                 }
                 ring.pop_commit();
                 continue;
@@ -568,27 +575,34 @@ fn process_cif(
     let out_addr = output.as_mut_ptr() as usize;
 
     jobs.par_iter().for_each(|job| {
-        let mut out_vector = vec![0u8; job.out_size];
-
-        // Deconvolve (each Protection has independent mutable state)
-        let prot = unsafe { &mut *(prot_addr as *mut Option<Protection>).add(job.idx) };
-        if let Some(ref mut p) = prot {
-            p.deconvolve(&input_ref[job.start..job.start + job.size], &mut out_vector);
+        thread_local! {
+            static BUF: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::new());
         }
+        BUF.with(|buf| {
+            let mut out_vector = buf.borrow_mut();
+            out_vector.clear();
+            out_vector.resize(job.out_size, 0);
 
-        // Descramble
-        let desc = unsafe { &*(desc_addr as *const Option<Vec<u8>>).add(job.idx) };
-        if let Some(ref d) = desc {
-            for j in 0..job.out_size {
-                out_vector[j] ^= d[j];
+            // Deconvolve (each Protection has independent mutable state)
+            let prot = unsafe { &mut *(prot_addr as *mut Option<Protection>).add(job.idx) };
+            if let Some(ref mut p) = prot {
+                p.deconvolve(&input_ref[job.start..job.start + job.size], &mut out_vector);
             }
-        }
 
-        // Pack bits to bytes into output slice
-        let out_slice = unsafe {
-            std::slice::from_raw_parts_mut((out_addr as *mut u8).add(job.out_offset), job.byte_size)
-        };
-        pack_bits(&out_vector[..job.out_size], out_slice);
+            // Descramble
+            let desc = unsafe { &*(desc_addr as *const Option<Vec<u8>>).add(job.idx) };
+            if let Some(ref d) = desc {
+                for j in 0..job.out_size {
+                    out_vector[j] ^= d[j];
+                }
+            }
+
+            // Pack bits to bytes into output slice
+            let out_slice = unsafe {
+                std::slice::from_raw_parts_mut((out_addr as *mut u8).add(job.out_offset), job.byte_size)
+            };
+            pack_bits(&out_vector[..job.out_size], out_slice);
+        });
     });
 
     cur_offset
