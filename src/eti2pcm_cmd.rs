@@ -275,13 +275,13 @@ pub fn run(args: Eti2pcmArgs) {
                 if let Some(ref label) = pad_result.dynamic_label {
                     pad_output.write_dl(&label.text);
                     if !args.disable_dyn_fic {
-                        eprintln!("DLS: {}", label.text);
+                        info!("DLS: {}", label.text);
                     }
                 }
                 if let Some(ref slide) = pad_result.slide {
                     pad_output.write_slide(slide);
                     if !args.disable_dyn_fic {
-                        eprintln!(
+                        info!(
                             "Slide: {} ({}, {} bytes)",
                             slide.content_name, slide.mime_type(), slide.data.len()
                         );
