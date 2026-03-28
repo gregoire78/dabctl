@@ -1,0 +1,430 @@
+/// DAB+ superframe decoder: accumulates 5 frames, applies RS,
+/// checks fire code sync, extracts Access Units.
+use crate::eti2pcm::crc::{crc16_ccitt, crc_fire_code, CrcCalculator};
+use crate::eti2pcm::rs_decoder::RsDecoder;
+
+const FPAD_LEN: usize = 2;
+
+/// DAB+ superframe audio format
+#[derive(Debug, Clone, PartialEq)]
+pub struct SuperframeFormat {
+    pub dac_rate: bool,
+    pub sbr_flag: bool,
+    pub aac_channel_mode: bool,
+    pub ps_flag: bool,
+    pub mpeg_surround_config: u8,
+}
+
+impl SuperframeFormat {
+    pub fn core_sr_index(&self) -> u8 {
+        if self.dac_rate {
+            if self.sbr_flag { 6 } else { 3 }
+        } else {
+            if self.sbr_flag { 8 } else { 5 }
+        }
+    }
+
+    pub fn core_ch_config(&self) -> u8 {
+        if self.aac_channel_mode { 2 } else { 1 }
+    }
+
+    pub fn extension_sr_index(&self) -> u8 {
+        if self.dac_rate { 3 } else { 5 }
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        if self.dac_rate { 48000 } else { 32000 }
+    }
+
+    pub fn channels(&self) -> u8 {
+        if self.aac_channel_mode || self.ps_flag { 2 } else { 1 }
+    }
+
+    pub fn num_aus(&self) -> usize {
+        if self.dac_rate {
+            if self.sbr_flag { 3 } else { 6 }
+        } else {
+            if self.sbr_flag { 2 } else { 4 }
+        }
+    }
+
+    pub fn codec_name(&self) -> &'static str {
+        if self.sbr_flag {
+            if self.ps_flag { "HE-AAC v2" } else { "HE-AAC" }
+        } else {
+            "AAC-LC"
+        }
+    }
+
+    /// Build AudioSpecificConfig for FAAD2 initialization (960-sample transform)
+    pub fn build_asc(&self) -> Vec<u8> {
+        let mut asc = Vec::new();
+        // AAC LC (AOT 2)
+        asc.push(0b00010 << 3 | self.core_sr_index() >> 1);
+        asc.push(
+            (self.core_sr_index() & 0x01) << 7
+                | self.core_ch_config() << 3
+                | 0b100, // GASpecificConfig with 960 transform
+        );
+
+        if self.sbr_flag {
+            // SBR explicit backwards-compatible signaling
+            asc.push(0x56); // sync extension 0x2B7 = 0101 0110 111...
+            asc.push(0xE5); // ...101 = AOT 5 (SBR), 1 = SBR present
+            let ext_sr = self.extension_sr_index() << 3;
+            if self.ps_flag {
+                // PS explicit backwards-compatible signaling
+                asc.push(0x80 | ext_sr | 0x05); // ext_sr | 10101
+                asc.push(0x48); // 001 = PS extension, 0 = ...
+                asc.push(0x80); // PS present = 1
+            } else {
+                asc.push(0x80 | ext_sr);
+            }
+        }
+        asc
+    }
+}
+
+/// An extracted Access Unit ready for AAC decoding
+pub struct AccessUnit {
+    pub data: Vec<u8>,
+}
+
+/// PAD data extracted from an AAC AU
+pub struct PadData {
+    pub xpad: Vec<u8>,
+    pub fpad: [u8; FPAD_LEN],
+}
+
+/// Superframe filter: accumulates logical frames, RS-decodes, extracts AUs
+pub struct SuperframeFilter {
+    rs_dec: RsDecoder,
+    crc_ccitt: CrcCalculator,
+    crc_fire: CrcCalculator,
+    frame_len: usize,
+    frame_count: usize,
+    sf_raw: Vec<u8>,
+    sf: Vec<u8>,
+    sf_len: usize,
+    format: Option<SuperframeFormat>,
+    format_raw: u8,
+}
+
+impl SuperframeFilter {
+    pub fn new() -> Self {
+        SuperframeFilter {
+            rs_dec: RsDecoder::new(),
+            crc_ccitt: crc16_ccitt(),
+            crc_fire: crc_fire_code(),
+            frame_len: 0,
+            frame_count: 0,
+            sf_raw: Vec::new(),
+            sf: Vec::new(),
+            sf_len: 0,
+            format: None,
+            format_raw: 0,
+        }
+    }
+
+    /// Feed a subchannel frame (called once per ETI frame for the selected subchannel).
+    /// Returns decoded access units + optional PAD + optional format change.
+    pub fn feed(&mut self, data: &[u8]) -> SuperframeResult {
+        let len = data.len();
+
+        // Initialize frame length on first frame
+        if self.frame_len == 0 {
+            if len < 10 || (5 * len) % 120 != 0 {
+                return SuperframeResult::default();
+            }
+            self.frame_len = len;
+            self.sf_len = 5 * len;
+            self.sf_raw = vec![0u8; self.sf_len];
+            self.sf = vec![0u8; self.sf_len];
+        }
+
+        if len != self.frame_len {
+            return SuperframeResult::default();
+        }
+
+        // Accumulate frames using sliding window
+        if self.frame_count == 5 {
+            // Shift previous 4 frames
+            self.sf_raw.copy_within(self.frame_len.., 0);
+            self.sf_raw[4 * self.frame_len..].copy_from_slice(data);
+        } else {
+            let start = self.frame_count * self.frame_len;
+            self.sf_raw[start..start + self.frame_len].copy_from_slice(data);
+            self.frame_count += 1;
+        }
+
+        if self.frame_count < 5 {
+            return SuperframeResult::default();
+        }
+
+        // RS decode on copy
+        self.sf.copy_from_slice(&self.sf_raw);
+        let (_corr, _uncorr) = self.rs_dec.decode_superframe(&mut self.sf);
+
+        // Check fire code sync
+        if !self.check_sync() {
+            // Slide by 1 frame instead of resetting to find alignment faster
+            self.sf_raw.copy_within(self.frame_len.., 0);
+            self.frame_count = 4;
+            return SuperframeResult::default();
+        }
+
+        // Check format change
+        let mut format_changed = false;
+        if self.format.is_none() || self.format_raw != self.sf[2] {
+            self.format_raw = self.sf[2];
+            self.format = Some(self.parse_format());
+            format_changed = true;
+        }
+
+        let format = self.format.as_ref().unwrap();
+        let num_aus = format.num_aus();
+
+        // Extract AU boundaries
+        let au_start = self.compute_au_starts(num_aus);
+
+        // Decode each AU
+        let mut access_units = Vec::with_capacity(num_aus);
+        let mut pad_data = Vec::new();
+
+        for i in 0..num_aus {
+            let start = au_start[i];
+            let end = au_start[i + 1];
+            if start >= end || end > self.sf.len() {
+                continue;
+            }
+
+            let au_data = &self.sf[start..end];
+            let au_len = au_data.len();
+
+            // CRC check
+            if au_len < 2 {
+                continue;
+            }
+            let crc_stored = (au_data[au_len - 2] as u16) << 8 | au_data[au_len - 1] as u16;
+            let crc_calced = self.crc_ccitt.calc(&au_data[..au_len - 2]);
+            if crc_stored != crc_calced {
+                continue;
+            }
+
+            let au_payload = &au_data[..au_len - 2];
+            access_units.push(AccessUnit {
+                data: au_payload.to_vec(),
+            });
+
+            // Extract PAD from AAC AU (Data Stream Element)
+            if let Some(pad) = extract_pad_from_au(au_payload) {
+                pad_data.push(pad);
+            }
+        }
+
+        // Reset for next superframe
+        self.frame_count = 0;
+
+        SuperframeResult {
+            access_units,
+            pad_data,
+            format: if format_changed {
+                self.format.clone()
+            } else {
+                None
+            },
+        }
+    }
+
+    fn check_sync(&self) -> bool {
+        // Prevent sync on all-zero
+        if self.sf[3] == 0x00 && self.sf[4] == 0x00 {
+            return false;
+        }
+
+        // Fire code CRC
+        let crc_stored = (self.sf[0] as u16) << 8 | self.sf[1] as u16;
+        let crc_calced = self.crc_fire.calc(&self.sf[2..11]);
+        crc_stored == crc_calced
+    }
+
+    fn parse_format(&self) -> SuperframeFormat {
+        SuperframeFormat {
+            dac_rate: self.sf[2] & 0x40 != 0,
+            sbr_flag: self.sf[2] & 0x20 != 0,
+            aac_channel_mode: self.sf[2] & 0x10 != 0,
+            ps_flag: self.sf[2] & 0x08 != 0,
+            mpeg_surround_config: self.sf[2] & 0x07,
+        }
+    }
+
+    fn compute_au_starts(&self, num_aus: usize) -> Vec<usize> {
+        let sf = &self.sf;
+        let format = self.format.as_ref().unwrap();
+        let mut au_start = vec![0usize; num_aus + 1];
+
+        // First AU start depends on format
+        au_start[0] = if format.dac_rate {
+            if format.sbr_flag { 6 } else { 11 }
+        } else {
+            if format.sbr_flag { 5 } else { 8 }
+        };
+
+        // Last pseudo-AU boundary (after RS stripped)
+        au_start[num_aus] = self.sf_len / 120 * 110;
+
+        // Parse AU start offsets from superframe header
+        au_start[1] = (sf[3] as usize) << 4 | (sf[4] as usize) >> 4;
+        if num_aus >= 3 {
+            au_start[2] = ((sf[4] & 0x0F) as usize) << 8 | sf[5] as usize;
+        }
+        if num_aus >= 4 {
+            au_start[3] = (sf[6] as usize) << 4 | (sf[7] as usize) >> 4;
+        }
+        if num_aus == 6 {
+            au_start[4] = ((sf[7] & 0x0F) as usize) << 8 | sf[8] as usize;
+            au_start[5] = (sf[9] as usize) << 4 | (sf[10] as usize) >> 4;
+        }
+
+        au_start
+    }
+
+    /// Get the current format (if determined)
+    pub fn format(&self) -> Option<&SuperframeFormat> {
+        self.format.as_ref()
+    }
+}
+
+/// Result of feeding a frame to the superframe filter
+#[derive(Default)]
+pub struct SuperframeResult {
+    pub access_units: Vec<AccessUnit>,
+    pub pad_data: Vec<PadData>,
+    pub format: Option<SuperframeFormat>,
+}
+
+/// Extract PAD data from an AAC AU (embedded in Data Stream Element)
+fn extract_pad_from_au(data: &[u8]) -> Option<PadData> {
+    if data.len() < 3 {
+        return None;
+    }
+
+    // Check for DSE: element_id type 4 (data[0] >> 5 == 4)
+    if (data[0] >> 5) != 4 {
+        return None;
+    }
+
+    let mut pad_start = 2;
+    let mut pad_len = data[1] as usize;
+    if pad_len == 255 {
+        if data.len() < 4 {
+            return None;
+        }
+        pad_len += data[2] as usize;
+        pad_start = 3;
+    }
+
+    if pad_len < FPAD_LEN || data.len() < pad_start + pad_len {
+        return None;
+    }
+
+    let xpad_len = pad_len - FPAD_LEN;
+    let xpad = data[pad_start..pad_start + xpad_len].to_vec();
+    let fpad_start = pad_start + xpad_len;
+    let fpad = [data[fpad_start], data[fpad_start + 1]];
+
+    Some(PadData { xpad, fpad })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_superframe_format_num_aus() {
+        let fmt = SuperframeFormat {
+            dac_rate: true,
+            sbr_flag: true,
+            aac_channel_mode: true,
+            ps_flag: false,
+            mpeg_surround_config: 0,
+        };
+        assert_eq!(fmt.num_aus(), 3);
+
+        let fmt2 = SuperframeFormat {
+            dac_rate: true,
+            sbr_flag: false,
+            aac_channel_mode: true,
+            ps_flag: false,
+            mpeg_surround_config: 0,
+        };
+        assert_eq!(fmt2.num_aus(), 6);
+
+        let fmt3 = SuperframeFormat {
+            dac_rate: false,
+            sbr_flag: true,
+            aac_channel_mode: false,
+            ps_flag: false,
+            mpeg_surround_config: 0,
+        };
+        assert_eq!(fmt3.num_aus(), 2);
+    }
+
+    #[test]
+    fn test_superframe_format_asc() {
+        let fmt = SuperframeFormat {
+            dac_rate: true,
+            sbr_flag: true,
+            aac_channel_mode: true,
+            ps_flag: true,
+            mpeg_surround_config: 0,
+        };
+        let asc = fmt.build_asc();
+        // Should contain SBR + PS signaling
+        assert!(asc.len() >= 5);
+        assert_eq!(fmt.codec_name(), "HE-AAC v2");
+    }
+
+    #[test]
+    fn test_superframe_format_sample_rate() {
+        let fmt48 = SuperframeFormat {
+            dac_rate: true,
+            sbr_flag: false,
+            aac_channel_mode: false,
+            ps_flag: false,
+            mpeg_surround_config: 0,
+        };
+        assert_eq!(fmt48.sample_rate(), 48000);
+
+        let fmt32 = SuperframeFormat {
+            dac_rate: false,
+            sbr_flag: false,
+            aac_channel_mode: false,
+            ps_flag: false,
+            mpeg_surround_config: 0,
+        };
+        assert_eq!(fmt32.sample_rate(), 32000);
+    }
+
+    #[test]
+    fn test_extract_pad_from_au_no_dse() {
+        let data = [0x00, 0x00, 0x00];
+        assert!(extract_pad_from_au(&data).is_none());
+    }
+
+    #[test]
+    fn test_extract_pad_from_au_dse() {
+        // DSE element: type=4 (0x80), length=4 (2 xpad + 2 fpad)
+        let data = [0x80, 0x04, 0xAA, 0xBB, 0xCC, 0xDD];
+        let pad = extract_pad_from_au(&data).unwrap();
+        assert_eq!(pad.xpad, vec![0xAA, 0xBB]);
+        assert_eq!(pad.fpad, [0xCC, 0xDD]);
+    }
+
+    #[test]
+    fn test_superframe_filter_initialization() {
+        let sf = SuperframeFilter::new();
+        assert_eq!(sf.frame_len, 0);
+        assert!(sf.format.is_none());
+    }
+}

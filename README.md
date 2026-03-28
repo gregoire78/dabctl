@@ -2,9 +2,9 @@
 
 # 📡 eti-rtlsdr-rust
 
-**Convertisseur DAB → ETI en Rust, via RTL-SDR**
+**Réception DAB complète en Rust : RTL-SDR → ETI → PCM audio**
 
-Port Rust de [eti-cmdline](https://github.com/JvanKatwijk/eti-stuff) (C++).
+Port Rust de [eti-cmdline](https://github.com/JvanKatwijk/eti-stuff) (IQ → ETI) et [dablin](https://github.com/Opendigitalradio/dablin) (ETI → audio).
 
 [![Rust](https://img.shields.io/badge/Rust-2021-orange)](https://www.rust-lang.org/)
 [![License: GPL-2.0](https://img.shields.io/badge/License-GPL%202.0-blue.svg)](COPYING)
@@ -22,13 +22,12 @@ cargo build --release
 # 2. Configurer LD_LIBRARY_PATH
 export LD_LIBRARY_PATH=$(find target -name "librtlsdr.so.0" 2>/dev/null | head -1 | xargs dirname):$LD_LIBRARY_PATH
 
-# 3. Recevoir le canal 11C, pipe vers dablin
-./target/release/eti-rtlsdr-rust -S -C 11C -G 80 | dablin_gtk -L
-```
+# 3. Pipeline complète : RTL-SDR → ETI → PCM → lecteur audio
+sudo ./target/release/eti-rtlsdr-rust iq2eti -S -C 6C -G 20 \
+  | ./target/release/eti-rtlsdr-rust eti2pcm -F -s 0xF2F8 -p \
+  | ffplay -f s16le -ar 48000 -ac 2 -i -
 
-Ou via le script helper :
-
-```bash
+# 4. Ou plus simplement, avec le script helper :
 ./eti-rtlsdr-rust.sh -S -C 11C -G 80 | dablin_gtk -L
 ```
 
@@ -45,9 +44,11 @@ Ou via le script helper :
 | `pkg-config` | Découverte de libs |
 | `build-essential` | Compilateur C |
 | `clang`, `libclang-dev` | Requis par bindgen |
+| `libfaad-dev` | Décodeur AAC pour DAB+ (`eti2pcm`) |
+| `libmpg123-dev` | Décodeur MP2 pour DAB classique (`eti2pcm`) |
 
 ```bash
-sudo apt install -y cmake libusb-1.0-0-dev pkg-config build-essential clang libclang-dev
+sudo apt install -y cmake libusb-1.0-0-dev pkg-config build-essential clang libclang-dev libfaad-dev libmpg123-dev
 ```
 
 ### Rust
@@ -62,14 +63,16 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 |---|---|---|---|
 | **librtlsdr** | 0.6+ | Pilote RTL-SDR (compilé automatiquement via `build.rs`) | [osmocom/rtl-sdr](https://github.com/osmocom/rtl-sdr) |
 | **libusb-1.0** | 1.0+ | Backend USB pour librtlsdr | [libusb.info](https://libusb.info) |
+| **libfaad2** | 2.11+ | Décodeur AAC (DAB+) pour `eti2pcm` | [knik-o/faad2](https://github.com/knik-o/faad2) |
+| **libmpg123** | 1.32+ | Décodeur MP2 (DAB classique) pour `eti2pcm` | [mpg123.de](https://mpg123.de) |
 
-> **Note :** `librtlsdr` est incluse dans le dépôt (`rtl-sdr/`) et compilée statiquement par `build.rs` via CMake. Seule `libusb` doit être installée sur le système.
+> **Note :** `librtlsdr` est incluse dans le dépôt (`rtl-sdr/`) et compilée statiquement par `build.rs` via CMake. Seule `libusb` doit être installée sur le système. `libfaad2` et `libmpg123` sont nécessaires uniquement pour la sous-commande `eti2pcm`.
 
 ### Crates Rust
 
 | Crate | Version | Rôle |
 |---|---|---|
-| `clap` | 4.4 | Parsing des arguments CLI |
+| `clap` | 4.4 | Parsing des arguments CLI (sous-commandes) |
 | `rustfft` | 6.4 | FFT pour démodulation OFDM |
 | `num-complex` | 0.4 | Types complexes (IQ) |
 | `rayon` | 1.10 | Parallélisation des sous-canaux |
@@ -77,6 +80,10 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 | `tracing-subscriber` | 0.3 | Formatage et filtrage des logs |
 | `anyhow` | 1.0 | Gestion d'erreurs |
 | `ctrlc` | 3.4 | Handler Ctrl-C |
+| `libc` | 0.2 | Écriture JSON sur fd 3 (`eti2pcm`) |
+| `serde` | 1.0 | Sérialisation (`eti2pcm`) |
+| `serde_json` | 1.0 | Sortie JSON métadonnées DAB (`eti2pcm`) |
+| `base64` | 0.22 | Encodage base64 des images slideshow (`eti2pcm`) |
 | `bindgen` | 0.69 | Génération FFI C → Rust (build) |
 | `cmake` | 0.1 | Compilation librtlsdr (build) |
 
@@ -150,6 +157,17 @@ src/
     cif_interleaver.rs      → tests entrelacement CIF
     protection.rs           → tests EEP/UEP
     prot_tables.rs          → tests tables de poinçonnage
+  eti2pcm/
+    crc.rs                  → tests CRC-16-CCITT, Fire Code
+    eti_reader.rs           → tests lecture ETI (sync FSYNC)
+    eti_frame.rs            → tests parsing trame ETI
+    fic_decoder.rs          → tests FIG 0/0, 0/1, 0/2, 1/0, 1/1
+    rs_decoder.rs           → tests Reed-Solomon GF(2^8)
+    superframe.rs           → tests superframe DAB+
+    pad_decoder.rs          → tests PAD / DLS / MOT slideshow
+    pad_output.rs           → tests JSON fd 3 + slideshow
+    mot_decoder.rs          → tests X-PAD MOT DataGroup decoder
+    mot_manager.rs          → tests MOT object reassembly
 ```
 
 ---
@@ -232,8 +250,18 @@ tar -czf eti-rtlsdr-rust-${VERSION}-aarch64-linux.tar.gz \
 
 ## ⚙️ Options CLI
 
+Le binaire expose deux sous-commandes :
+
 ```
-eti-rtlsdr-rust [OPTIONS]
+eti-rtlsdr-rust <COMMAND>
+  iq2eti     Générer un flux ETI depuis RTL-SDR (IQ → ETI)
+  eti2pcm    Décoder un flux ETI en audio PCM (comme dablin)
+```
+
+### `iq2eti` — RTL-SDR → ETI
+
+```
+eti-rtlsdr-rust iq2eti [OPTIONS]
 ```
 
 | Option | Court | Description | Défaut |
@@ -249,6 +277,35 @@ eti-rtlsdr-rust [OPTIONS]
 | `--silent` | `-S` | Mode silencieux (pas de log stderr) | off |
 | `--device-index` | | Index dongle RTL-SDR | `0` |
 
+### `eti2pcm` — ETI → PCM audio
+
+```
+eti-rtlsdr-rust eti2pcm [OPTIONS] [FILE]
+```
+
+| Option | Court | Description | Défaut |
+|---|---|---|---|
+| `--sid` | `-s` | Service ID hex (ex: `0xF2F8`) | — |
+| `--label` | `-l` | Sélection par nom de service | — |
+| `--first` | `-1` | Jouer le premier service trouvé | off |
+| `--pcm` | `-p` | Sortie PCM 16-bit sur stdout | off |
+| `--disable-dyn-fic` | `-F` | Désactiver les messages FIC sur stderr | off |
+| `--slide-dir` | `-S` | Sauvegarder les images slideshow dans ce dossier | — |
+| `--slide-base64` | | Sortir les slides en base64 JSON sur fd 3 | off |
+| `[FILE]` | | Fichier ETI (défaut : stdin) | stdin |
+
+**Sortie audio :** PCM signé 16-bit little-endian, stéréo, 48 kHz (ou 32 kHz pour certains services DAB+).
+
+**Métadonnées JSON (fd 3) :** Si le file descriptor 3 est ouvert, `eti2pcm` y écrit les métadonnées DAB au format JSON, une ligne par événement :
+- `{"ensemble":{"eid":"0x...","label":"..."}}` — informations ensemble
+- `{"service":{"sid":"0x...","label":"..."}}` — service sélectionné
+- `{"dl":"..."}` — Dynamic Label (texte en cours de diffusion)
+- `{"slide":{"contentName":"...","contentType":"image/jpeg","data":"base64..."}}` — slideshow (avec `--slide-base64`)
+
+**Slideshow :** Les images MOT (JPEG/PNG) diffusées via X-PAD peuvent être :
+- Sauvegardées sur disque avec `-S /chemin/dossier`
+- Envoyées en base64 JSON sur fd 3 avec `--slide-base64`
+
 ### Canaux bande III
 
 5A–13F (174.928–239.200 MHz). Les canaux L-Band (LA–LP, 1452–1478 MHz) sont aussi supportés.
@@ -257,34 +314,89 @@ eti-rtlsdr-rust [OPTIONS]
 
 ## 💡 Exemples
 
+### Pipeline complète : RTL-SDR → PCM → lecteur audio
+
+```bash
+# Écouter NRJ (SID 0xF2F8) sur le canal 6C sans dépendance externe (sauf ffplay)
+sudo ./target/release/eti-rtlsdr-rust iq2eti -S -C 6C -G 20 \
+  | ./target/release/eti-rtlsdr-rust eti2pcm -F -s 0xF2F8 -p \
+  | ffplay -f s16le -ar 48000 -ac 2 -nodisp -i -
+```
+
+### Pipeline avec métadonnées JSON
+
+```bash
+# fd 3 redirigé vers un fichier pour capturer DLS, ensemble, service
+sudo ./target/release/eti-rtlsdr-rust iq2eti -S -C 6C -G 20 \
+  | ./target/release/eti-rtlsdr-rust eti2pcm -F -s 0xF2F8 -p 3>metadata.json \
+  | ffplay -f s16le -ar 48000 -ac 2 -nodisp -i -
+```
+
+### Décoder un fichier ETI existant
+
+```bash
+# Décoder un fichier ETI capturé en PCM
+./target/release/eti-rtlsdr-rust eti2pcm -s 0xF2F8 -p capture.eti > output.raw
+ffplay -f s16le -ar 48000 -ac 2 output.raw
+
+# Ou par nom de service
+./target/release/eti-rtlsdr-rust eti2pcm -l "NRJ" -p capture.eti > output.raw
+```
+
+### Jouer le premier service trouvé
+
+```bash
+./target/release/eti-rtlsdr-rust eti2pcm -1 -p < capture.eti | aplay -f S16_LE -r 48000 -c 2
+```
+
 ### Recevoir et sauvegarder un fichier ETI
 
 ```bash
-sudo ./target/release/eti-rtlsdr-rust -C 6C -G 20 -O "6C_$(date +%F_%H%M).eti"
+sudo ./target/release/eti-rtlsdr-rust iq2eti -C 6C -G 20 -O "6C_$(date +%F_%H%M).eti"
 ```
 
-### Pipeline vers dablin
+### Pipeline vers dablin (compatibilité)
 
 ```bash
-sudo ./target/release/eti-rtlsdr-rust -S -C 6C -G 20 | dablin_gtk -L
+sudo ./target/release/eti-rtlsdr-rust iq2eti -S -C 6C -G 20 | dablin_gtk -L
 ```
 
 ### dablin CLI avec sélection de service
 
 ```bash
-sudo ./target/release/eti-rtlsdr-rust -S -C 6C -G 20 | dablin -F -s 0xF2F8 -p
+sudo ./target/release/eti-rtlsdr-rust iq2eti -S -C 6C -G 20 | dablin -F -s 0xF2F8 -p
 ```
 
 ### Enregistrement limité à 60 secondes
 
 ```bash
-sudo ./target/release/eti-rtlsdr-rust -C 6C -G 20 -t 60 -O capture.eti
+sudo ./target/release/eti-rtlsdr-rust iq2eti -C 6C -G 20 -t 60 -O capture.eti
 ```
 
-### Exporter en WAV (via dablin)
+### Convertir en WAV (via eti2pcm + ffmpeg)
 
 ```bash
-sudo ./target/release/eti-rtlsdr-rust -S -C 6C -G 20 -t 15 | dablin -s 0xF2F8 -w > output.wav
+sudo ./target/release/eti-rtlsdr-rust iq2eti -S -C 6C -G 20 -t 15 \
+  | ./target/release/eti-rtlsdr-rust eti2pcm -s 0xF2F8 -p \
+  | ffmpeg -f s16le -ar 48000 -ac 2 -i - output.wav
+```
+
+### Sauvegarder les images slideshow
+
+```bash
+sudo ./target/release/eti-rtlsdr-rust iq2eti -S -C 6C -G 20 \
+  | ./target/release/eti-rtlsdr-rust eti2pcm -s 0xF2F8 -p -S /tmp/slides \
+  | ffplay -f s16le -ar 48000 -ac 2 -nodisp -i -
+# Les images JPEG/PNG reçues sont sauvegardées dans /tmp/slides/
+```
+
+### Slideshow en base64 JSON (fd 3)
+
+```bash
+sudo ./target/release/eti-rtlsdr-rust iq2eti -S -C 6C -G 20 \
+  | ./target/release/eti-rtlsdr-rust eti2pcm -s 0xF2F8 -p --slide-base64 3>pad.json \
+  | ffplay -f s16le -ar 48000 -ac 2 -nodisp -i -
+# Le fichier pad.json contient les infos DAB + les slides en base64
 ```
 
 ### Test fonctionnel automatisé
@@ -306,9 +418,6 @@ Vérifie : build → détection dongle → capture 10s → validation frames ETI
 git clone https://github.com/votre-user/eti-rtlsdr-rust.git
 cd eti-rtlsdr-rust
 cargo build --release
-
-# Installer dablin (décodeur ETI → audio)
-sudo apt install -y dablin
 ```
 
 ### Étape 2 — Brancher le dongle RTL-SDR
@@ -342,7 +451,7 @@ Le DAB en France utilise la bande III. Les multiplexes principaux :
 
 ```bash
 # Tester un canal (ex: 6C à Paris)
-./eti-rtlsdr-rust.sh -C 6C -G 20 -t 5 -O /dev/null
+./eti-rtlsdr-rust.sh iq2eti -C 6C -G 20 -t 5 -O /dev/null
 ```
 
 Si vous voyez `ensemble ... detected` et des `program ... is in the list`, le canal fonctionne.
@@ -351,19 +460,24 @@ Si vous voyez `ensemble ... detected` et des `program ... is in the list`, le ca
 
 ```bash
 # Capturer 60 secondes du canal 6C
-./eti-rtlsdr-rust.sh -C 6C -G 20 -t 60 -O capture_6C.eti
+./eti-rtlsdr-rust.sh iq2eti -C 6C -G 20 -t 60 -O capture_6C.eti
 ```
 
-Le fichier ETI peut être relu plus tard avec dablin sans le dongle.
+Le fichier ETI peut être relu plus tard avec `eti2pcm` sans le dongle.
 
-### Étape 5 — Écouter en direct (pipe vers dablin)
+### Étape 5 — Écouter en direct (pipeline intégrée)
 
 ```bash
 # Écouter un programme spécifique (ex: NRJ, SID 0xF2F8)
-sudo ./target/release/eti-rtlsdr-rust -S -C 6C -G 20 | dablin -s 0xF2F8
+sudo ./target/release/eti-rtlsdr-rust iq2eti -S -C 6C -G 20 \
+  | ./target/release/eti-rtlsdr-rust eti2pcm -F -s 0xF2F8 -p \
+  | ffplay -f s16le -ar 48000 -ac 2 -nodisp -i -
 
-# Ou avec l'interface graphique (sélection visuelle du programme)
-sudo ./target/release/eti-rtlsdr-rust -S -C 6C -G 20 | dablin_gtk
+# Ou avec dablin (si installé)
+sudo ./target/release/eti-rtlsdr-rust iq2eti -S -C 6C -G 20 | dablin -s 0xF2F8
+
+# Ou avec l'interface graphique dablin
+sudo ./target/release/eti-rtlsdr-rust iq2eti -S -C 6C -G 20 | dablin_gtk
 ```
 
 > **Astuce** : lancez d'abord sans `-S` pour voir les SID des programmes disponibles dans stderr, puis relancez avec `-S` et `-s 0xSID`.
@@ -371,10 +485,12 @@ sudo ./target/release/eti-rtlsdr-rust -S -C 6C -G 20 | dablin_gtk
 ### Étape 6 — Relire une capture
 
 ```bash
-# Relire le fichier ETI capturé avec dablin
-dablin -s 0xF2F8 < capture_6C.eti
+# Relire le fichier ETI capturé avec eti2pcm (intégré)
+./target/release/eti-rtlsdr-rust eti2pcm -s 0xF2F8 -p capture_6C.eti \
+  | ffplay -f s16le -ar 48000 -ac 2 -nodisp -i -
 
-# Ou avec l'interface graphique
+# Ou avec dablin (si installé)
+dablin -s 0xF2F8 < capture_6C.eti
 dablin_gtk < capture_6C.eti
 ```
 
@@ -387,9 +503,11 @@ cargo build --release --target aarch64-unknown-linux-gnu
 # Déployer
 scp target/aarch64-unknown-linux-gnu/release/eti-rtlsdr-rust pi@raspberrypi:~
 
-# Sur le Pi
+# Sur le Pi — écouter en direct
 ssh pi@raspberrypi
-./eti-rtlsdr-rust -S -C 6C -G 30 | dablin -s 0xF2F8
+./eti-rtlsdr-rust iq2eti -S -C 6C -G 30 \
+  | ./eti-rtlsdr-rust eti2pcm -F -s 0xF2F8 -p \
+  | aplay -f S16_LE -r 48000 -c 2
 ```
 
 ---
@@ -397,10 +515,12 @@ ssh pi@raspberrypi
 ## 🏗️ Architecture
 
 ```
-build.rs              CMake librtlsdr + bindgen FFI
+build.rs              CMake librtlsdr + bindgen FFI + link faad/mpg123
 src/
-  main.rs             CLI (clap) → orchestration
+  main.rs             CLI (clap sous-commandes) → routage iq2eti / eti2pcm
   lib.rs              Déclarations modules
+  iq2eti.rs           Sous-commande iq2eti (ancien main.rs)
+  eti2pcm_cmd.rs      Sous-commande eti2pcm (pipeline ETI → PCM)
   rtlsdr_sys.rs       FFI bindings auto-générés
   dab_constants.rs    Constantes, CRC, bit utils
   support/
@@ -422,13 +542,41 @@ src/
     eti_generator.rs  Construction trame ETI
   device/
     rtlsdr_handler.rs RTL-SDR via FFI C
+  eti2pcm/
+    crc.rs            CRC-16-CCITT + Fire Code
+    eti_reader.rs     Lecture trames ETI 6144 octets (sync FSYNC)
+    eti_frame.rs      Parsing en-tête ETI (ERR, FC, STC, EOH)
+    fic_decoder.rs    Décodage FIC/FIG pour découverte services
+    rs_decoder.rs     Reed-Solomon (120,110) GF(2^8) pur Rust
+    superframe.rs     Superframe DAB+ (5 frames → RS → AU)
+    aac_decoder.rs    FFI libfaad2 (décodage AAC DAB+)
+    mp2_decoder.rs    FFI libmpg123 (décodage MP2 DAB)
+    pad_decoder.rs    PAD : F-PAD + X-PAD + DLS (Dynamic Label) + MOT slideshow
+    pad_output.rs     Sortie JSON métadonnées + slideshow sur fd 3
+    mot_decoder.rs    X-PAD → MOT DataGroup (accumulation + CRC)
+    mot_manager.rs    MOT DataGroup → objet MOT (header+body → image JPEG/PNG)
 ```
 
-### Threads
+### Threads (iq2eti)
 
 1. **Main** : CLI, sync detection, status display
 2. **OFDM** : `ofdm_processor.run()` lit IQ depuis device, démodule, envoie blocs
 3. **ETI** : `eti_generator.run_loop()` reçoit blocs, FIC + CIF interleaving + sortie ETI
+
+### Pipeline (eti2pcm)
+
+```
+stdin/fichier ETI
+  → EtiReader (sync FSYNC, blocs 6144 octets)
+    → parse_eti_frame (en-tête, FIC, sous-canaux)
+      → FicDecoder (FIG 0/0, 0/1, 0/2, 1/0, 1/1 → découverte services)
+      → subchannel_data(subchid)
+        → SuperframeFilter (5 frames → RS(120,110) → AU)
+          → AacDecoder (libfaad2) ou Mp2Decoder (libmpg123)
+            → PCM 16-bit stdout
+        → PadDecoder (F-PAD + X-PAD → DLS)
+          → PadOutput (JSON fd 3)
+```
 
 ---
 
@@ -516,6 +664,8 @@ GPL-2.0 — Même licence que librtlsdr.
 
 ## 🔗 Références
 
-- [eti-stuff](https://github.com/JvanKatwijk/eti-stuff) — Implémentation C++ de référence
+- [eti-stuff](https://github.com/JvanKatwijk/eti-stuff) — Implémentation C++ de référence (IQ → ETI)
+- [dablin](https://github.com/Opendigitalradio/dablin) — Décodeur ETI → audio (C++, base du port `eti2pcm`)
 - [rtl-sdr](https://github.com/osmocom/rtl-sdr) — Driver RTL-SDR
-- [dablin](https://github.com/Opendigitalradio/dablin) — Décodeur ETI → audio
+- [ETSI EN 300 401](https://www.etsi.org/deliver/etsi_en/300400_300499/300401/) — Norme DAB
+- [ETSI TS 102 563](https://www.etsi.org/deliver/etsi_ts/102500_102599/102563/) — Norme DAB+

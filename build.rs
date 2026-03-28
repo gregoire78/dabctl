@@ -85,6 +85,10 @@ fn main() {
     }
     println!("cargo:rustc-link-lib=usb-1.0");
 
+    // Link audio decoding libraries (for eti2pcm)
+    println!("cargo:rustc-link-lib=faad");
+    println!("cargo:rustc-link-lib=mpg123");
+
     // Générer les bindings avec bindgen
     let header_path = format!("{}/include/rtl-sdr.h", rtlsdr_dir);
     let include_path = format!("{}/include", rtlsdr_dir);

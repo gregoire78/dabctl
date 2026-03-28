@@ -1,10 +1,10 @@
 .\" Man page for eti-rtlsdr-rust
 .\" Copyright (C) 2025 — GPL-2.0
-.TH ETI-RTLSDR-RUST 1 "2026-03-27" "0.3.0" "DAB ETI Generator"
+.TH ETI-RTLSDR-RUST 1 "2025-07-12" "0.5.0" "DAB ETI Tools"
 .SH NAME
-eti\-rtlsdr\-rust \- receive DAB radio via RTL-SDR and output ETI frames
+eti\-rtlsdr\-rust \- receive DAB radio via RTL-SDR (iq2eti) and decode ETI to PCM audio (eti2pcm)
 .SH SYNOPSIS
-.B eti\-rtlsdr\-rust
+.B eti\-rtlsdr\-rust iq2eti
 .RB [ \-C
 .IR channel ]
 .RB [ \-G
@@ -23,19 +23,38 @@ eti\-rtlsdr\-rust \- receive DAB radio via RTL-SDR and output ETI frames
 .RB [ \-S ]
 .RB [ \-\-device\-index
 .IR n ]
+.PP
+.B eti\-rtlsdr\-rust eti2pcm
+.RB [ \-s
+.IR sid ]
+.RB [ \-l
+.IR label ]
+.RB [ \-1 ]
+.RB [ \-p ]
+.RB [ \-F ]
+.RB [ \-S
+.IR dir ]
+.RB [ \-\-slide\-base64 ]
+.RI [ file ]
 .SH DESCRIPTION
 .B eti\-rtlsdr\-rust
-is a DAB (Digital Audio Broadcasting) to ETI (Ensemble Transport Interface) converter.
-It receives DAB signals from an RTL-SDR dongle, demodulates the OFDM signal,
+provides two subcommands for DAB (Digital Audio Broadcasting) processing:
+.SS iq2eti
+Receives DAB signals from an RTL-SDR dongle, demodulates the OFDM signal,
 decodes the FIC (Fast Information Channel), and outputs ETI-NI frames
-(6144 bytes each) suitable for decoding with
-.BR dablin (1)
-or similar software.
-.PP
-The program is a faithful port of
+(6144 bytes each) on stdout or to a file.
+This is a faithful port of
 .I eti\-cmdline
 (C++) to Rust.
+.SS eti2pcm
+Reads ETI frames from stdin or a file, selects an audio service (DAB or DAB+),
+decodes it to PCM audio written to stdout. Optionally outputs DAB metadata
+(ensemble info, service info, Dynamic Label) as JSON on file descriptor 3.
+This is a port of
+.I dablin
+(C++) to Rust.
 .SH OPTIONS
+.SS iq2eti options
 .TP
 .BR \-C ", " \-\-channel " " \fIchannel\fR
 DAB channel to tune to. Examples: 5A, 6C, 11C, 12C.
@@ -44,7 +63,7 @@ Default:
 .BR 11C .
 .TP
 .BR \-G ", " \-\-gain " " \fIpercent\fR
-Tuner gain as a percentage from 0 to 100. Mapped to the nearest supported gain value of the RTL-SDR hardware.
+Tuner gain as a percentage from 0 to 100.
 Default:
 .BR 50 .
 .TP
@@ -58,37 +77,66 @@ Enable automatic gain control (AGC). Overrides
 .BR \-G .
 .TP
 .BR \-d ", " \-\-sync\-time " " \fIseconds\fR
-Timeout in seconds to wait for time synchronization (null symbol detection).
-If no DAB signal is found within this time, the program exits with code 1.
+Timeout for time synchronization (null symbol detection).
 Default:
 .BR 5 .
 .TP
 .BR \-D ", " \-\-detect\-time " " \fIseconds\fR
-Timeout in seconds to wait for ensemble detection (FIC decoding).
+Timeout for ensemble detection (FIC decoding).
 Default:
 .BR 10 .
 .TP
 .BR \-O ", " \-\-output " " \fIfile\fR
 Output file path. Use
 .B \-
-for stdout (same as default).
+for stdout.
 Default: stdout.
 .TP
 .BR \-t ", " \-\-record\-time " " \fIseconds\fR
-Recording duration in seconds.
+Recording duration.
 .B \-1
-means record indefinitely until interrupted (Ctrl-C).
+means indefinite.
 Default:
 .BR \-1 .
 .TP
 .BR \-S ", " \-\-silent
-Silent mode. Suppress status messages on stderr (SNR, FIC quality).
-Useful when piping ETI to another program.
+Suppress status messages on stderr.
 .TP
 .BI \-\-device\-index " n"
-RTL-SDR device index when multiple dongles are connected.
+RTL-SDR device index.
 Default:
 .BR 0 .
+.SS eti2pcm options
+.TP
+.BR \-s ", " \-\-sid " " \fIsid\fR
+Service ID in hexadecimal (e.g., 0xF2F8 or F2F8). Selects the audio service to decode.
+.TP
+.BR \-l ", " \-\-label " " \fIlabel\fR
+Select service by label name (case-sensitive match).
+.TP
+.BR \-1 ", " \-\-first
+Play the first audio service found in the ensemble.
+.TP
+.BR \-p ", " \-\-pcm
+Enable PCM output on stdout. Signed 16-bit little-endian, stereo.
+Sample rate is typically 48000 Hz (or 32000 Hz for some DAB+ services).
+.TP
+.BR \-F ", " \-\-disable\-dyn\-fic
+Disable dynamic FIC messages on stderr.
+.TP
+.BR \-S ", " \-\-slide\-dir " " \fIdir\fR
+Save slideshow images (JPEG/PNG) to the specified directory.
+The directory is created automatically if it does not exist.
+Files are named using the MOT ContentName field or a default name.
+.TP
+.BR \-\-slide\-base64
+Output slideshow images as base64-encoded JSON on file descriptor 3.
+Each slide is written as a JSON object (see
+.B JSON METADATA
+below).
+.TP
+.I file
+ETI input file. If omitted, reads from stdin.
 .SH EXIT STATUS
 .TP
 .B 0
@@ -107,45 +155,84 @@ Invalid channel name.
 Failed to start RTL-SDR reader.
 .SH EXAMPLES
 .PP
+.B Full pipeline \(em RTL-SDR to audio:
+.RS
+.nf
+eti\-rtlsdr\-rust iq2eti \-S \-C 6C \-G 20 \\
+  | eti\-rtlsdr\-rust eti2pcm \-F \-s 0xF2F8 \-p \\
+  | ffplay \-f s16le \-ar 48000 \-ac 2 \-nodisp \-i \-
+.fi
+.RE
+.PP
+.B Pipeline with JSON metadata on fd 3:
+.RS
+.nf
+eti\-rtlsdr\-rust iq2eti \-S \-C 6C \-G 20 \\
+  | eti\-rtlsdr\-rust eti2pcm \-F \-s 0xF2F8 \-p 3>metadata.json \\
+  | ffplay \-f s16le \-ar 48000 \-ac 2 \-nodisp \-i \-
+.fi
+.RE
+.PP
 .B Save ETI to a file:
 .RS
 .nf
-eti\-rtlsdr\-rust \-C 6C \-G 20 \-O capture.eti
+eti\-rtlsdr\-rust iq2eti \-C 6C \-G 20 \-O capture.eti
 .fi
 .RE
 .PP
-.B Pipe to dablin for live listening:
+.B Decode an ETI file to PCM:
 .RS
 .nf
-eti\-rtlsdr\-rust \-S \-C 6C \-G 20 | dablin \-s 0xF2F8
+eti\-rtlsdr\-rust eti2pcm \-s 0xF2F8 \-p capture.eti > output.raw
+ffplay \-f s16le \-ar 48000 \-ac 2 output.raw
 .fi
 .RE
 .PP
-.B Pipe to dablin_gtk for graphical selection:
+.B Play first service from stdin:
 .RS
 .nf
-eti\-rtlsdr\-rust \-S \-C 11C \-G 80 | dablin_gtk
+eti\-rtlsdr\-rust eti2pcm \-1 \-p < capture.eti | aplay \-f S16_LE \-r 48000 \-c 2
+.fi
+.RE
+.PP
+.B Pipe to dablin (compatibility):
+.RS
+.nf
+eti\-rtlsdr\-rust iq2eti \-S \-C 6C \-G 20 | dablin \-s 0xF2F8
 .fi
 .RE
 .PP
 .B Record 60 seconds:
 .RS
 .nf
-eti\-rtlsdr\-rust \-C 5A \-G 70 \-t 60 \-O capture.eti
+eti\-rtlsdr\-rust iq2eti \-C 5A \-G 70 \-t 60 \-O capture.eti
 .fi
 .RE
 .PP
-.B Replay a captured ETI file:
+.B Convert to WAV:
 .RS
 .nf
-dablin \-s 0xF211 < capture.eti
+eti\-rtlsdr\-rust iq2eti \-S \-C 6C \-G 20 \-t 15 \\
+  | eti\-rtlsdr\-rust eti2pcm \-s 0xF2F8 \-p \\
+  | ffmpeg \-f s16le \-ar 48000 \-ac 2 \-i \- output.wav
 .fi
 .RE
 .PP
-.B Run the automated test:
+.B Save slideshow images to a directory:
 .RS
 .nf
-sudo bash test\-capture.sh 6C 20
+eti\-rtlsdr\-rust iq2eti \-S \-C 6C \-G 20 \\
+  | eti\-rtlsdr\-rust eti2pcm \-s 0xF2F8 \-p \-S /tmp/slides \\
+  | ffplay \-f s16le \-ar 48000 \-ac 2 \-nodisp \-i \-
+.fi
+.RE
+.PP
+.B Get slideshow as base64 JSON on fd 3:
+.RS
+.nf
+eti\-rtlsdr\-rust iq2eti \-S \-C 6C \-G 20 \\
+  | eti\-rtlsdr\-rust eti2pcm \-s 0xF2F8 \-p \-\-slide\-base64 3>pad.json \\
+  | ffplay \-f s16le \-ar 48000 \-ac 2 \-nodisp \-i \-
 .fi
 .RE
 .SH ETI FORMAT
@@ -167,6 +254,46 @@ Timestamp (set to 0xFFFFFFFF).
 Remaining bytes filled with 0x55.
 .PP
 At 24 frames per second, the ETI bitrate is approximately 1.2 Mbit/s.
+.SH JSON METADATA (eti2pcm)
+When file descriptor 3 is open, the
+.B eti2pcm
+subcommand writes DAB metadata as JSON lines (one JSON object per line):
+.PP
+.B Ensemble information:
+.RS
+.nf
+{"ensemble":{"eid":"0x1234","label":"My Ensemble"}}
+.fi
+.RE
+.PP
+.B Selected service:
+.RS
+.nf
+{"service":{"sid":"0xF2F8","label":"NRJ"}}
+.fi
+.RE
+.PP
+.B Dynamic Label (DLS):
+.RS
+.nf
+{"dl":"Now playing: Song Title - Artist"}
+.fi
+.RE
+.PP
+.B Slideshow (with \-\-slide\-base64):
+.RS
+.nf
+{"slide":{"contentName":"logo.jpg","contentType":"image/jpeg","data":"base64..."}}
+.fi
+.RE
+.PP
+Slideshow JSON is only emitted when
+.B \-\-slide\-base64
+is passed.
+.PP
+This format is compatible with
+.I dablin
+(gregoire fork) fd 3 output.
 .SH DAB CHANNELS (BAND III)
 .TS
 l l l l.
