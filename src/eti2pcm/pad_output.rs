@@ -2,6 +2,8 @@
 /// Also handles slideshow file saving and base64 JSON output.
 use crate::eti2pcm::mot_manager::MotFile;
 use base64::Engine;
+use serde::Serialize;
+use serde_json;
 use std::io::Write;
 use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
@@ -36,30 +38,58 @@ impl PadOutput {
 
     /// Write ensemble info as JSON
     pub fn write_ensemble(&mut self, label: &str, short_label: &str, eid: u16) {
-        self.write_json(&format!(
-            "{{\"ensemble\":{{\"label\":\"{}\",\"shortLabel\":\"{}\",\"eid\":\"0x{:04X}\"}}}}",
-            escape_json(label),
-            escape_json(short_label),
-            eid
-        ));
+        #[derive(Serialize)]
+        struct Ensemble<'a> {
+            label: &'a str,
+            #[serde(rename = "shortLabel")]
+            short_label: &'a str,
+            eid: String,
+        }
+        #[derive(Serialize)]
+        struct Wrapper<'a> {
+            ensemble: Ensemble<'a>,
+        }
+        let data = Wrapper {
+            ensemble: Ensemble {
+                label,
+                short_label,
+                eid: format!("0x{:04X}", eid),
+            },
+        };
+        self.write_json_struct(&data);
     }
 
     /// Write service info as JSON
     pub fn write_service(&mut self, label: &str, short_label: &str, sid: u16) {
-        self.write_json(&format!(
-            "{{\"service\":{{\"label\":\"{}\",\"shortLabel\":\"{}\",\"sid\":\"0x{:04X}\"}}}}",
-            escape_json(label),
-            escape_json(short_label),
-            sid
-        ));
+        #[derive(Serialize)]
+        struct Service<'a> {
+            label: &'a str,
+            #[serde(rename = "shortLabel")]
+            short_label: &'a str,
+            sid: String,
+        }
+        #[derive(Serialize)]
+        struct Wrapper<'a> {
+            service: Service<'a>,
+        }
+        let data = Wrapper {
+            service: Service {
+                label,
+                short_label,
+                sid: format!("0x{:04X}", sid),
+            },
+        };
+        self.write_json_struct(&data);
     }
 
     /// Write dynamic label (DLS) as JSON
     pub fn write_dl(&mut self, text: &str) {
-        self.write_json(&format!(
-            "{{\"dl\":\"{}\"}}",
-            escape_json(text)
-        ));
+        #[derive(Serialize)]
+        struct Dl<'a> {
+            dl: &'a str,
+        }
+        let data = Dl { dl: text };
+        self.write_json_struct(&data);
     }
 
     /// Handle a completed slideshow image.
@@ -96,19 +126,34 @@ impl PadOutput {
     }
 
     fn write_slide_base64(&mut self, file: &MotFile) {
+        #[derive(Serialize)]
+        struct Slide<'a> {
+            #[serde(rename = "contentName")]
+            content_name: &'a str,
+            #[serde(rename = "contentType")]
+            content_type: &'a str,
+            data: String,
+        }
+        #[derive(Serialize)]
+        struct Wrapper<'a> {
+            slide: Slide<'a>,
+        }
         let b64 = base64::engine::general_purpose::STANDARD.encode(&file.data);
-        let content_name = escape_json(&file.content_name);
-        let mime = file.mime_type();
-        self.write_json(&format!(
-            "{{\"slide\":{{\"contentName\":\"{}\",\"contentType\":\"{}\",\"data\":\"{}\"}}}}",
-            content_name, mime, b64
-        ));
+        let slide = Slide {
+            content_name: &file.content_name,
+            content_type: file.mime_type(),
+            data: b64,
+        };
+        let data = Wrapper { slide };
+        self.write_json_struct(&data);
     }
 
-    fn write_json(&mut self, json: &str) {
+    fn write_json_struct<T: serde::Serialize>(&mut self, value: &T) {
         if let Some(ref mut writer) = self.writer {
-            let _ = writeln!(writer, "{}", json);
-            let _ = writer.flush();
+            if let Ok(json) = serde_json::to_string(value) {
+                let _ = writeln!(writer, "{}", json);
+                let _ = writer.flush();
+            }
         }
     }
 }
@@ -116,25 +161,6 @@ impl PadOutput {
 /// Check if a file descriptor is valid using fcntl
 fn nix_fcntl_check(fd: i32) -> bool {
     unsafe { libc::fcntl(fd, libc::F_GETFD) != -1 }
-}
-
-/// Escape special JSON characters
-fn escape_json(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            '"' => result.push_str("\\\""),
-            '\\' => result.push_str("\\\\"),
-            '\n' => result.push_str("\\n"),
-            '\r' => result.push_str("\\r"),
-            '\t' => result.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                result.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => result.push(c),
-        }
-    }
-    result
 }
 
 /// Sanitize a filename: remove path components and unsafe characters.
@@ -153,26 +179,6 @@ fn sanitize_filename(name: &str) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_escape_json_simple() {
-        assert_eq!(escape_json("hello"), "hello");
-    }
-
-    #[test]
-    fn test_escape_json_quotes() {
-        assert_eq!(escape_json("say \"hi\""), "say \\\"hi\\\"");
-    }
-
-    #[test]
-    fn test_escape_json_backslash() {
-        assert_eq!(escape_json("a\\b"), "a\\\\b");
-    }
-
-    #[test]
-    fn test_escape_json_control_chars() {
-        assert_eq!(escape_json("a\nb"), "a\\nb");
-        assert_eq!(escape_json("a\tb"), "a\\tb");
-    }
 
     #[test]
     fn test_sanitize_filename_basic() {
