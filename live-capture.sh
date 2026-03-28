@@ -20,7 +20,7 @@ mkdir -p slides
 
 # Lancer la capture live 120s sur 6C NRJ
 sudo ../target/release/eti-rtlsdr-rust iq2eti -S -C 6C -G 20 -t 300 2>iq2eti.log \
-  | ../target/release/eti-rtlsdr-rust eti2pcm -s 0xF211 -p --slide-dir ./slides --slide-base64 3>pad_metadata.json 2>eti2pcm.log \
+  | ../target/release/eti-rtlsdr-rust eti2pcm -s 0xF2F8 -p --slide-dir ./slides --slide-base64 3>pad_metadata.json 2>eti2pcm.log \
   | sox -t raw -r 48000 -b 16 -c 2 -e signed-integer -L - output.wav
 
 echo "\n--- Résultats ---"
