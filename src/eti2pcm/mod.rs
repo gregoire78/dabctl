@@ -1,3 +1,4 @@
+pub mod ebu_latin;
 pub mod crc;
 pub mod eti_reader;
 pub mod eti_frame;
