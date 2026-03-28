@@ -18,3 +18,5 @@ Thumbs.db
 
 # Build artifacts for testing
 /build/
+# Tests locaux ignorés
+/test-local/
