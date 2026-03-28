@@ -399,13 +399,28 @@ sudo ./target/release/eti-rtlsdr-rust iq2eti -S -C 6C -G 20 \
 # Le fichier pad.json contient les infos DAB + les slides en base64
 ```
 
-### Test fonctionnel automatisé
+### Capture automatisée avec live-capture.sh
+
+Un script prêt à l'emploi pour capturer, décoder et sauvegarder les métadonnées DAB, audio et images slideshow :
 
 ```bash
-sudo bash test-capture.sh 6C 20
+bash live-capture.sh
 ```
 
-Vérifie : build → détection dongle → capture 10s → validation frames ETI.
+Ce script :
+- Compile le projet en release et lance les tests unitaires
+- Lance la capture live IQ → ETI → PCM sur 6C (modifiable dans le script)
+- Décode le flux, sauvegarde l'audio (output.wav), les métadonnées (pad_metadata.json) et les images slideshow (slides/)
+- Nettoie les anciens fichiers à chaque exécution
+
+Les options --slide-dir et --slide-base64 sont activées pour obtenir à la fois les images sur disque et en JSON base64.
+
+Résultats attendus :
+- `output.wav` : audio décodé
+- `pad_metadata.json` : métadonnées DAB + images slideshow (base64)
+- `slides/` : images JPEG/PNG extraites
+
+Adaptez le script selon vos besoins (canal, durée, SID, etc.).
 
 ---
 
@@ -658,10 +673,6 @@ man eti-rtlsdr-rust
 
 ---
 
-## 📄 Licence
-
-GPL-2.0 — Même licence que librtlsdr.
-
 ## 🔗 Références
 
 - [eti-stuff](https://github.com/JvanKatwijk/eti-stuff) — Implémentation C++ de référence (IQ → ETI)
@@ -669,3 +680,4 @@ GPL-2.0 — Même licence que librtlsdr.
 - [rtl-sdr](https://github.com/osmocom/rtl-sdr) — Driver RTL-SDR
 - [ETSI EN 300 401](https://www.etsi.org/deliver/etsi_en/300400_300499/300401/) — Norme DAB
 - [ETSI TS 102 563](https://www.etsi.org/deliver/etsi_ts/102500_102599/102563/) — Norme DAB+
+```
