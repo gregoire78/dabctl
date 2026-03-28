@@ -113,7 +113,7 @@ impl DlReassembler {
             raw.extend_from_slice(&seg.data);
         }
 
-        let text = decode_label_text(&raw, charset);
+        let text = decode_label_text(&raw, charset, false);
         Some(DynamicLabel { text, charset })
     }
 }
@@ -277,7 +277,7 @@ impl DlDataGroupDecoder {
         let last = prefix0 & 0x20 != 0;
 
         let seg_num = if first { 0 } else { (prefix1 & 0x70) >> 4 };
-        let charset = if first { prefix0 & 0x0F } else { 0 };
+        let charset = if first { prefix1 & 0x0F } else { 0 };
 
         let char_data = &self.data[2..2 + field_len];
 
@@ -528,60 +528,84 @@ impl PadDecoder {
 }
 
 /// Decode label bytes to UTF-8 text
-fn decode_label_text(raw: &[u8], charset: u8) -> String {
+fn decode_label_text(raw: &[u8], charset: u8, mot: bool) -> String {
+    use encoding_rs::{WINDOWS_1252, UTF_16BE};
+    // Nettoyage des caractères de contrôle
+    let cleaned: Vec<u8> = raw.iter().copied().filter(|&ch| ch != 0x00 && ch != 0x0A && ch != 0x0B && ch != 0x1F).collect();
     match charset {
         0 => {
             // EBU Latin
-            raw.iter()
-                .filter(|&&ch| ch != 0x00 && ch != 0x0A && ch != 0x0B && ch != 0x1F)
-                .map(|&ch| ebu_to_utf8(ch))
-                .collect()
+            cleaned.iter().map(|&ch| ebu_to_utf8(ch)).collect()
+        }
+        4 if mot => {
+            // ISO-8859-1 (MOT) (utilise WINDOWS_1252, compatible pour DAB)
+            let (cow, _, _) = WINDOWS_1252.decode(&cleaned);
+            cow.into_owned().to_string()
+        }
+        6 if !mot => {
+            // UCS-2BE (DAB only) : décodage direct via encoding_rs (UTF_16BE)
+            if raw.len() % 2 != 0 {
+                return String::new();
+            }
+            let (cow, _, had_errors) = UTF_16BE.decode(raw);
+            if had_errors {
+                String::new()
+            } else {
+                cow.into_owned().to_string()
+            }
         }
         15 => {
-            // UTF-8
-            let cleaned: Vec<u8> = raw
-                .iter()
-                .copied()
-                .filter(|&ch| ch != 0x00 && ch != 0x0A && ch != 0x0B && ch != 0x1F)
-                .collect();
-            String::from_utf8_lossy(&cleaned).to_string()
+            // UTF-8 (no fallback)
+            String::from_utf8(cleaned).unwrap_or_else(|_| String::new())
         }
         _ => {
-            let cleaned: Vec<u8> = raw
-                .iter()
-                .copied()
-                .filter(|&ch| ch != 0x00)
-                .collect();
-            String::from_utf8_lossy(&cleaned).to_string()
+            // Charset non supporté
+            tracing::warn!("DL charset={} non supporté, chaîne ignorée", charset);
+            String::new()
         }
     }
 }
 
 /// EBU Latin character to UTF-8 string
-fn ebu_to_utf8(ch: u8) -> char {
-    static EBU_TABLE: [char; 128] = [
-        '\u{00E1}', '\u{00E0}', '\u{00E9}', '\u{00E8}', '\u{00ED}', '\u{00EC}', '\u{00F3}', '\u{00F2}',
-        '\u{00FA}', '\u{00F9}', '\u{00D1}', '\u{00C7}', '\u{015E}', '\u{00DF}', '\u{00A1}', '\u{0132}',
-        '\u{00E2}', '\u{00E4}', '\u{00EA}', '\u{00EB}', '\u{00EE}', '\u{00EF}', '\u{00F4}', '\u{00F6}',
-        '\u{00FB}', '\u{00FC}', '\u{00F1}', '\u{00E7}', '\u{015F}', '\u{011F}', '\u{0131}', '\u{0133}',
-        '\u{00AA}', '\u{03B1}', '\u{00A9}', '\u{2030}', '\u{011E}', '\u{011B}', '\u{0148}', '\u{0151}',
-        '\u{03C0}', '\u{20AC}', '\u{00A3}', '\u{0024}', '\u{2190}', '\u{2191}', '\u{2192}', '\u{2193}',
-        '\u{00BA}', '\u{00B9}', '\u{00B2}', '\u{00B3}', '\u{00B1}', '\u{0130}', '\u{0144}', '\u{0171}',
-        '\u{00B5}', '\u{00BF}', '\u{00F7}', '\u{00B0}', '\u{00BC}', '\u{00BD}', '\u{00BE}', '\u{00A7}',
-        '\u{00C1}', '\u{00C0}', '\u{00C9}', '\u{00C8}', '\u{00CD}', '\u{00CC}', '\u{00D3}', '\u{00D2}',
-        '\u{00DA}', '\u{00D9}', '\u{0158}', '\u{010C}', '\u{0160}', '\u{017D}', '\u{00D0}', '\u{013F}',
-        '\u{00C2}', '\u{00C4}', '\u{00CA}', '\u{00CB}', '\u{00CE}', '\u{00CF}', '\u{00D4}', '\u{00D6}',
-        '\u{00DB}', '\u{00DC}', '\u{0159}', '\u{010D}', '\u{0161}', '\u{017E}', '\u{0111}', '\u{0140}',
-        '\u{00C3}', '\u{00C5}', '\u{00C6}', '\u{0152}', '\u{0177}', '\u{00DD}', '\u{00D5}', '\u{00D8}',
-        '\u{00DE}', '\u{014A}', '\u{0154}', '\u{0106}', '\u{015A}', '\u{0179}', '\u{0166}', '\u{00F0}',
-        '\u{00E3}', '\u{00E5}', '\u{00E6}', '\u{0153}', '\u{0175}', '\u{00FD}', '\u{00F5}', '\u{00F8}',
-        '\u{00FE}', '\u{014B}', '\u{0155}', '\u{0107}', '\u{015B}', '\u{017A}', '\u{0167}', '\u{00FF}',
+fn ebu_to_utf8(ch: u8) -> String {
+    // LUT pour 0x00-0x1F (alignée sur DABlin)
+    const EBU_0X00_0X1F: [&str; 0x20] = [
+        "", "\u{0118}", "\u{012E}", "\u{0172}", "\u{0102}", "\u{0116}", "\u{010E}", "\u{0218}",
+        "\u{021A}", "\u{010A}", "", "", "\u{0120}", "\u{0139}", "\u{017B}", "\u{0143}",
+        "\u{0105}", "\u{0119}", "\u{012F}", "\u{0173}", "\u{0103}", "\u{0117}", "\u{010F}", "\u{0219}",
+        "\u{021B}", "\u{010B}", "\u{0147}", "\u{011A}", "\u{0121}", "\u{013A}", "\u{017C}", ""
     ];
-    if ch < 0x80 {
-        ch as char
-    } else {
-        EBU_TABLE[(ch - 0x80) as usize]
+    // LUT pour 0x7B-0xFF (alignée sur DABlin)
+    const EBU_0X7B_0XFF: [&str; 133] = [
+        "\u{00AB}", "\u{016F}", "\u{00BB}", "\u{013D}", "\u{0126}",
+        "\u{00E1}", "\u{00E0}", "\u{00E9}", "\u{00E8}", "\u{00ED}", "\u{00EC}", "\u{00F3}", "\u{00F2}", "\u{00FA}", "\u{00F9}", "\u{00D1}", "\u{00C7}", "\u{015E}", "\u{00DF}", "\u{00A1}", "\u{0178}",
+        "\u{00E2}", "\u{00E4}", "\u{00EA}", "\u{00EB}", "\u{00EE}", "\u{00EF}", "\u{00F4}", "\u{00F6}", "\u{00FB}", "\u{00FC}", "\u{00F1}", "\u{00E7}", "\u{015F}", "\u{011F}", "\u{0131}", "\u{00FF}",
+        "\u{0136}", "\u{0145}", "\u{00A9}", "\u{0122}", "\u{011E}", "\u{011B}", "\u{0148}", "\u{0151}", "\u{0150}", "\u{20AC}", "\u{00A3}", "\u{0024}", "\u{0100}", "\u{0112}", "\u{012A}", "\u{016A}",
+        "\u{0137}", "\u{0146}", "\u{013B}", "\u{0123}", "\u{013C}", "\u{0130}", "\u{0144}", "\u{0171}", "\u{0170}", "\u{00BF}", "\u{013E}", "\u{00B0}", "\u{0101}", "\u{0113}", "\u{012B}", "\u{016B}",
+        "\u{00C1}", "\u{00C0}", "\u{00C9}", "\u{00C8}", "\u{00CD}", "\u{00CC}", "\u{00D3}", "\u{00D2}", "\u{00DA}", "\u{00D9}", "\u{0158}", "\u{010C}", "\u{0160}", "\u{017D}", "\u{00D0}", "\u{013F}",
+        "\u{00C2}", "\u{00C4}", "\u{00CA}", "\u{00CB}", "\u{00CE}", "\u{00CF}", "\u{00D4}", "\u{00D6}", "\u{00DB}", "\u{00DC}", "\u{0159}", "\u{010D}", "\u{0161}", "\u{017E}", "\u{0111}", "\u{0140}",
+        "\u{00C3}", "\u{00C5}", "\u{00C6}", "\u{0152}", "\u{0177}", "\u{00DD}", "\u{00D5}", "\u{00D8}", "\u{00DE}", "\u{014A}", "\u{0154}", "\u{0106}", "\u{015A}", "\u{0179}", "\u{0164}", "\u{00F0}",
+        "\u{00E3}", "\u{00E5}", "\u{00E6}", "\u{0153}", "\u{0175}", "\u{00FD}", "\u{00F5}", "\u{00F8}", "\u{00FE}", "\u{014B}", "\u{0155}", "\u{0107}", "\u{015B}", "\u{017A}", "\u{0165}", "\u{0127}"
+    ];
+    if ch <= 0x1F {
+        return EBU_0X00_0X1F[ch as usize].to_string();
     }
+    if ch >= 0x7B {
+        // Correction spéciale pour 0xF3 (œ)
+        if ch == 0xF3 {
+            return "\u{0153}".to_string();
+        }
+        return EBU_0X7B_0XFF[(ch - 0x7B) as usize].to_string();
+    }
+    match ch {
+        0x24 => return "\u{0142}".to_string(), // ł
+        0x5C => return "\u{016E}".to_string(), // Ů
+        0x5E => return "\u{0141}".to_string(), // Ł
+        0x60 => return "\u{0104}".to_string(), // Ą
+        _ => {}
+    }
+    // ASCII direct sinon
+    (ch as char).to_string()
 }
 
 #[cfg(test)]
@@ -672,14 +696,78 @@ mod tests {
     #[test]
     fn test_decode_label_ebu() {
         let raw = [b'A', b'B', b'C'];
-        let text = decode_label_text(&raw, 0);
+        let text = decode_label_text(&raw, 0, false);
         assert_eq!(text, "ABC");
     }
 
     #[test]
     fn test_decode_label_utf8() {
         let raw = "Héllo".as_bytes().to_vec();
-        let text = decode_label_text(&raw, 15);
+        let text = decode_label_text(&raw, 15, false);
         assert_eq!(text, "Héllo");
+    }
+
+    #[test]
+    fn test_decode_label_ebu_accents() {
+        // 0x82 = EBU index 2 = é (U+00E9), 0x83 = EBU index 3 = è (U+00E8)
+        let raw = [b'C', b'a', b'f', 0x82];
+        let text = decode_label_text(&raw, 0, false);
+        assert_eq!(text, "Café");
+    }
+
+    #[test]
+    fn test_decode_label_iso8859_1() {
+        // ISO 8859-1: 0xE9 = é, charset 4
+        let raw = b"Cavaill\xe9-Roux";
+        let text = decode_label_text(raw, 4, true);
+        assert_eq!(text, "Cavaillé-Roux");
+    }
+
+    #[test]
+    fn test_decode_label_iso8859_1_multiple_accents() {
+        // ISO 8859-1: 0xE0=à, 0xE9=é, 0xF4=ô
+        let raw = b"M\xe9tropolitain d\xe9j\xe0 pr\xf4t";
+        let text = decode_label_text(raw, 4, true);
+        assert_eq!(text, "Métropolitain déjà prôt");
+    }
+
+    #[test]
+    fn test_decode_label_ucs2() {
+        // UCS-2 BE: "Café" = 0x0043 0x0061 0x0066 0x00E9
+        let raw = [0x00, 0x43, 0x00, 0x61, 0x00, 0x66, 0x00, 0xE9];
+        let text = decode_label_text(&raw, 6, false);
+        assert_eq!(text, "Café");
+    }
+
+    #[test]
+    fn test_decode_label_unknown_charset_fallback() {
+        // Unknown charset (e.g. 5) : DABlin-style = chaîne vide
+        let raw = b"Cavaill\xe9";
+        let text = decode_label_text(raw, 5, false);
+        assert_eq!(text, "");
+    }
+
+    #[test]
+    fn test_decode_label_iso8859_1_filters_control_chars() {
+        let raw = [b'A', 0x00, b'B', 0x0A, b'C', 0x1F, b'D'];
+        let text = decode_label_text(&raw, 4, true);
+        assert_eq!(text, "ABCD"); // 0x00, 0x0A, 0x1F filtered out
+    }
+
+    #[test]
+    fn test_decode_label_utf8_with_ebu_fallback() {
+        // Broadcaster claims UTF-8 (charset 15) mais envoie EBU Latin (non valide UTF-8)
+        // DABlin-style : chaîne vide
+        let raw = b"Cavaill\x82-Roux";
+        let text = decode_label_text(raw, 15, false);
+        assert_eq!(text, "");
+    }
+
+    #[test]
+    fn test_decode_label_ebu_oe_ligature() {
+        // 0xF3 in EBU Latin = œ (U+0153), must NOT be decoded as ó (ISO 8859-1)
+        let raw = b"le c\xF3ur des Balkans";
+        let text = decode_label_text(&raw[..], 0, false);
+        assert_eq!(text, "le cœur des Balkans");
     }
 }
