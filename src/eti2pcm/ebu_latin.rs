@@ -1,13 +1,19 @@
 /// Conversion EBU Latin vers String UTF-8 (logique DABlin, tout-en-un)
-pub fn ebu_latin_to_utf8(ch: u8) -> String {
-    // LUT pour 0x00-0x1F (alignée sur DABlin)
+pub fn ebu_latin_char_to_utf8_string(ch: u8) -> String {
+    match ebu_latin_lut(ch) {
+        Some(s) => s.to_string(),
+        None => (ch as char).to_string(),
+    }
+}
+
+/// LUT EBU Latin (privée)
+fn ebu_latin_lut(ch: u8) -> Option<&'static str> {
     const EBU_0X00_0X1F: [&str; 0x20] = [
         "", "\u{0118}", "\u{012E}", "\u{0172}", "\u{0102}", "\u{0116}", "\u{010E}", "\u{0218}",
         "\u{021A}", "\u{010A}", "", "", "\u{0120}", "\u{0139}", "\u{017B}", "\u{0143}",
         "\u{0105}", "\u{0119}", "\u{012F}", "\u{0173}", "\u{0103}", "\u{0117}", "\u{010F}", "\u{0219}",
         "\u{021B}", "\u{010B}", "\u{0147}", "\u{011A}", "\u{0121}", "\u{013A}", "\u{017C}", ""
     ];
-    // LUT pour 0x7B-0xFF (alignée sur DABlin)
     const EBU_0X7B_0XFF: [&str; 133] = [
         "\u{00AB}", "\u{016F}", "\u{00BB}", "\u{013D}", "\u{0126}",
         "\u{00E1}", "\u{00E0}", "\u{00E9}", "\u{00E8}", "\u{00ED}", "\u{00EC}", "\u{00F3}", "\u{00F2}", "\u{00FA}", "\u{00F9}", "\u{00D1}", "\u{00C7}", "\u{015E}", "\u{00DF}", "\u{00A1}", "\u{0178}",
@@ -20,20 +26,18 @@ pub fn ebu_latin_to_utf8(ch: u8) -> String {
         "\u{00E3}", "\u{00E5}", "\u{00E6}", "\u{0153}", "\u{0175}", "\u{00FD}", "\u{00F5}", "\u{00F8}", "\u{00FE}", "\u{014B}", "\u{0155}", "\u{0107}", "\u{015B}", "\u{017A}", "\u{0165}", "\u{0127}"
     ];
     if ch <= 0x1F {
-        return EBU_0X00_0X1F[ch as usize].to_string();
+        return Some(EBU_0X00_0X1F[ch as usize]);
     }
     if ch >= 0x7B {
-        return EBU_0X7B_0XFF[(ch - 0x7B) as usize].to_string();
+        return Some(EBU_0X7B_0XFF[(ch - 0x7B) as usize]);
     }
     match ch {
-        0x24 => return "\u{0142}".to_string(), // ł
-        0x5C => return "\u{016E}".to_string(), // Ů
-        0x5E => return "\u{0141}".to_string(), // Ł
-        0x60 => return "\u{0104}".to_string(), // Ą
-        _ => {}
+        0x24 => Some("\u{0142}"), // ł
+        0x5C => Some("\u{016E}"), // Ů
+        0x5E => Some("\u{0141}"), // Ł
+        0x60 => Some("\u{0104}"), // Ą
+        _ => None,
     }
-    // ASCII direct sinon
-    (ch as char).to_string()
 }
 
 #[cfg(test)]
@@ -41,16 +45,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_ebu_latin_to_utf8() {
-        assert_eq!(ebu_latin_to_utf8(b'A'), "A");
-        assert_eq!(ebu_latin_to_utf8(0x00), "");
-        assert_eq!(ebu_latin_to_utf8(0x01), "\u{0118}");
-        assert_eq!(ebu_latin_to_utf8(0x0A), "");
-        assert_eq!(ebu_latin_to_utf8(0x7B), "\u{00AB}");
-        assert_eq!(ebu_latin_to_utf8(0xF3), "\u{0153}");
-        assert_eq!(ebu_latin_to_utf8(0x24), "\u{0142}");
-        assert_eq!(ebu_latin_to_utf8(0x5C), "\u{016E}");
-        assert_eq!(ebu_latin_to_utf8(0x5E), "\u{0141}");
-        assert_eq!(ebu_latin_to_utf8(0x60), "\u{0104}");
+    fn test_ebu_latin_char_to_utf8_string_given_ascii_then_ascii() {
+        // Given/When/Then
+        assert_eq!(ebu_latin_char_to_utf8_string(b'A'), "A");
+    }
+
+    #[test]
+    fn test_ebu_latin_char_to_utf8_string_given_lut_0x00_then_empty() {
+        assert_eq!(ebu_latin_char_to_utf8_string(0x00), "");
+    }
+
+    #[test]
+    fn test_ebu_latin_char_to_utf8_string_given_lut_0x01_then_unicode() {
+        assert_eq!(ebu_latin_char_to_utf8_string(0x01), "\u{0118}");
+    }
+
+    #[test]
+    fn test_ebu_latin_char_to_utf8_string_given_lut_0x0a_then_empty() {
+        assert_eq!(ebu_latin_char_to_utf8_string(0x0A), "");
+    }
+
+    #[test]
+    fn test_ebu_latin_char_to_utf8_string_given_lut_0x7b_then_unicode() {
+        assert_eq!(ebu_latin_char_to_utf8_string(0x7B), "\u{00AB}");
+    }
+
+    #[test]
+    fn test_ebu_latin_char_to_utf8_string_given_lut_0xf3_then_unicode() {
+        assert_eq!(ebu_latin_char_to_utf8_string(0xF3), "\u{0153}");
+    }
+
+    #[test]
+    fn test_ebu_latin_char_to_utf8_string_given_special_cases_then_unicode() {
+        assert_eq!(ebu_latin_char_to_utf8_string(0x24), "\u{0142}");
+        assert_eq!(ebu_latin_char_to_utf8_string(0x5C), "\u{016E}");
+        assert_eq!(ebu_latin_char_to_utf8_string(0x5E), "\u{0141}");
+        assert_eq!(ebu_latin_char_to_utf8_string(0x60), "\u{0104}");
+    }
+    
+    #[test]
+    fn test_ebu_latin_lut_none_returns_none() {
+        // Given/When/Then : un code non LUT ni spécial
+        assert_eq!(ebu_latin_lut(b'Z'), None);
     }
 }

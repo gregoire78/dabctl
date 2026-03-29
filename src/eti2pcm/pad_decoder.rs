@@ -2,7 +2,7 @@
 /// and MOT (Multimedia Object Transfer) slideshow.
 /// Decodes F-PAD + X-PAD from DAB+ AU to extract Dynamic Label text and MOT images.
 use crate::eti2pcm::crc::crc16_ccitt;
-use crate::eti2pcm::ebu_latin::ebu_latin_to_utf8;
+use crate::eti2pcm::ebu_latin::ebu_latin_char_to_utf8_string;
 use crate::eti2pcm::mot_decoder::MotDecoder;
 use crate::eti2pcm::mot_manager::{MotFile, MotManager};
 use encoding_rs::{WINDOWS_1252, UTF_16BE};
@@ -536,7 +536,7 @@ fn decode_label_text(raw: &[u8], charset: u8, mot: bool) -> String {
     match charset {
         0 => {
             // EBU Latin
-            cleaned.iter().map(|&ch| ebu_latin_to_utf8(ch)).collect()
+            cleaned.iter().map(|&ch| ebu_latin_char_to_utf8_string(ch)).collect()
         }
         4 if mot => {
             // ISO-8859-1 (MOT) (utilise WINDOWS_1252, compatible pour DAB)
