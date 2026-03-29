@@ -1,5 +1,5 @@
 [package]
-name = "eti-rtlsdr-rust"
+name = "dabctl"
 version = "0.1.0"
 edition = "2021"
 authors = ["Your Name"]
@@ -24,7 +24,7 @@ bindgen = "0.69"
 cmake = "0.1"
 
 [[bin]]
-name = "eti-rtlsdr-rust"
+name = "dabctl"
 path = "src/main.rs"
 
 [profile.release]

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# Script helper pour exécuter eti-rtlsdr-rust avec LD_LIBRARY_PATH configuré automatiquement
+# Script helper pour exécuter dabctl avec LD_LIBRARY_PATH configuré automatiquement
 
 set -e
 
@@ -8,7 +8,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Trouver le binaire release
-BINARY="${SCRIPT_DIR}/target/release/eti-rtlsdr-rust"
+BINARY="${SCRIPT_DIR}/target/release/dabctl"
 
 # Vérifier que le binaire existe
 if [ ! -f "$BINARY" ]; then

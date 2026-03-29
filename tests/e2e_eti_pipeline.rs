@@ -2,9 +2,9 @@
 /// reads them back with EtiReader, and parses them with parse_eti_frame.
 /// This validates the full ETI pipeline without requiring RTL-SDR hardware.
 
-use eti_rtlsdr_rust::eti2pcm::crc::crc16_ccitt;
-use eti_rtlsdr_rust::eti2pcm::eti_frame::{parse_eti_frame, ETI_FRAME_SIZE};
-use eti_rtlsdr_rust::eti2pcm::eti_reader::EtiReader;
+use dabctl::eti2pcm::crc::crc16_ccitt;
+use dabctl::eti2pcm::eti_frame::{parse_eti_frame, ETI_FRAME_SIZE};
+use dabctl::eti2pcm::eti_reader::EtiReader;
 
 use std::io::Cursor;
 

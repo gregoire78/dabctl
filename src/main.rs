@@ -1,4 +1,4 @@
-// main.rs - CLI entry point for eti-rtlsdr-rust
+// main.rs - CLI entry point for dabctl
 // Supports subcommands: iq2eti (RTL-SDR → ETI) and eti2pcm (ETI → PCM audio)
 
 mod iq2eti;
@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "eti-rtlsdr-rust",
+    name = "dabctl",
     about = "DAB ETI tools: RTL-SDR → ETI and ETI → PCM audio",
     version
 )]

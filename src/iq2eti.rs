@@ -10,11 +10,11 @@ use clap::Args;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use eti_rtlsdr_rust::dab_constants::BAND_III;
-use eti_rtlsdr_rust::device::rtlsdr_handler::RtlsdrHandler;
-use eti_rtlsdr_rust::eti_handling::eti_generator::{EtiGenerator, EtiWriterFn};
-use eti_rtlsdr_rust::ofdm::ofdm_processor::OfdmProcessor;
-use eti_rtlsdr_rust::support::band_handler;
+use dabctl::dab_constants::BAND_III;
+use dabctl::device::rtlsdr_handler::RtlsdrHandler;
+use dabctl::eti_handling::eti_generator::{EtiGenerator, EtiWriterFn};
+use dabctl::ofdm::ofdm_processor::OfdmProcessor;
+use dabctl::support::band_handler;
 
 #[derive(Args, Debug)]
 pub struct Iq2etiArgs {
