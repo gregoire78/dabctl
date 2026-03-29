@@ -19,8 +19,8 @@ rm -f slides/*.jpg 2>/dev/null || true
 mkdir -p slides
 
 # Lancer la capture live 120s sur 6C NRJ
-sudo LD_LIBRARY_PATH="$LD_LIBRARY_PATH" ../target/release/eti-rtlsdr-rust iq2eti -S -C 6C -G 20 2>iq2eti.log \
-  | ../target/release/eti-rtlsdr-rust eti2pcm -s 0xF2F8 -p --slide-dir ./slides --slide-base64 3>pad_metadata.json 2>eti2pcm.log \
+sudo LD_LIBRARY_PATH="$LD_LIBRARY_PATH" ../target/release/dabctl iq2eti -S -C 6C -G 20 2>iq2eti.log \
+  | ../target/release/dabctl eti2pcm -s 0xF2F8 -p --slide-dir ./slides --slide-base64 3>pad_metadata.json 2>eti2pcm.log \
   | sox -t raw -r 48000 -b 16 -c 2 -e signed-integer -L - output.wav
 
 echo -e "\n--- Résultats ---"

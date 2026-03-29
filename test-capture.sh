@@ -18,7 +18,7 @@ ETI_FRAME_SIZE=6144  # taille d'une frame ETI (octets)
 MIN_FRAMES=5         # minimum de frames attendues
 OUTFILE=$(mktemp /tmp/eti-test-XXXXXX.eti)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BINARY="${SCRIPT_DIR}/target/release/eti-rtlsdr-rust"
+BINARY="${SCRIPT_DIR}/target/release/dabctl"
 
 # --- Couleurs ---
 RED='\033[0;31m'
@@ -36,7 +36,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "╔══════════════════════════════════════╗"
-echo "║   Test fonctionnel ETI-RTL-SDR-Rust  ║"
+echo "║   Test fonctionnel DABCTL-Rust  ║"
 echo "╚══════════════════════════════════════╝"
 echo ""
 echo "  Canal: $CHANNEL | Gain: $GAIN% | Durée: ${DURATION}s"

@@ -46,7 +46,7 @@ cleanup() { rm -f "$ETI_TMPFILE"; }
 trap cleanup EXIT
 
 echo "╔══════════════════════════════════════════╗"
-echo "║   Test end-to-end ETI-RTL-SDR Rust       ║"
+echo "║   Test end-to-end DABCTL Rust       ║"
 echo "╚══════════════════════════════════════════╝"
 
 # ================================================================
@@ -273,9 +273,9 @@ fi
 # ================================================================
 section "Pipeline eti2pcm (parsing ETI synthétique)"
 
-BINARY="./target/debug/eti-rtlsdr-rust"
-if $BUILD_RELEASE && [ -f "./target/release/eti-rtlsdr-rust" ]; then
-    BINARY="./target/release/eti-rtlsdr-rust"
+BINARY="./target/debug/dabctl"
+if $BUILD_RELEASE && [ -f "./target/release/dabctl" ]; then
+    BINARY="./target/release/dabctl"
 fi
 
 if [ -f "$BINARY" ] && [ -f "$ETI_TMPFILE" ]; then

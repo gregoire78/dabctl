@@ -11,12 +11,12 @@ use clap::Args;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-use eti_rtlsdr_rust::eti2pcm::eti_frame::parse_eti_frame;
-use eti_rtlsdr_rust::eti2pcm::eti_reader::EtiReader;
-use eti_rtlsdr_rust::eti2pcm::fic_decoder::FicDecoder;
-use eti_rtlsdr_rust::eti2pcm::pad_decoder::PadDecoder;
-use eti_rtlsdr_rust::eti2pcm::pad_output::PadOutput;
-use eti_rtlsdr_rust::eti2pcm::superframe::SuperframeFilter;
+use dabctl::eti2pcm::eti_frame::parse_eti_frame;
+use dabctl::eti2pcm::eti_reader::EtiReader;
+use dabctl::eti2pcm::fic_decoder::FicDecoder;
+use dabctl::eti2pcm::pad_decoder::PadDecoder;
+use dabctl::eti2pcm::pad_output::PadOutput;
+use dabctl::eti2pcm::superframe::SuperframeFilter;
 
 #[derive(Args, Debug)]
 pub struct Eti2pcmArgs {
@@ -92,8 +92,8 @@ pub fn run(args: Eti2pcmArgs) {
     let slide_dir = args.slide_dir.as_ref().map(PathBuf::from);
     let mut pad_output = PadOutput::new(slide_dir, args.slide_base64);
     let mut superframe = SuperframeFilter::new();
-    let mut mp2_decoder: Option<eti_rtlsdr_rust::eti2pcm::mp2_decoder::Mp2Decoder> = None;
-    let mut aac_decoder: Option<eti_rtlsdr_rust::eti2pcm::aac_decoder::AacDecoder> = None;
+    let mut mp2_decoder: Option<dabctl::eti2pcm::mp2_decoder::Mp2Decoder> = None;
+    let mut aac_decoder: Option<dabctl::eti2pcm::aac_decoder::AacDecoder> = None;
 
     let mut current_subchid: Option<u8> = None;
     let mut is_dab_plus: Option<bool> = None;
@@ -177,7 +177,7 @@ pub fn run(args: Eti2pcmArgs) {
 
                 // Initialize decoder
                 if !audio.dab_plus {
-                    match eti_rtlsdr_rust::eti2pcm::mp2_decoder::Mp2Decoder::new() {
+                    match dabctl::eti2pcm::mp2_decoder::Mp2Decoder::new() {
                         Ok(dec) => mp2_decoder = Some(dec),
                         Err(e) => {
                             error!("Failed to create MP2 decoder: {}", e);
@@ -239,7 +239,7 @@ pub fn run(args: Eti2pcmArgs) {
                     fmt.sample_rate() / 1000,
                     fmt.channels()
                 );
-                match eti_rtlsdr_rust::eti2pcm::aac_decoder::AacDecoder::new(&asc) {
+                match dabctl::eti2pcm::aac_decoder::AacDecoder::new(&asc) {
                     Ok(dec) => {
                         info!(
                             "AAC decoder: {}Hz {}ch",

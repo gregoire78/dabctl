@@ -1,6 +1,6 @@
 <div align="center">
 
-# 📡 eti-rtlsdr-rust
+# 📡 dabctl
 
 **Réception DAB complète en Rust : RTL-SDR → ETI → PCM audio**
 
@@ -23,12 +23,12 @@ cargo build --release
 export LD_LIBRARY_PATH=$(find target -name "librtlsdr.so.0" 2>/dev/null | head -1 | xargs dirname):$LD_LIBRARY_PATH
 
 # 3. Pipeline complète : RTL-SDR → ETI → PCM → lecteur audio
-sudo ./target/release/eti-rtlsdr-rust iq2eti -S -C 6C -G 20 \
-  | ./target/release/eti-rtlsdr-rust eti2pcm -F -s 0xF2F8 -p \
+sudo ./target/release/dabctl iq2eti -S -C 6C -G 20 \
+  | ./target/release/dabctl eti2pcm -F -s 0xF2F8 -p \
   | ffplay -f s16le -ar 48000 -ac 2 -i -
 
 # 4. Ou plus simplement, avec le script helper :
-./eti-rtlsdr-rust.sh -S -C 11C -G 80 | dablin_gtk -L
+./dabctl.sh -S -C 11C -G 80 | dablin_gtk -L
 ```
 
 ---
@@ -211,7 +211,7 @@ codegen-units = 1
 ### Déploiement
 
 ```bash
-scp target/aarch64-unknown-linux-gnu/release/eti-rtlsdr-rust user@rpi:/usr/local/bin/
+scp target/aarch64-unknown-linux-gnu/release/dabctl user@rpi:/usr/local/bin/
 ```
 
 ### Packaging release (.tar.gz)
@@ -222,8 +222,8 @@ scp target/aarch64-unknown-linux-gnu/release/eti-rtlsdr-rust user@rpi:/usr/local
 cargo build --release
 VERSION=$(cargo metadata --no-deps --format-version 1 | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4)
 LIB_DIR=$(find target/release/build -path '*/out/lib/librtlsdr.so.0' | head -1 | xargs dirname)
-tar -czf eti-rtlsdr-rust-${VERSION}-x86_64-linux.tar.gz \
-  -C target/release eti-rtlsdr-rust \
+tar -czf dabctl-${VERSION}-x86_64-linux.tar.gz \
+  -C target/release dabctl \
   -C "$(pwd)/${LIB_DIR}" librtlsdr.so.0
 ```
 
@@ -233,15 +233,15 @@ tar -czf eti-rtlsdr-rust-${VERSION}-x86_64-linux.tar.gz \
 cargo build --release --target aarch64-unknown-linux-gnu
 VERSION=$(cargo metadata --no-deps --format-version 1 | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4)
 LIB_DIR=$(find target/aarch64-unknown-linux-gnu/release/build -path '*/out/lib/librtlsdr.so.0' | head -1 | xargs dirname)
-tar -czf eti-rtlsdr-rust-${VERSION}-aarch64-linux.tar.gz \
-  -C target/aarch64-unknown-linux-gnu/release eti-rtlsdr-rust \
+tar -czf dabctl-${VERSION}-aarch64-linux.tar.gz \
+  -C target/aarch64-unknown-linux-gnu/release dabctl \
   -C "$(pwd)/${LIB_DIR}" librtlsdr.so.0
 ```
 
 > Les archives contiennent le binaire et `librtlsdr.so.0`. Sur la cible, installer `libusb-1.0-0` puis :
 > ```bash
-> tar xzf eti-rtlsdr-rust-*-linux.tar.gz
-> sudo cp eti-rtlsdr-rust /usr/local/bin/
+> tar xzf dabctl-*-linux.tar.gz
+> sudo cp dabctl /usr/local/bin/
 > sudo cp librtlsdr.so.0 /usr/local/lib/
 > sudo ldconfig
 > ```
@@ -253,7 +253,7 @@ tar -czf eti-rtlsdr-rust-${VERSION}-aarch64-linux.tar.gz \
 Le binaire expose deux sous-commandes :
 
 ```
-eti-rtlsdr-rust <COMMAND>
+dabctl <COMMAND>
   iq2eti     Générer un flux ETI depuis RTL-SDR (IQ → ETI)
   eti2pcm    Décoder un flux ETI en audio PCM (comme dablin)
 ```
@@ -261,7 +261,7 @@ eti-rtlsdr-rust <COMMAND>
 ### `iq2eti` — RTL-SDR → ETI
 
 ```
-eti-rtlsdr-rust iq2eti [OPTIONS]
+dabctl iq2eti [OPTIONS]
 ```
 
 | Option | Court | Description | Défaut |
@@ -280,7 +280,7 @@ eti-rtlsdr-rust iq2eti [OPTIONS]
 ### `eti2pcm` — ETI → PCM audio
 
 ```
-eti-rtlsdr-rust eti2pcm [OPTIONS] [FILE]
+dabctl eti2pcm [OPTIONS] [FILE]
 ```
 
 | Option | Court | Description | Défaut |
@@ -318,8 +318,8 @@ eti-rtlsdr-rust eti2pcm [OPTIONS] [FILE]
 
 ```bash
 # Écouter NRJ (SID 0xF2F8) sur le canal 6C sans dépendance externe (sauf ffplay)
-sudo ./target/release/eti-rtlsdr-rust iq2eti -S -C 6C -G 20 \
-  | ./target/release/eti-rtlsdr-rust eti2pcm -F -s 0xF2F8 -p \
+sudo ./target/release/dabctl iq2eti -S -C 6C -G 20 \
+  | ./target/release/dabctl eti2pcm -F -s 0xF2F8 -p \
   | ffplay -f s16le -ar 48000 -ac 2 -nodisp -i -
 ```
 
@@ -327,8 +327,8 @@ sudo ./target/release/eti-rtlsdr-rust iq2eti -S -C 6C -G 20 \
 
 ```bash
 # fd 3 redirigé vers un fichier pour capturer DLS, ensemble, service
-sudo ./target/release/eti-rtlsdr-rust iq2eti -S -C 6C -G 20 \
-  | ./target/release/eti-rtlsdr-rust eti2pcm -F -s 0xF2F8 -p 3>metadata.json \
+sudo ./target/release/dabctl iq2eti -S -C 6C -G 20 \
+  | ./target/release/dabctl eti2pcm -F -s 0xF2F8 -p 3>metadata.json \
   | ffplay -f s16le -ar 48000 -ac 2 -nodisp -i -
 ```
 
@@ -336,56 +336,56 @@ sudo ./target/release/eti-rtlsdr-rust iq2eti -S -C 6C -G 20 \
 
 ```bash
 # Décoder un fichier ETI capturé en PCM
-./target/release/eti-rtlsdr-rust eti2pcm -s 0xF2F8 -p capture.eti > output.raw
+./target/release/dabctl eti2pcm -s 0xF2F8 -p capture.eti > output.raw
 ffplay -f s16le -ar 48000 -ac 2 output.raw
 
 # Ou par nom de service
-./target/release/eti-rtlsdr-rust eti2pcm -l "NRJ" -p capture.eti > output.raw
+./target/release/dabctl eti2pcm -l "NRJ" -p capture.eti > output.raw
 ```
 
 ### Jouer le premier service trouvé
 
 ```bash
-./target/release/eti-rtlsdr-rust eti2pcm -1 -p < capture.eti | aplay -f S16_LE -r 48000 -c 2
+./target/release/dabctl eti2pcm -1 -p < capture.eti | aplay -f S16_LE -r 48000 -c 2
 ```
 
 ### Recevoir et sauvegarder un fichier ETI
 
 ```bash
-sudo ./target/release/eti-rtlsdr-rust iq2eti -C 6C -G 20 -O "6C_$(date +%F_%H%M).eti"
+sudo ./target/release/dabctl iq2eti -C 6C -G 20 -O "6C_$(date +%F_%H%M).eti"
 ```
 
 ### Pipeline vers dablin (compatibilité)
 
 ```bash
-sudo ./target/release/eti-rtlsdr-rust iq2eti -S -C 6C -G 20 | dablin_gtk -L
+sudo ./target/release/dabctl iq2eti -S -C 6C -G 20 | dablin_gtk -L
 ```
 
 ### dablin CLI avec sélection de service
 
 ```bash
-sudo ./target/release/eti-rtlsdr-rust iq2eti -S -C 6C -G 20 | dablin -F -s 0xF2F8 -p
+sudo ./target/release/dabctl iq2eti -S -C 6C -G 20 | dablin -F -s 0xF2F8 -p
 ```
 
 ### Enregistrement limité à 60 secondes
 
 ```bash
-sudo ./target/release/eti-rtlsdr-rust iq2eti -C 6C -G 20 -t 60 -O capture.eti
+sudo ./target/release/dabctl iq2eti -C 6C -G 20 -t 60 -O capture.eti
 ```
 
 ### Convertir en WAV (via eti2pcm + ffmpeg)
 
 ```bash
-sudo ./target/release/eti-rtlsdr-rust iq2eti -S -C 6C -G 20 -t 15 \
-  | ./target/release/eti-rtlsdr-rust eti2pcm -s 0xF2F8 -p \
+sudo ./target/release/dabctl iq2eti -S -C 6C -G 20 -t 15 \
+  | ./target/release/dabctl eti2pcm -s 0xF2F8 -p \
   | ffmpeg -f s16le -ar 48000 -ac 2 -i - output.wav
 ```
 
 ### Sauvegarder les images slideshow
 
 ```bash
-sudo ./target/release/eti-rtlsdr-rust iq2eti -S -C 6C -G 20 \
-  | ./target/release/eti-rtlsdr-rust eti2pcm -s 0xF2F8 -p -S /tmp/slides \
+sudo ./target/release/dabctl iq2eti -S -C 6C -G 20 \
+  | ./target/release/dabctl eti2pcm -s 0xF2F8 -p -S /tmp/slides \
   | ffplay -f s16le -ar 48000 -ac 2 -nodisp -i -
 # Les images JPEG/PNG reçues sont sauvegardées dans /tmp/slides/
 ```
@@ -393,8 +393,8 @@ sudo ./target/release/eti-rtlsdr-rust iq2eti -S -C 6C -G 20 \
 ### Slideshow en base64 JSON (fd 3)
 
 ```bash
-sudo ./target/release/eti-rtlsdr-rust iq2eti -S -C 6C -G 20 \
-  | ./target/release/eti-rtlsdr-rust eti2pcm -s 0xF2F8 -p --slide-base64 3>pad.json \
+sudo ./target/release/dabctl iq2eti -S -C 6C -G 20 \
+  | ./target/release/dabctl eti2pcm -s 0xF2F8 -p --slide-base64 3>pad.json \
   | ffplay -f s16le -ar 48000 -ac 2 -nodisp -i -
 # Le fichier pad.json contient les infos DAB + les slides en base64
 ```
@@ -430,8 +430,8 @@ Adaptez le script selon vos besoins (canal, durée, SID, etc.).
 
 ```bash
 # Cloner et builder
-git clone https://github.com/votre-user/eti-rtlsdr-rust.git
-cd eti-rtlsdr-rust
+git clone https://github.com/votre-user/dabctl.git
+cd dabctl
 cargo build --release
 ```
 
@@ -466,7 +466,7 @@ Le DAB en France utilise la bande III. Les multiplexes principaux :
 
 ```bash
 # Tester un canal (ex: 6C à Paris)
-./eti-rtlsdr-rust.sh iq2eti -C 6C -G 20 -t 5 -O /dev/null
+./dabctl.sh iq2eti -C 6C -G 20 -t 5 -O /dev/null
 ```
 
 Si vous voyez `ensemble ... detected` et des `program ... is in the list`, le canal fonctionne.
@@ -475,7 +475,7 @@ Si vous voyez `ensemble ... detected` et des `program ... is in the list`, le ca
 
 ```bash
 # Capturer 60 secondes du canal 6C
-./eti-rtlsdr-rust.sh iq2eti -C 6C -G 20 -t 60 -O capture_6C.eti
+./dabctl.sh iq2eti -C 6C -G 20 -t 60 -O capture_6C.eti
 ```
 
 Le fichier ETI peut être relu plus tard avec `eti2pcm` sans le dongle.
@@ -484,15 +484,15 @@ Le fichier ETI peut être relu plus tard avec `eti2pcm` sans le dongle.
 
 ```bash
 # Écouter un programme spécifique (ex: NRJ, SID 0xF2F8)
-sudo ./target/release/eti-rtlsdr-rust iq2eti -S -C 6C -G 20 \
-  | ./target/release/eti-rtlsdr-rust eti2pcm -F -s 0xF2F8 -p \
+sudo ./target/release/dabctl iq2eti -S -C 6C -G 20 \
+  | ./target/release/dabctl eti2pcm -F -s 0xF2F8 -p \
   | ffplay -f s16le -ar 48000 -ac 2 -nodisp -i -
 
 # Ou avec dablin (si installé)
-sudo ./target/release/eti-rtlsdr-rust iq2eti -S -C 6C -G 20 | dablin -s 0xF2F8
+sudo ./target/release/dabctl iq2eti -S -C 6C -G 20 | dablin -s 0xF2F8
 
 # Ou avec l'interface graphique dablin
-sudo ./target/release/eti-rtlsdr-rust iq2eti -S -C 6C -G 20 | dablin_gtk
+sudo ./target/release/dabctl iq2eti -S -C 6C -G 20 | dablin_gtk
 ```
 
 > **Astuce** : lancez d'abord sans `-S` pour voir les SID des programmes disponibles dans stderr, puis relancez avec `-S` et `-s 0xSID`.
@@ -501,7 +501,7 @@ sudo ./target/release/eti-rtlsdr-rust iq2eti -S -C 6C -G 20 | dablin_gtk
 
 ```bash
 # Relire le fichier ETI capturé avec eti2pcm (intégré)
-./target/release/eti-rtlsdr-rust eti2pcm -s 0xF2F8 -p capture_6C.eti \
+./target/release/dabctl eti2pcm -s 0xF2F8 -p capture_6C.eti \
   | ffplay -f s16le -ar 48000 -ac 2 -nodisp -i -
 
 # Ou avec dablin (si installé)
@@ -516,12 +516,12 @@ dablin_gtk < capture_6C.eti
 cargo build --release --target aarch64-unknown-linux-gnu
 
 # Déployer
-scp target/aarch64-unknown-linux-gnu/release/eti-rtlsdr-rust pi@raspberrypi:~
+scp target/aarch64-unknown-linux-gnu/release/dabctl pi@raspberrypi:~
 
 # Sur le Pi — écouter en direct
 ssh pi@raspberrypi
-./eti-rtlsdr-rust iq2eti -S -C 6C -G 30 \
-  | ./eti-rtlsdr-rust eti2pcm -F -s 0xF2F8 -p \
+./dabctl iq2eti -S -C 6C -G 30 \
+  | ./dabctl eti2pcm -F -s 0xF2F8 -p \
   | aplay -f S16_LE -r 48000 -c 2
 ```
 
@@ -663,12 +663,12 @@ Une page de manuel Unix est fournie :
 
 ```bash
 # Consulter localement
-man ./eti-rtlsdr-rust.1
+man ./dabctl.1
 
 # Installer system-wide
-sudo install -m 644 eti-rtlsdr-rust.1 /usr/local/share/man/man1/
+sudo install -m 644 dabctl.1 /usr/local/share/man/man1/
 sudo mandb
-man eti-rtlsdr-rust
+man dabctl
 ```
 
 ---
