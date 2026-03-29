@@ -16,7 +16,7 @@ pub struct SuperframeFormat {
 }
 
 impl SuperframeFormat {
-    pub fn core_sr_index(&self) -> u8 {
+    pub fn core_sample_rate_index(&self) -> u8 {
         if self.dac_rate {
             if self.sbr_flag { 6 } else { 3 }
         } else {
@@ -24,11 +24,11 @@ impl SuperframeFormat {
         }
     }
 
-    pub fn core_ch_config(&self) -> u8 {
+    pub fn core_channel_config(&self) -> u8 {
         if self.aac_channel_mode { 2 } else { 1 }
     }
 
-    pub fn extension_sr_index(&self) -> u8 {
+    pub fn extension_sample_rate_index(&self) -> u8 {
         if self.dac_rate { 3 } else { 5 }
     }
 
@@ -40,12 +40,8 @@ impl SuperframeFormat {
         if self.aac_channel_mode || self.ps_flag { 2 } else { 1 }
     }
 
-    pub fn num_aus(&self) -> usize {
-        if self.dac_rate {
-            if self.sbr_flag { 3 } else { 6 }
-        } else {
-            if self.sbr_flag { 2 } else { 4 }
-        }
+    pub fn number_of_access_units(&self) -> usize {
+        calculate_number_of_access_units(self.dac_rate, self.sbr_flag)
     }
 
     pub fn codec_name(&self) -> &'static str {
@@ -60,10 +56,10 @@ impl SuperframeFormat {
     pub fn build_asc(&self) -> Vec<u8> {
         let mut asc = Vec::new();
         // AAC LC (AOT 2)
-        asc.push(0b00010 << 3 | self.core_sr_index() >> 1);
+        asc.push(0b00010 << 3 | self.core_sample_rate_index() >> 1);
         asc.push(
-            (self.core_sr_index() & 0x01) << 7
-                | self.core_ch_config() << 3
+            (self.core_sample_rate_index() & 0x01) << 7
+                | self.core_channel_config() << 3
                 | 0b100, // GASpecificConfig with 960 transform
         );
 
@@ -71,7 +67,7 @@ impl SuperframeFormat {
             // SBR explicit backwards-compatible signaling
             asc.push(0x56); // sync extension 0x2B7 = 0101 0110 111...
             asc.push(0xE5); // ...101 = AOT 5 (SBR), 1 = SBR present
-            let ext_sr = self.extension_sr_index() << 3;
+            let ext_sr = self.extension_sample_rate_index() << 3;
             if self.ps_flag {
                 // PS explicit backwards-compatible signaling
                 asc.push(0x80 | ext_sr | 0x05); // ext_sr | 10101
@@ -82,6 +78,16 @@ impl SuperframeFormat {
             }
         }
         asc
+    }
+}
+
+/// Fonction pure pour calculer le nombre d'AUs (access units) selon dac_rate et sbr_flag
+pub fn calculate_number_of_access_units(dac_rate: bool, sbr_flag: bool) -> usize {
+    match (dac_rate, sbr_flag) {
+        (true, true) => 3,
+        (true, false) => 6,
+        (false, true) => 2,
+        (false, false) => 4,
     }
 }
 
@@ -182,7 +188,7 @@ impl SuperframeFilter {
         }
 
         let format = self.format.as_ref().unwrap();
-        let num_aus = format.num_aus();
+        let num_aus = format.number_of_access_units();
 
         // Extract AU boundaries
         let au_start = self.compute_au_starts(num_aus);
@@ -263,17 +269,18 @@ impl SuperframeFilter {
         let format = self.format.as_ref().unwrap();
         let mut au_start = vec![0usize; num_aus + 1];
 
-        // First AU start depends on format
-        au_start[0] = if format.dac_rate {
-            if format.sbr_flag { 6 } else { 11 }
-        } else {
-            if format.sbr_flag { 5 } else { 8 }
+        // Premier offset AU selon le format
+        au_start[0] = match (format.dac_rate, format.sbr_flag) {
+            (true, true) => 6,
+            (true, false) => 11,
+            (false, true) => 5,
+            (false, false) => 8,
         };
 
-        // Last pseudo-AU boundary (after RS stripped)
+        // Dernière pseudo-limite AU (après RS strip)
         au_start[num_aus] = self.sf_len / 120 * 110;
 
-        // Parse AU start offsets from superframe header
+        // Offsets AU depuis l'en-tête superframe
         au_start[1] = (sf[3] as usize) << 4 | (sf[4] as usize) >> 4;
         if num_aus >= 3 {
             au_start[2] = ((sf[4] & 0x0F) as usize) << 8 | sf[5] as usize;
@@ -341,7 +348,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_superframe_format_num_aus() {
+    fn test_calculate_number_of_access_units_given_dac_and_sbr_combinations_then_expected_result() {
+        // Given/When/Then : tous les cas possibles
+        assert_eq!(calculate_number_of_access_units(true, true), 3); // Given dac_rate=true, sbr_flag=true, Then 3
+        assert_eq!(calculate_number_of_access_units(true, false), 6); // Given dac_rate=true, sbr_flag=false, Then 6
+        assert_eq!(calculate_number_of_access_units(false, true), 2); // Given dac_rate=false, sbr_flag=true, Then 2
+        assert_eq!(calculate_number_of_access_units(false, false), 4); // Given dac_rate=false, sbr_flag=false, Then 4
+    }
+    
+    #[test]
+    fn test_superframe_format_number_of_access_units_when_various_formats_then_expected() {
+        // Given
         let fmt = SuperframeFormat {
             dac_rate: true,
             sbr_flag: true,
@@ -349,7 +366,8 @@ mod tests {
             ps_flag: false,
             mpeg_surround_config: 0,
         };
-        assert_eq!(fmt.num_aus(), 3);
+        // When/Then
+        assert_eq!(fmt.number_of_access_units(), 3);
 
         let fmt2 = SuperframeFormat {
             dac_rate: true,
@@ -358,7 +376,7 @@ mod tests {
             ps_flag: false,
             mpeg_surround_config: 0,
         };
-        assert_eq!(fmt2.num_aus(), 6);
+        assert_eq!(fmt2.number_of_access_units(), 6);
 
         let fmt3 = SuperframeFormat {
             dac_rate: false,
@@ -367,7 +385,7 @@ mod tests {
             ps_flag: false,
             mpeg_surround_config: 0,
         };
-        assert_eq!(fmt3.num_aus(), 2);
+        assert_eq!(fmt3.number_of_access_units(), 2);
     }
 
     #[test]

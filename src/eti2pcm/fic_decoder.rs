@@ -2,7 +2,7 @@
 /// Implements FIG 0/0 (ensemble), FIG 0/1 (subchannel config), FIG 0/2 (service→component),
 /// FIG 1/0 (ensemble label), FIG 1/1 (service label).
 use crate::eti2pcm::crc::crc16_ccitt;
-use crate::eti2pcm::ebu_latin::ebu_latin_to_utf8;
+use crate::eti2pcm::ebu_latin::ebu_latin_char_to_utf8_string;
 use std::collections::HashMap;
 
 /// Audio service type
@@ -350,7 +350,7 @@ fn decode_ebu_label(data: &[u8]) -> String {
     data.iter()
         .take(16)
         .filter(|&&ch| ch != 0)
-        .map(|&ch| ebu_latin_to_utf8(ch))
+        .map(|&ch| ebu_latin_char_to_utf8_string(ch))
         .collect()
 }
 
@@ -360,7 +360,7 @@ fn extract_short_label(data: &[u8], mask: u16) -> String {
     for i in 0..16 {
         if mask & (1 << (15 - i)) != 0 {
             if i < data.len() && data[i] != 0 {
-                result.push_str(&ebu_latin_to_utf8(data[i]));
+                result.push_str(&ebu_latin_char_to_utf8_string(data[i]));
             }
         }
     }
@@ -373,14 +373,14 @@ mod tests {
 
     #[test]
     fn test_ebu_latin_to_utf8_ascii() {
-        assert_eq!(ebu_latin_to_utf8(b'A').chars().next().unwrap_or('\0'), 'A');
-        assert_eq!(ebu_latin_to_utf8(b' ').chars().next().unwrap_or('\0'), ' ');
+        assert_eq!(ebu_latin_char_to_utf8_string(b'A').chars().next().unwrap_or('\0'), 'A');
+        assert_eq!(ebu_latin_char_to_utf8_string(b' ').chars().next().unwrap_or('\0'), ' ');
     }
 
     #[test]
     fn test_ebu_latin_to_utf8_accented() {
-        assert_eq!(ebu_latin_to_utf8(0x82).chars().next().unwrap_or('\0'), 'é');
-        assert_eq!(ebu_latin_to_utf8(0x80).chars().next().unwrap_or('\0'), 'á');
+        assert_eq!(ebu_latin_char_to_utf8_string(0x82).chars().next().unwrap_or('\0'), 'é');
+        assert_eq!(ebu_latin_char_to_utf8_string(0x80).chars().next().unwrap_or('\0'), 'á');
     }
 
     #[test]

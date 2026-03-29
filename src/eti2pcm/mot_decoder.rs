@@ -61,27 +61,26 @@ impl MotDecoder {
         if self.size_needed == 0 || self.size < self.size_needed {
             return false;
         }
-
-        // Validate CRC
-        if self.size_needed < CRC_LEN {
+        // Validation CRC extraite
+        if !self.is_valid_crc() {
             self.reset();
             return false;
         }
-
-        let data_len = self.size_needed - CRC_LEN;
-        let crc_stored =
-            (self.buffer[data_len] as u16) << 8 | self.buffer[data_len + 1] as u16;
-        let crc_calced = self.crc.calc(&self.buffer[..data_len]);
-
-        if crc_stored != crc_calced {
-            self.reset();
-            return false;
-        }
-
         true
     }
 
     /// Get the completed Data Group bytes (including CRC).
+
+    /// Validation CRC du Data Group courant
+    fn is_valid_crc(&self) -> bool {
+        if self.size_needed < CRC_LEN {
+            return false;
+        }
+        let data_len = self.size_needed - CRC_LEN;
+        let crc_stored = (self.buffer[data_len] as u16) << 8 | self.buffer[data_len + 1] as u16;
+        let crc_calced = self.crc.calc(&self.buffer[..data_len]);
+        crc_stored == crc_calced
+    }
     pub fn get_data_group(&self) -> Vec<u8> {
         self.buffer[..self.size_needed].to_vec()
     }
@@ -101,15 +100,53 @@ mod tests {
     }
 
     #[test]
-    fn test_mot_decoder_single_subfield() {
+    fn test_mot_decoder_single_subfield_given_valid_crc_then_returns_true() {
+        // Given
         let mut dec = MotDecoder::new();
-
         let payload = vec![0x01, 0x02, 0x03, 0x04];
         let dg = build_dg_with_crc(&payload);
-
         dec.set_len(dg.len());
-        assert!(dec.process_subfield(true, &dg));
+        // When
+        let result = dec.process_subfield(true, &dg);
+        // Then
+        assert!(result);
         assert_eq!(dec.get_data_group(), dg);
+    }
+
+    #[test]
+    fn test_mot_decoder_single_subfield_given_invalid_crc_then_returns_false() {
+        // Given
+        let mut dec = MotDecoder::new();
+        let mut payload = vec![0x01, 0x02, 0x03, 0x04];
+        // CRC faux
+        payload.push(0x00);
+        payload.push(0x00);
+        dec.set_len(payload.len());
+        // When
+        let result = dec.process_subfield(true, &payload);
+        // Then
+        assert!(!result);
+    }
+
+    #[test]
+    fn test_is_valid_crc_given_valid_and_invalid_cases() {
+        // Given
+        let mut dec = MotDecoder::new();
+        let payload = vec![0x10, 0x20, 0x30, 0x40];
+        let dg = build_dg_with_crc(&payload);
+        dec.set_len(dg.len());
+        dec.process_subfield(true, &dg);
+        // When/Then
+        assert!(dec.is_valid_crc());
+
+        // Cas CRC faux
+        let mut dec2 = MotDecoder::new();
+        let mut bad = dg.clone();
+        let last = bad.len() - 1;
+        bad[last] ^= 0xFF; // corrompre le CRC
+        dec2.set_len(bad.len());
+        dec2.process_subfield(true, &bad);
+        assert!(!dec2.is_valid_crc());
     }
 
     #[test]
