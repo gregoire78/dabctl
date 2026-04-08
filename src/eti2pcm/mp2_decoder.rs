@@ -56,8 +56,8 @@ pub struct Mp2Decoder {
 
 impl Mp2Decoder {
     pub fn new() -> Result<Self, String> {
-        MPG123_INIT.call_once(|| {
-            unsafe { ffi::mpg123_init(); }
+        MPG123_INIT.call_once(|| unsafe {
+            ffi::mpg123_init();
         });
 
         unsafe {
@@ -75,7 +75,12 @@ impl Mp2Decoder {
             // Accept common DAB sample rates
             ffi::mpg123_format_none(handle);
             for rate in [48000i64, 24000, 32000, 16000] {
-                ffi::mpg123_format(handle, rate as std::os::raw::c_long, 1 | 2, ffi::MPG123_ENC_SIGNED_16);
+                ffi::mpg123_format(
+                    handle,
+                    rate as std::os::raw::c_long,
+                    1 | 2,
+                    ffi::MPG123_ENC_SIGNED_16,
+                );
             }
 
             Ok(Mp2Decoder {

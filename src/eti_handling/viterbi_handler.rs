@@ -10,14 +10,14 @@ const POLYS: [i32; RATE] = [0o155, 0o117, 0o123, 0o155];
 const RENORMALIZE_THRESHOLD: u32 = 137;
 
 static PARTAB: [u8; 256] = [
-    0,1,1,0,1,0,0,1,1,0,0,1,0,1,1,0, 1,0,0,1,0,1,1,0,0,1,1,0,1,0,0,1,
-    1,0,0,1,0,1,1,0,0,1,1,0,1,0,0,1, 0,1,1,0,1,0,0,1,1,0,0,1,0,1,1,0,
-    1,0,0,1,0,1,1,0,0,1,1,0,1,0,0,1, 0,1,1,0,1,0,0,1,1,0,0,1,0,1,1,0,
-    0,1,1,0,1,0,0,1,1,0,0,1,0,1,1,0, 1,0,0,1,0,1,1,0,0,1,1,0,1,0,0,1,
-    1,0,0,1,0,1,1,0,0,1,1,0,1,0,0,1, 0,1,1,0,1,0,0,1,1,0,0,1,0,1,1,0,
-    0,1,1,0,1,0,0,1,1,0,0,1,0,1,1,0, 1,0,0,1,0,1,1,0,0,1,1,0,1,0,0,1,
-    0,1,1,0,1,0,0,1,1,0,0,1,0,1,1,0, 1,0,0,1,0,1,1,0,0,1,1,0,1,0,0,1,
-    1,0,0,1,0,1,1,0,0,1,1,0,1,0,0,1, 0,1,1,0,1,0,0,1,1,0,0,1,0,1,1,0,
+    0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1,
+    1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0,
+    1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0,
+    0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1,
+    1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0,
+    0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1,
+    0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1,
+    1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0,
 ];
 
 fn parity(mut x: i32) -> i32 {
@@ -43,17 +43,19 @@ impl ViterbiSpiral {
         let mut branchtab = vec![0u8; RATE * NUM_STATES / 2];
         for state in 0..NUM_STATES / 2 {
             for i in 0..RATE {
-                branchtab[i * NUM_STATES / 2 + state] =
-                    if (POLYS[i] < 0) as u8 ^ parity((2 * state as i32) & POLYS[i].abs()) as u8 != 0 {
-                        255
-                    } else {
-                        0
-                    };
+                branchtab[i * NUM_STATES / 2 + state] = if (POLYS[i] < 0) as u8
+                    ^ parity((2 * state as i32) & POLYS[i].abs()) as u8
+                    != 0
+                {
+                    255
+                } else {
+                    0
+                };
             }
         }
 
         let total_symbols = RATE * (word_length + K - 1);
-        let decision_words = (word_length + K - 1) * ((NUM_STATES + 31) / 32);
+        let decision_words = (word_length + K - 1) * NUM_STATES.div_ceil(32);
 
         ViterbiSpiral {
             frame_bits: word_length,
@@ -87,7 +89,7 @@ impl ViterbiSpiral {
 
     fn update_viterbi(&mut self) {
         let nbits = self.frame_bits + K - 1;
-        let words_per_decision = (NUM_STATES + 31) / 32;
+        let words_per_decision = NUM_STATES.div_ceil(32);
 
         // Clear decisions
         for d in self.decisions[..nbits * words_per_decision].iter_mut() {
@@ -100,7 +102,14 @@ impl ViterbiSpiral {
             let sym_base = s * RATE;
 
             // Destructure to split borrows on disjoint fields
-            let Self { metrics1, metrics2, branchtab, symbols, decisions, .. } = self;
+            let Self {
+                metrics1,
+                metrics2,
+                branchtab,
+                symbols,
+                decisions,
+                ..
+            } = self;
             let (old, new): (&[u32], &mut [u32]) = if use_metrics1_as_old {
                 (metrics1.as_slice(), metrics2.as_mut_slice())
             } else {
@@ -150,9 +159,9 @@ impl ViterbiSpiral {
 
     fn chainback(&mut self) {
         let nbits = self.frame_bits;
-        let words_per_decision = (NUM_STATES + 31) / 32;
-        let add_shift = if K - 1 < 8 { 8 - (K - 1) } else { 0 };
-        let sub_shift = if K - 1 > 8 { (K - 1) - 8 } else { 0 };
+        let words_per_decision = NUM_STATES.div_ceil(32);
+        let add_shift = 8_usize.saturating_sub(K - 1);
+        let sub_shift = (K - 1).saturating_sub(8);
 
         let mut endstate: u32 = 0;
         endstate = (endstate % NUM_STATES as u32) << add_shift;
@@ -186,8 +195,8 @@ impl ViterbiSpiral {
     pub fn deconvolve(&mut self, input: &[i16], output: &mut [u8]) {
         self.init_viterbi();
         let total = (self.frame_bits + K - 1) * RATE;
-        for i in 0..total.min(input.len()) {
-            let temp = (input[i] as i32 + 127).clamp(0, 255);
+        for (i, &inp) in input.iter().enumerate().take(total.min(input.len())) {
+            let temp = (inp as i32 + 127).clamp(0, 255);
             self.symbols[i] = temp as u8;
         }
 
@@ -195,10 +204,10 @@ impl ViterbiSpiral {
         self.chainback();
 
         // Extract bits from packed bytes
-        for i in 0..self.frame_bits {
+        for (i, out) in output.iter_mut().enumerate().take(self.frame_bits) {
             let byte_idx = i >> 3;
             let bit_pos = 7 - (i & 7);
-            output[i] = (self.data[byte_idx] >> bit_pos) & 1;
+            *out = (self.data[byte_idx] >> bit_pos) & 1;
         }
     }
 }
@@ -224,7 +233,9 @@ mod tests {
     #[test]
     fn output_is_binary() {
         let mut v = ViterbiSpiral::new(64);
-        let input: Vec<i16> = (0..280).map(|i| if i % 3 == 0 { 127 } else { -127 }).collect();
+        let input: Vec<i16> = (0..280)
+            .map(|i| if i % 3 == 0 { 127 } else { -127 })
+            .collect();
         let mut output = vec![0u8; 64];
         v.deconvolve(&input, &mut output);
         assert!(output.iter().all(|&b| b == 0 || b == 1));

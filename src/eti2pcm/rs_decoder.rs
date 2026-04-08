@@ -1,6 +1,8 @@
 /// Reed-Solomon (120,110) decoder for DAB+ superframes.
 /// Uses GF(2^8), generator polynomial 0x11D, FCR=0, prim=1, nroots=10, pad=135.
 /// This is RS(255,245) shortened to (120,110).
+/// ETSI TS 102 563 §6.
+use std::sync::OnceLock;
 
 const GF_POLY: u16 = 0x11D; // x^8 + x^4 + x^3 + x^2 + 1
 const NROOTS: usize = 10;
@@ -68,13 +70,24 @@ fn build_gf_tables() -> GfTables {
 
 /// RS decoder state
 pub struct RsDecoder {
-    gf: GfTables,
+    gf: &'static GfTables,
+}
+
+/// Global GF(2^8) tables, computed once at first use.
+static GF_TABLES: OnceLock<GfTables> = OnceLock::new();
+
+impl Default for RsDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RsDecoder {
+    /// Create a new RS decoder.  GF tables are shared across all instances
+    /// via a process-wide `OnceLock`; construction is O(1) after the first call.
     pub fn new() -> Self {
         RsDecoder {
-            gf: build_gf_tables(),
+            gf: GF_TABLES.get_or_init(build_gf_tables),
         }
     }
 
@@ -126,17 +139,17 @@ impl RsDecoder {
         let mut syndromes = [0u8; NROOTS];
         let mut has_errors = false;
 
-        for i in 0..NROOTS {
+        for (i, syn_out) in syndromes.iter_mut().enumerate() {
             let mut syn: u8 = 0;
-            for j in 0..NN {
+            for &bv in block.iter() {
                 if syn == 0 {
-                    syn = block[j];
+                    syn = bv;
                 } else {
                     let idx = (gf.index_of[syn as usize] as u16 + i as u16) % 255;
-                    syn = block[j] ^ gf.alpha_to[idx as usize];
+                    syn = bv ^ gf.alpha_to[idx as usize];
                 }
             }
-            syndromes[i] = syn;
+            *syn_out = syn;
             if syn != 0 {
                 has_errors = true;
             }
@@ -178,11 +191,14 @@ impl RsDecoder {
 
                 // t(x) = lambda(x) - delta * x * b(x)
                 let mut t = [0u8; NROOTS + 1];
-                for i in 0..=NROOTS {
-                    t[i] = lambda[i];
-                    if b[i] != 0 {
-                        let idx = (gf.index_of[b[i] as usize] as u16 + delta_idx as u16) % 255;
-                        t[i] ^= gf.alpha_to[idx as usize];
+                for (t_val, (&lam_val, &b_val)) in t
+                    .iter_mut()
+                    .zip(lambda.iter().zip(b.iter()))
+                {
+                    *t_val = lam_val;
+                    if b_val != 0 {
+                        let idx = (gf.index_of[b_val as usize] as u16 + delta_idx as u16) % 255;
+                        *t_val ^= gf.alpha_to[idx as usize];
                     }
                 }
 
@@ -192,7 +208,8 @@ impl RsDecoder {
                     let inv_delta_idx = (255 - delta_idx as u16) % 255;
                     for i in 0..=NROOTS {
                         if lambda[i] != 0 {
-                            let idx = (gf.index_of[lambda[i] as usize] as u16 + inv_delta_idx) % 255;
+                            let idx =
+                                (gf.index_of[lambda[i] as usize] as u16 + inv_delta_idx) % 255;
                             b[i] = gf.alpha_to[idx as usize];
                         } else {
                             b[i] = 0;
@@ -208,9 +225,11 @@ impl RsDecoder {
         let mut error_locs = Vec::new();
         for i in 0..NN {
             let mut sum: u8 = 0;
-            for j in 0..=NROOTS {
-                if lambda[j] != 0 {
-                    let idx = (gf.index_of[lambda[j] as usize] as u16 + (j as u16 * i as u16) % 255) % 255;
+            for (j, &lam_j) in lambda.iter().enumerate().take(NROOTS + 1) {
+                if lam_j != 0 {
+                    let idx = (gf.index_of[lam_j as usize] as u16
+                        + (j as u16 * i as u16) % 255)
+                        % 255;
                     sum ^= gf.alpha_to[idx as usize];
                 }
             }
@@ -232,14 +251,19 @@ impl RsDecoder {
         // Forney algorithm to compute error magnitudes
         // First, compute omega (error evaluator polynomial)
         let mut omega = [0u8; NROOTS + 1];
-        for i in 0..NROOTS {
-            omega[i] = syndromes[i];
+        for (i, (om, &syn_i)) in omega
+            .iter_mut()
+            .zip(syndromes.iter())
+            .enumerate()
+            .take(NROOTS)
+        {
+            *om = syn_i;
             for j in 1..=i.min(l) {
                 if lambda[j] != 0 && syndromes[i - j] != 0 {
                     let idx = (gf.index_of[lambda[j] as usize] as u16
                         + gf.index_of[syndromes[i - j] as usize] as u16)
                         % 255;
-                    omega[i] ^= gf.alpha_to[idx as usize];
+                    *om ^= gf.alpha_to[idx as usize];
                 }
             }
         }
@@ -250,9 +274,10 @@ impl RsDecoder {
 
             // Evaluate omega at xi_inv
             let mut omega_val: u8 = 0;
-            for i in 0..NROOTS {
-                if omega[i] != 0 {
-                    let idx = (gf.index_of[omega[i] as usize] as u16 + xi_inv * i as u16 % 255) % 255;
+            for (i, &om_i) in omega.iter().enumerate().take(NROOTS) {
+                if om_i != 0 {
+                    let idx =
+                        (gf.index_of[om_i as usize] as u16 + xi_inv * i as u16 % 255) % 255;
                     omega_val ^= gf.alpha_to[idx as usize];
                 }
             }
@@ -261,7 +286,9 @@ impl RsDecoder {
             let mut lambda_prime: u8 = 0;
             for i in (1..=l).step_by(2) {
                 if lambda[i] != 0 {
-                    let idx = (gf.index_of[lambda[i] as usize] as u16 + xi_inv * (i - 1) as u16 % 255) % 255;
+                    let idx = (gf.index_of[lambda[i] as usize] as u16
+                        + xi_inv * (i - 1) as u16 % 255)
+                        % 255;
                     lambda_prime ^= gf.alpha_to[idx as usize];
                 }
             }
@@ -271,13 +298,12 @@ impl RsDecoder {
             }
 
             // Error magnitude = omega / lambda'
-            let err_val_idx = (gf.index_of[omega_val as usize] as u16
-                + 255
+            let err_val_idx = (gf.index_of[omega_val as usize] as u16 + 255
                 - gf.index_of[lambda_prime as usize] as u16)
                 % 255;
             let err_val = gf.alpha_to[err_val_idx as usize];
 
-            if loc >= PAD && loc < PAD + BLOCK_SIZE {
+            if (PAD..PAD + BLOCK_SIZE).contains(&loc) {
                 block[loc] ^= err_val;
             }
         }

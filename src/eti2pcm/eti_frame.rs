@@ -6,8 +6,8 @@ pub const ETI_FRAME_SIZE: usize = 6144;
 /// Description of one subchannel stream within an ETI frame (from STC field)
 #[derive(Debug, Clone)]
 pub struct StreamDescriptor {
-    pub scid: u8,       // SubChannel ID (6 bits)
-    pub stl: u16,       // Stream length in 64-bit words
+    pub scid: u8, // SubChannel ID (6 bits)
+    pub stl: u16, // Stream length in 64-bit words
 }
 
 impl StreamDescriptor {
@@ -22,10 +22,10 @@ impl StreamDescriptor {
 pub struct EtiFrameHeader {
     pub err: u8,
     pub fsync: u32,
-    pub ficf: bool,     // FIC flag
-    pub nst: u8,        // Number of streams
-    pub mid: u8,        // Mode identity (1-4)
-    pub fl: u16,        // Frame length in 32-bit words
+    pub ficf: bool, // FIC flag
+    pub nst: u8,    // Number of streams
+    pub mid: u8,    // Mode identity (1-4)
+    pub fl: u16,    // Frame length in 32-bit words
     pub streams: Vec<StreamDescriptor>,
 }
 
@@ -59,7 +59,11 @@ impl<'a> EtiFrame<'a> {
 
     fn fic_length(&self) -> usize {
         if self.header.ficf {
-            if self.header.mid == 3 { 32 } else { 24 }
+            if self.header.mid == 3 {
+                32
+            } else {
+                24
+            }
         } else {
             0
         }
@@ -120,7 +124,15 @@ pub fn parse_eti_frame(frame: &[u8; ETI_FRAME_SIZE]) -> Option<EtiFrame<'_>> {
         streams.push(StreamDescriptor { scid, stl });
     }
 
-    let ficl = if ficf { if mid == 3 { 32 } else { 24 } } else { 0 };
+    let ficl = if ficf {
+        if mid == 3 {
+            32
+        } else {
+            24
+        }
+    } else {
+        0
+    };
     let data_start = 8 + nst as usize * 4 + 4; // after EOH (MNSC + HCRC)
 
     // MST CRC check

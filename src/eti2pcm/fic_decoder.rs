@@ -53,21 +53,77 @@ const EEP_B_SIZE_FACTORS: [u16; 4] = [27, 21, 18, 15];
 
 // UEP table: [size, protection_level, bitrate] for indices 0..63
 static UEP_TABLE: [(u16, u8, u16); 64] = [
-    (16,5,32),(21,4,32),(24,3,32),(29,2,32),(35,1,32),
-    (24,5,48),(29,4,48),(35,3,48),(42,2,48),(52,1,48),
-    (29,5,56),(35,4,56),(42,3,56),(52,2,56),
-    (32,5,64),(42,4,64),(48,3,64),(58,2,64),(70,1,64),
-    (40,5,80),(52,4,80),(58,3,80),(70,2,80),(84,1,80),
-    (48,5,96),(58,4,96),(70,3,96),(84,2,96),(104,1,96),
-    (58,5,112),(70,4,112),(84,3,112),(104,2,112),
-    (64,5,128),(84,4,128),(96,3,128),(116,2,128),(140,1,128),
-    (80,5,160),(104,4,160),(116,3,160),(140,2,160),(168,1,160),
-    (96,5,192),(116,4,192),(140,3,192),(168,2,192),(208,1,192),
-    (116,5,224),(140,4,224),(168,3,224),(208,2,224),(232,1,224),
-    (128,5,256),(168,4,256),(192,3,256),(232,2,256),(280,1,256),
-    (160,5,320),(208,4,320),(280,2,320),
-    (192,5,384),(280,3,384),(416,1,384),
+    (16, 5, 32),
+    (21, 4, 32),
+    (24, 3, 32),
+    (29, 2, 32),
+    (35, 1, 32),
+    (24, 5, 48),
+    (29, 4, 48),
+    (35, 3, 48),
+    (42, 2, 48),
+    (52, 1, 48),
+    (29, 5, 56),
+    (35, 4, 56),
+    (42, 3, 56),
+    (52, 2, 56),
+    (32, 5, 64),
+    (42, 4, 64),
+    (48, 3, 64),
+    (58, 2, 64),
+    (70, 1, 64),
+    (40, 5, 80),
+    (52, 4, 80),
+    (58, 3, 80),
+    (70, 2, 80),
+    (84, 1, 80),
+    (48, 5, 96),
+    (58, 4, 96),
+    (70, 3, 96),
+    (84, 2, 96),
+    (104, 1, 96),
+    (58, 5, 112),
+    (70, 4, 112),
+    (84, 3, 112),
+    (104, 2, 112),
+    (64, 5, 128),
+    (84, 4, 128),
+    (96, 3, 128),
+    (116, 2, 128),
+    (140, 1, 128),
+    (80, 5, 160),
+    (104, 4, 160),
+    (116, 3, 160),
+    (140, 2, 160),
+    (168, 1, 160),
+    (96, 5, 192),
+    (116, 4, 192),
+    (140, 3, 192),
+    (168, 2, 192),
+    (208, 1, 192),
+    (116, 5, 224),
+    (140, 4, 224),
+    (168, 3, 224),
+    (208, 2, 224),
+    (232, 1, 224),
+    (128, 5, 256),
+    (168, 4, 256),
+    (192, 3, 256),
+    (232, 2, 256),
+    (280, 1, 256),
+    (160, 5, 320),
+    (208, 4, 320),
+    (280, 2, 320),
+    (192, 5, 384),
+    (280, 3, 384),
+    (416, 1, 384),
 ];
+
+impl Default for FicDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl FicDecoder {
     pub fn new() -> Self {
@@ -81,7 +137,7 @@ impl FicDecoder {
 
     /// Process raw FIC data (multiple FIBs of 32 bytes each)
     pub fn process(&mut self, data: &[u8]) {
-        if data.len() % 32 != 0 {
+        if !data.len().is_multiple_of(32) {
             return;
         }
         for chunk in data.chunks_exact(32) {
@@ -190,24 +246,30 @@ impl FicDecoder {
                     _ => continue,
                 };
 
-                self.subchannels.insert(subchid, SubchannelInfo {
-                    start: _start_address,
-                    size: subch_size,
-                    bitrate,
-                    protection,
-                });
+                self.subchannels.insert(
+                    subchid,
+                    SubchannelInfo {
+                        start: _start_address,
+                        size: subch_size,
+                        bitrate,
+                        protection,
+                    },
+                );
             } else {
                 let table_index = (data[offset] & 0x3F) as usize;
                 offset += 1;
 
                 if table_index < UEP_TABLE.len() {
                     let (size, pl, bitrate) = UEP_TABLE[table_index];
-                    self.subchannels.insert(subchid, SubchannelInfo {
-                        start: _start_address,
-                        size,
-                        bitrate,
-                        protection: format!("UEP {}", pl),
-                    });
+                    self.subchannels.insert(
+                        subchid,
+                        SubchannelInfo {
+                            start: _start_address,
+                            size,
+                            bitrate,
+                            protection: format!("UEP {}", pl),
+                        },
+                    );
                 }
             }
         }
@@ -261,7 +323,7 @@ impl FicDecoder {
     }
 
     fn process_fig1(&mut self, data: &[u8]) {
-        if data.len() < 1 {
+        if data.is_empty() {
             return;
         }
         let charset = data[0] >> 4;
@@ -301,7 +363,11 @@ impl FicDecoder {
                 ens.short_label = short_label;
             }
         } else {
-            self.ensemble = Some(EnsembleInfo { eid, label, short_label });
+            self.ensemble = Some(EnsembleInfo {
+                eid,
+                label,
+                short_label,
+            });
         }
     }
 
@@ -341,7 +407,9 @@ impl FicDecoder {
     /// Find a service by its label (case-insensitive, trimmed).
     pub fn find_service_by_label(&self, label: &str) -> Option<&ServiceInfo> {
         let needle = label.trim().to_lowercase();
-        self.services.values().find(|s| s.label.trim().to_lowercase() == needle)
+        self.services
+            .values()
+            .find(|s| s.label.trim().to_lowercase() == needle)
     }
 }
 
@@ -358,11 +426,10 @@ fn decode_ebu_label(data: &[u8]) -> String {
 fn extract_short_label(data: &[u8], mask: u16) -> String {
     let mut result = String::new();
     for i in 0..16 {
-        if mask & (1 << (15 - i)) != 0 {
-            if i < data.len() && data[i] != 0 {
+        if mask & (1 << (15 - i)) != 0
+            && i < data.len() && data[i] != 0 {
                 result.push_str(&ebu_latin_char_to_utf8_string(data[i]));
             }
-        }
     }
     result
 }
@@ -373,14 +440,38 @@ mod tests {
 
     #[test]
     fn test_ebu_latin_to_utf8_ascii() {
-        assert_eq!(ebu_latin_char_to_utf8_string(b'A').chars().next().unwrap_or('\0'), 'A');
-        assert_eq!(ebu_latin_char_to_utf8_string(b' ').chars().next().unwrap_or('\0'), ' ');
+        assert_eq!(
+            ebu_latin_char_to_utf8_string(b'A')
+                .chars()
+                .next()
+                .unwrap_or('\0'),
+            'A'
+        );
+        assert_eq!(
+            ebu_latin_char_to_utf8_string(b' ')
+                .chars()
+                .next()
+                .unwrap_or('\0'),
+            ' '
+        );
     }
 
     #[test]
     fn test_ebu_latin_to_utf8_accented() {
-        assert_eq!(ebu_latin_char_to_utf8_string(0x82).chars().next().unwrap_or('\0'), 'é');
-        assert_eq!(ebu_latin_char_to_utf8_string(0x80).chars().next().unwrap_or('\0'), 'á');
+        assert_eq!(
+            ebu_latin_char_to_utf8_string(0x82)
+                .chars()
+                .next()
+                .unwrap_or('\0'),
+            'é'
+        );
+        assert_eq!(
+            ebu_latin_char_to_utf8_string(0x80)
+                .chars()
+                .next()
+                .unwrap_or('\0'),
+            'á'
+        );
     }
 
     #[test]
@@ -402,9 +493,10 @@ mod tests {
         // Construct FIG 0/2 data:
         // SId=0xF201, 1 component, tmid=0b00 (MSC audio), ascty=63 (DAB+), subchid=5, ps=true
         let data = [
-            0xF2, 0x01,     // SId
-            0x01,           // 1 component
-            0x3F,           // tmid=0b00, ascty=63
+            0xF2,
+            0x01,            // SId
+            0x01,            // 1 component
+            0x3F,            // tmid=0b00, ascty=63
             (5 << 2) | 0x02, // subchid=5, ps=1, ca=0
         ];
         dec.process_fig0_2(&data);
@@ -420,17 +512,26 @@ mod tests {
     #[test]
     fn test_find_audio_service() {
         let mut dec = FicDecoder::new();
-        dec.services.insert(0xF201, ServiceInfo {
-            sid: 0xF201,
-            label: "France Inter".to_string(),
-            short_label: "Fr Inter".to_string(),
-            primary_subchid: Some(5),
-            audio_components: {
-                let mut map = HashMap::new();
-                map.insert(5, AudioService { subchid: 5, dab_plus: true });
-                map
+        dec.services.insert(
+            0xF201,
+            ServiceInfo {
+                sid: 0xF201,
+                label: "France Inter".to_string(),
+                short_label: "Fr Inter".to_string(),
+                primary_subchid: Some(5),
+                audio_components: {
+                    let mut map = HashMap::new();
+                    map.insert(
+                        5,
+                        AudioService {
+                            subchid: 5,
+                            dab_plus: true,
+                        },
+                    );
+                    map
+                },
             },
-        });
+        );
 
         let audio = dec.find_audio_service(0xF201).unwrap();
         assert_eq!(audio.subchid, 5);

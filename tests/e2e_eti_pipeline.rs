@@ -1,7 +1,6 @@
 /// End-to-end integration test: generates synthetic ETI frames, writes them to a file,
 /// reads them back with EtiReader, and parses them with parse_eti_frame.
 /// This validates the full ETI pipeline without requiring RTL-SDR hardware.
-
 use dabctl::eti2pcm::crc::crc16_ccitt;
 use dabctl::eti2pcm::eti_frame::{parse_eti_frame, ETI_FRAME_SIZE};
 use dabctl::eti2pcm::eti_reader::EtiReader;
@@ -98,8 +97,7 @@ fn e2e_generate_and_parse_eti_frames() {
     let mut prev_fsync: u32 = 0;
 
     while let Ok(Some(frame_data)) = reader.next_frame() {
-        let frame = parse_eti_frame(&frame_data)
-            .expect("Frame should parse successfully");
+        let frame = parse_eti_frame(&frame_data).expect("Frame should parse successfully");
 
         // Validate header fields
         assert_eq!(frame.header.err, 0xFF);
@@ -115,12 +113,18 @@ fn e2e_generate_and_parse_eti_frames() {
 
         // Verify FSYNC alternates
         if parsed_count > 0 {
-            assert_ne!(frame.header.fsync, prev_fsync, "FSYNC should alternate between frames");
+            assert_ne!(
+                frame.header.fsync, prev_fsync,
+                "FSYNC should alternate between frames"
+            );
         }
         prev_fsync = frame.header.fsync;
 
         // Verify FIC data is present
-        assert!(!frame.fic_data.is_empty(), "FIC data should be present (FICF=1)");
+        assert!(
+            !frame.fic_data.is_empty(),
+            "FIC data should be present (FICF=1)"
+        );
         // FIC length for mode 1 = 24 * 4 = 96 bytes
         assert_eq!(frame.fic_data.len(), 96);
 
@@ -204,8 +208,7 @@ fn e2e_eti_write_to_file_and_read_back() {
         let mut reader = EtiReader::new(std::io::BufReader::new(file));
         let mut count = 0;
         while let Ok(Some(frame_data)) = reader.next_frame() {
-            let frame = parse_eti_frame(&frame_data)
-                .expect("Frame from file should parse");
+            let frame = parse_eti_frame(&frame_data).expect("Frame from file should parse");
             assert_eq!(frame.header.streams[0].scid, 1);
             assert_eq!(frame.header.streams[0].stl, 16);
             count += 1;
@@ -244,7 +247,10 @@ fn e2e_eti_frame_crc_integrity() {
     // Tamper with a byte and verify parse fails
     let mut bad_frame = frame;
     bad_frame[10] ^= 0xFF; // corrupt STC area
-    assert!(parse_eti_frame(&bad_frame).is_none(), "Corrupted frame should not parse");
+    assert!(
+        parse_eti_frame(&bad_frame).is_none(),
+        "Corrupted frame should not parse"
+    );
 }
 
 #[test]

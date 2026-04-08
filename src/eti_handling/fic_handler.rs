@@ -1,9 +1,9 @@
 // FIC handler - converted from fic-handler.cpp (eti-cmdline)
 
 use crate::dab_constants::{check_crc_bits, ChannelData};
+use crate::eti_handling::fib_processor::FibProcessor;
 use crate::eti_handling::prot_tables::get_pcodes;
 use crate::eti_handling::viterbi_handler::ViterbiSpiral;
-use crate::eti_handling::fib_processor::FibProcessor;
 use crate::support::dab_params::DabParams;
 
 pub struct FicHandler {
@@ -25,9 +25,9 @@ impl FicHandler {
         // Generate PRBS sequence
         let mut prbs = [0u8; 768];
         let mut shift_reg = [1u8; 9];
-        for i in 0..768 {
-            prbs[i] = shift_reg[8] ^ shift_reg[4];
-            let b = prbs[i];
+        for item in &mut prbs {
+            *item = shift_reg[8] ^ shift_reg[4];
+            let b = *item;
             for j in (1..9).rev() {
                 shift_reg[j] = shift_reg[j - 1];
             }
@@ -102,15 +102,16 @@ impl FicHandler {
         // Depuncture
         let mut viterbi_block = vec![0i16; 3072 + 24];
         let mut input_count = 0;
-        for i in 0..(3072 + 24) {
+        for (i, vb) in viterbi_block.iter_mut().enumerate().take(3072 + 24) {
             if self.puncture_table[i] {
-                viterbi_block[i] = self.ofdm_input[input_count];
+                *vb = self.ofdm_input[input_count];
                 input_count += 1;
             }
         }
 
         // Viterbi decode
-        self.viterbi.deconvolve(&viterbi_block, &mut self.bit_buffer_out);
+        self.viterbi
+            .deconvolve(&viterbi_block, &mut self.bit_buffer_out);
 
         // Energy dispersal (PRBS descramble)
         for i in 0..768 {
@@ -178,7 +179,11 @@ mod tests {
         let params = DabParams::new(1);
         let fh = FicHandler::new(&params);
         for i in 0..64 {
-            assert!(!fh.get_channel_info(i).in_use, "Channel {} should not be in use initially", i);
+            assert!(
+                !fh.get_channel_info(i).in_use,
+                "Channel {} should not be in use initially",
+                i
+            );
         }
     }
 

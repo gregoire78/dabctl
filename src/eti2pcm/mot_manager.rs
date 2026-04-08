@@ -168,13 +168,7 @@ impl MotObject {
         }
     }
 
-    fn add_segment(
-        &mut self,
-        is_header: bool,
-        seg_number: usize,
-        last_seg: bool,
-        data: &[u8],
-    ) {
+    fn add_segment(&mut self, is_header: bool, seg_number: usize, last_seg: bool, data: &[u8]) {
         if is_header {
             self.header.add_segment(seg_number, last_seg, data);
         } else {
@@ -188,8 +182,10 @@ impl MotObject {
             return false;
         }
 
-        let body_size =
-            (data[0] as usize) << 20 | (data[1] as usize) << 12 | (data[2] as usize) << 4 | (data[3] as usize) >> 4;
+        let body_size = (data[0] as usize) << 20
+            | (data[1] as usize) << 12
+            | (data[2] as usize) << 4
+            | (data[3] as usize) >> 4;
         let header_size =
             ((data[3] & 0x0F) as usize) << 9 | (data[4] as usize) << 1 | (data[5] as usize) >> 7;
         let content_type = ((data[5] & 0x7F) >> 1) as i16;
@@ -263,8 +259,7 @@ impl MotObject {
                         let name_bytes = &data[offset + 1..offset + data_len];
                         self.result_file.content_name =
                             decode_content_name(name_bytes, charset_byte);
-                        self.result_file.content_name_charset =
-                            charset_name(charset_byte);
+                        self.result_file.content_name_charset = charset_name(charset_byte);
                     }
                 }
                 0x26 => {
@@ -339,6 +334,12 @@ pub struct MotManager {
     crc: crate::eti2pcm::crc::CrcCalculator,
 }
 
+impl Default for MotManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MotManager {
     pub fn new() -> Self {
         MotManager {
@@ -364,11 +365,11 @@ impl MotManager {
         };
 
         // Parse session header
-        let (last_seg, seg_number, transport_id) =
-            match self.parse_session_header(dg, &mut offset) {
-                Some(v) => v,
-                None => return (None, -1.0),
-            };
+        let (last_seg, seg_number, transport_id) = match self.parse_session_header(dg, &mut offset)
+        {
+            Some(v) => v,
+            None => return (None, -1.0),
+        };
 
         // Parse segmentation header
         let seg_size = match self.parse_segmentation_header(dg, &mut offset) {
@@ -383,8 +384,12 @@ impl MotManager {
         }
 
         let is_header = dg_type == 3;
-        self.object
-            .add_segment(is_header, seg_number, last_seg, &dg[offset..offset + seg_size]);
+        self.object.add_segment(
+            is_header,
+            seg_number,
+            last_seg,
+            &dg[offset..offset + seg_size],
+        );
 
         let display = self.object.is_to_be_shown();
 
@@ -425,11 +430,7 @@ impl MotManager {
         Some(dg_type)
     }
 
-    fn parse_session_header(
-        &self,
-        dg: &[u8],
-        offset: &mut usize,
-    ) -> Option<(bool, usize, usize)> {
+    fn parse_session_header(&self, dg: &[u8], offset: &mut usize) -> Option<(bool, usize, usize)> {
         if dg.len() < *offset + 3 {
             return None;
         }
@@ -674,12 +675,8 @@ mod tests {
         let body_size = body_data.len();
 
         // Build MOT header
-        let header_raw = build_mot_header(
-            body_size,
-            CONTENT_TYPE_IMAGE,
-            CONTENT_SUB_TYPE_JFIF,
-            true,
-        );
+        let header_raw =
+            build_mot_header(body_size, CONTENT_TYPE_IMAGE, CONTENT_SUB_TYPE_JFIF, true);
 
         // Send header as DG type 3
         let dg_header = build_mot_dg(3, 0, true, 1, &header_raw);
@@ -706,12 +703,8 @@ mod tests {
         let body_part2 = vec![0xE0, 0x00, 0x10];
         let body_size = body_part1.len() + body_part2.len();
 
-        let header_raw = build_mot_header(
-            body_size,
-            CONTENT_TYPE_IMAGE,
-            CONTENT_SUB_TYPE_PNG,
-            true,
-        );
+        let header_raw =
+            build_mot_header(body_size, CONTENT_TYPE_IMAGE, CONTENT_SUB_TYPE_PNG, true);
 
         let dg_header = build_mot_dg(3, 0, true, 42, &header_raw);
         let (result, _) = mgr.handle_data_group(&dg_header);

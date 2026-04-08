@@ -18,26 +18,50 @@ pub struct SuperframeFormat {
 impl SuperframeFormat {
     pub fn core_sample_rate_index(&self) -> u8 {
         if self.dac_rate {
-            if self.sbr_flag { 6 } else { 3 }
+            if self.sbr_flag {
+                6
+            } else {
+                3
+            }
         } else {
-            if self.sbr_flag { 8 } else { 5 }
+            if self.sbr_flag {
+                8
+            } else {
+                5
+            }
         }
     }
 
     pub fn core_channel_config(&self) -> u8 {
-        if self.aac_channel_mode { 2 } else { 1 }
+        if self.aac_channel_mode {
+            2
+        } else {
+            1
+        }
     }
 
     pub fn extension_sample_rate_index(&self) -> u8 {
-        if self.dac_rate { 3 } else { 5 }
+        if self.dac_rate {
+            3
+        } else {
+            5
+        }
     }
 
     pub fn sample_rate(&self) -> u32 {
-        if self.dac_rate { 48000 } else { 32000 }
+        if self.dac_rate {
+            48000
+        } else {
+            32000
+        }
     }
 
     pub fn channels(&self) -> u8 {
-        if self.aac_channel_mode || self.ps_flag { 2 } else { 1 }
+        if self.aac_channel_mode || self.ps_flag {
+            2
+        } else {
+            1
+        }
     }
 
     pub fn number_of_access_units(&self) -> usize {
@@ -46,7 +70,11 @@ impl SuperframeFormat {
 
     pub fn codec_name(&self) -> &'static str {
         if self.sbr_flag {
-            if self.ps_flag { "HE-AAC v2" } else { "HE-AAC" }
+            if self.ps_flag {
+                "HE-AAC v2"
+            } else {
+                "HE-AAC"
+            }
         } else {
             "AAC-LC"
         }
@@ -58,9 +86,7 @@ impl SuperframeFormat {
         // AAC LC (AOT 2)
         asc.push(0b00010 << 3 | self.core_sample_rate_index() >> 1);
         asc.push(
-            (self.core_sample_rate_index() & 0x01) << 7
-                | self.core_channel_config() << 3
-                | 0b100, // GASpecificConfig with 960 transform
+            (self.core_sample_rate_index() & 0x01) << 7 | self.core_channel_config() << 3 | 0b100, // GASpecificConfig with 960 transform
         );
 
         if self.sbr_flag {
@@ -109,11 +135,19 @@ pub struct SuperframeFilter {
     crc_fire: CrcCalculator,
     frame_len: usize,
     frame_count: usize,
-    sf_raw: Vec<u8>,
-    sf: Vec<u8>,
+    /// Circular write head (0..5): index of the slot to write next.
+    write_head: usize,
+    sf_raw: Vec<u8>, // 5 × frame_len slots in circular order
+    sf: Vec<u8>,     // linearized view for RS decode
     sf_len: usize,
     format: Option<SuperframeFormat>,
     format_raw: u8,
+}
+
+impl Default for SuperframeFilter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SuperframeFilter {
@@ -124,6 +158,7 @@ impl SuperframeFilter {
             crc_fire: crc_fire_code(),
             frame_len: 0,
             frame_count: 0,
+            write_head: 0,
             sf_raw: Vec::new(),
             sf: Vec::new(),
             sf_len: 0,
@@ -139,7 +174,7 @@ impl SuperframeFilter {
 
         // Initialize frame length on first frame
         if self.frame_len == 0 {
-            if len < 10 || (5 * len) % 120 != 0 {
+            if len < 10 || !(5 * len).is_multiple_of(120) {
                 return SuperframeResult::default();
             }
             self.frame_len = len;
@@ -152,14 +187,13 @@ impl SuperframeFilter {
             return SuperframeResult::default();
         }
 
-        // Accumulate frames using sliding window
-        if self.frame_count == 5 {
-            // Shift previous 4 frames
-            self.sf_raw.copy_within(self.frame_len.., 0);
-            self.sf_raw[4 * self.frame_len..].copy_from_slice(data);
-        } else {
-            let start = self.frame_count * self.frame_len;
-            self.sf_raw[start..start + self.frame_len].copy_from_slice(data);
+        // Circular write: overwrite the oldest slot.
+        // Eliminates the copy_within(frame_len.., 0) that previously shifted
+        // 4 × frame_len bytes on every frame in the sliding-window path.
+        let slot = self.write_head;
+        self.sf_raw[slot * self.frame_len..(slot + 1) * self.frame_len].copy_from_slice(data);
+        self.write_head = (self.write_head + 1) % 5;
+        if self.frame_count < 5 {
             self.frame_count += 1;
         }
 
@@ -167,14 +201,21 @@ impl SuperframeFilter {
             return SuperframeResult::default();
         }
 
-        // RS decode on copy
-        self.sf.copy_from_slice(&self.sf_raw);
+        // Linearize circular buffer into self.sf (oldest frame first).
+        // read_head = write_head (points to slot that was written longest ago).
+        let read_head = self.write_head;
+        for i in 0..5 {
+            let src_slot = (read_head + i) % 5;
+            let src = src_slot * self.frame_len..(src_slot + 1) * self.frame_len;
+            let dst = i * self.frame_len..(i + 1) * self.frame_len;
+            self.sf[dst].copy_from_slice(&self.sf_raw[src]);
+        }
         let (_corr, _uncorr) = self.rs_dec.decode_superframe(&mut self.sf);
 
         // Check fire code sync
         if !self.check_sync() {
-            // Slide by 1 frame instead of resetting to find alignment faster
-            self.sf_raw.copy_within(self.frame_len.., 0);
+            // Slide by 1 frame: set count to 4 so we collect just one more frame.
+            // write_head already points to the next slot to overwrite.
             self.frame_count = 4;
             return SuperframeResult::default();
         }
@@ -355,7 +396,7 @@ mod tests {
         assert_eq!(calculate_number_of_access_units(false, true), 2); // Given dac_rate=false, sbr_flag=true, Then 2
         assert_eq!(calculate_number_of_access_units(false, false), 4); // Given dac_rate=false, sbr_flag=false, Then 4
     }
-    
+
     #[test]
     fn test_superframe_format_number_of_access_units_when_various_formats_then_expected() {
         // Given

@@ -17,6 +17,12 @@ pub struct MotDecoder {
     crc: crate::eti2pcm::crc::CrcCalculator,
 }
 
+impl Default for MotDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MotDecoder {
     pub fn new() -> Self {
         MotDecoder {
@@ -70,7 +76,7 @@ impl MotDecoder {
     }
 
     /// Get the completed Data Group bytes (including CRC).
-
+    ///
     /// Validation CRC du Data Group courant
     fn is_valid_crc(&self) -> bool {
         if self.size_needed < CRC_LEN {

@@ -1,7 +1,7 @@
 // Ring buffer - thread-safe, matching the C++ RingBuffer<T> used in eti-cmdline
 
 use std::collections::VecDeque;
-use std::sync::{Mutex, Condvar};
+use std::sync::{Condvar, Mutex};
 
 pub struct RingBuffer<T> {
     inner: Mutex<VecDeque<T>>,
