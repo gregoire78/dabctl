@@ -2,10 +2,10 @@
 
 # 📡 dabctl
 
-**Réception DAB complète en Rust : RTL-SDR → PCM audio, direct ou via ETI**
+**Réception DAB complète en Rust : RTL-SDR → PCM audio**
 
 Port Rust de [eti-cmdline](https://github.com/JvanKatwijk/eti-stuff) (IQ → ETI) et [dablin](https://github.com/Opendigitalradio/dablin) (ETI → audio).
-Trois sous-commandes : **`iq2pcm`** (RTL-SDR → PCM en un seul processus), **`iq2eti`** (RTL-SDR → ETI) et **`eti2pcm`** (ETI → PCM).
+Pipeline directe **RTL-SDR → PCM** en un seul processus.
 
 [![Rust](https://img.shields.io/badge/Rust-2021-orange)](https://www.rust-lang.org/)
 [![License: GPL-2.0](https://img.shields.io/badge/License-GPL%202.0-blue.svg)](COPYING)
@@ -20,17 +20,13 @@ Trois sous-commandes : **`iq2pcm`** (RTL-SDR → PCM en un seul processus), **`i
 # 1. Build
 cargo build --release
 
-# 2. Direct RTL-SDR → PCM en un seul processus (nouvelle sous-commande iq2pcm)
-sudo ./target/release/dabctl iq2pcm -C 6C -G 20 -s 0xF2F8 \
+# 2. Écouter NRJ (SID 0xF2F8) sur le canal 6C
+sudo ./target/release/dabctl -C 6C -s 0xF2F8 \
   | ffplay -f s16le -ar 48000 -ac 2 -i -
 
-# 3. Ou pipeline en deux processus : RTL-SDR → ETI → PCM
-sudo ./target/release/dabctl iq2eti -S -C 6C -G 20 \
-  | ./target/release/dabctl eti2pcm -F -s 0xF2F8 -p \
+# 3. Avec gain manuel (20%)
+sudo ./target/release/dabctl -C 6C -s 0xF2F8 -G 20 \
   | ffplay -f s16le -ar 48000 -ac 2 -i -
-
-# 4. Ou avec le script helper :
-./dabctl.sh -S -C 11C -G 80 | dablin_gtk -L
 ```
 
 ---
@@ -44,8 +40,8 @@ sudo ./target/release/dabctl iq2eti -S -C 6C -G 20 \
 | `libusb-1.0-0-dev` | USB backend pour RTL-SDR (requis par `rtl-sdr-rs`) |
 | `pkg-config` | Découverte de libs système |
 | `build-essential` | Compilateur C (requis par libfaad2/libmpg123) |
-| `libfaad-dev` | Décodeur AAC pour DAB+ (`eti2pcm`) |
-| `libmpg123-dev` | Décodeur MP2 pour DAB classique (`eti2pcm`) |
+| `libfaad-dev` | Décodeur AAC pour DAB+ |
+| `libmpg123-dev` | Décodeur MP2 pour DAB classique |
 
 ```bash
 sudo apt install -y libusb-1.0-0-dev pkg-config build-essential libfaad-dev libmpg123-dev
@@ -65,13 +61,13 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 | **libfaad2** | 2.11+ | Décodeur AAC (DAB+) pour `eti2pcm` | [knik-o/faad2](https://github.com/knik-o/faad2) |
 | **libmpg123** | 1.32+ | Décodeur MP2 (DAB classique) pour `eti2pcm` | [mpg123.de](https://mpg123.de) |
 
-> **Note :** Le pilote RTL-SDR est géré par la crate Rust [`rtl-sdr-rs`](https://github.com/ccostes/rtl-sdr-rs), un port pur Rust de la bibliothèque Osmocom. Aucun CMake, `bindgen` ni `libclang` n'est requis. Seule `libusb-1.0` doit être installée sur le système. `libfaad2` et `libmpg123` sont nécessaires uniquement pour la sous-commande `eti2pcm`.
+> **Note :** Le pilote RTL-SDR est géré par la crate Rust [`rtl-sdr-rs`](https://github.com/ccostes/rtl-sdr-rs), un port pur Rust de la bibliothèque Osmocom. Aucun CMake, `bindgen` ni `libclang` n'est requis. Seule `libusb-1.0` doit être installée sur le système.
 
 ### Crates Rust
 
 | Crate | Version | Rôle |
 |---|---|---|
-| `clap` | 4.4 | Parsing des arguments CLI (sous-commandes) |
+| `clap` | 4.4 | Parsing des arguments CLI |
 | `rustfft` | 6.4 | FFT pour démodulation OFDM |
 | `num-complex` | 0.4 | Types complexes (IQ) |
 | `rayon` | 1.10 | Parallélisation des sous-canaux |
@@ -79,12 +75,12 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 | `tracing-subscriber` | 0.3 | Formatage et filtrage des logs |
 | `anyhow` | 1.0 | Gestion d'erreurs |
 | `ctrlc` | 3.4 | Handler Ctrl-C |
-| `libc` | 0.2 | Écriture JSON sur fd 3 (`eti2pcm`) |
-| `serde` | 1.0 | Sérialisation (`eti2pcm`) |
-| `serde_json` | 1.0 | Sortie JSON métadonnées DAB (`eti2pcm`) |
-| `base64` | 0.22 | Encodage base64 des images slideshow (`eti2pcm`) |
+| `libc` | 0.2 | Écriture JSON sur fd 3 |
+| `serde` | 1.0 | Sérialisation |
+| `serde_json` | 1.0 | Sortie JSON métadonnées DAB |
+| `base64` | 0.22 | Encodage base64 des images slideshow |
 | `rtl-sdr-rs` | 0.3 | Pilote RTL-SDR pur Rust (via `rusb`) |
-| `encoding_rs` | 0.8 | Décodage EBU Latin/UTF-8 pour DLS (`eti2pcm`) |
+| `encoding_rs` | 0.8 | Décodage EBU Latin/UTF-8 pour DLS |
 
 ### Matériel
 
@@ -142,31 +138,28 @@ Les tests sont organisés en modules `#[cfg(test)]` inline, mirrorant la structu
 
 ```
 src/
-  dab_constants.rs          → tests CRC, bit extraction, constantes
-  support/
-    dab_params.rs           → tests modes DAB I/II/III/IV
-    band_handler.rs         → tests fréquences canaux
-    ringbuffer.rs           → tests buffer thread-safe
-  ofdm/
-    freq_interleaver.rs     → tests permutation carriers
-    phase_table.rs          → tests table de phase
-  eti_handling/
-    viterbi_handler.rs      → tests décodeur Viterbi
-    fic_handler.rs          → tests traitement FIC
-    cif_interleaver.rs      → tests entrelacement CIF
-    protection.rs           → tests EEP/UEP
-    prot_tables.rs          → tests tables de poinçonnage
-  eti2pcm/
-    crc.rs                  → tests CRC-16-CCITT, Fire Code
-    eti_reader.rs           → tests lecture ETI (sync FSYNC)
-    eti_frame.rs            → tests parsing trame ETI
-    fic_decoder.rs          → tests FIG 0/0, 0/1, 0/2, 1/0, 1/1
-    rs_decoder.rs           → tests Reed-Solomon GF(2^8)
-    superframe.rs           → tests superframe DAB+
-    pad_decoder.rs          → tests PAD / DLS / MOT slideshow
-    pad_output.rs           → tests JSON fd 3 + slideshow
-    mot_decoder.rs          → tests X-PAD MOT DataGroup decoder
-    mot_manager.rs          → tests MOT object reassembly
+  pipeline/
+    dab_constants.rs          → tests CRC, bit extraction, constantes
+    dab_params.rs             → tests modes DAB I/II/III/IV
+    band_handler.rs           → tests fréquences canaux
+    ringbuffer.rs             → tests buffer thread-safe
+    ofdm/
+      freq_interleaver.rs     → tests permutation carriers
+      phase_table.rs          → tests table de phase
+    viterbi_handler.rs        → tests décodeur Viterbi
+    fic_handler.rs            → tests traitement FIC
+    cif_interleaver.rs        → tests entrelacement CIF
+    protection.rs             → tests EEP/UEP
+    prot_tables.rs            → tests tables de poinçonnage
+  audio/
+    crc.rs                    → tests CRC-16-CCITT, Fire Code
+    fic_decoder.rs            → tests FIG 0/0, 0/1, 0/2, 1/0, 1/1
+    rs_decoder.rs             → tests Reed-Solomon GF(2^8)
+    superframe.rs             → tests superframe DAB+
+    pad_decoder.rs            → tests PAD / DLS / MOT slideshow
+    pad_output.rs             → tests JSON fd 3 + slideshow
+    mot_decoder.rs            → tests X-PAD MOT DataGroup decoder
+    mot_manager.rs            → tests MOT object reassembly
 ```
 
 ---
@@ -244,92 +237,32 @@ tar -czf dabctl-${VERSION}-aarch64-linux.tar.gz \
 
 ## ⚙️ Options CLI
 
-Le binaire expose trois sous-commandes :
-
 ```
-dabctl <COMMAND>
-  iq2pcm     Reception DAB directe RTL-SDR → PCM (sans ETI intermédiaire)
-  iq2eti     Générer un flux ETI depuis RTL-SDR (IQ → ETI)
-  eti2pcm    Décoder un flux ETI en audio PCM (comme dablin)
-```
-
-### `iq2pcm` — RTL-SDR → PCM (direct)
-
-Combine `iq2eti` et `eti2pcm` en un seul processus, sans sérialisation ETI.
-Conçu pour une latence réduite et une consommation mémoire inférieure.
-
-```
-dabctl iq2pcm [OPTIONS]
+dabctl [OPTIONS]
 ```
 
 | Option | Court | Description | Défaut |
 |---|---|---|---|
-| `--channel` | `-C` | Canal DAB (5A, 6C, 11C, 12C…) | `11C` |
-| `--gain` | `-G` | Gain en % (0–100) | `50` |
+| `--channel` | `-C` | Canal DAB (5A, 6C, 11C, 12C…) | **requis** |
+| `--sid` | `-s` | Service ID hex (ex: `0xF2F8`) | **requis** |
+| `--gain` | `-G` | Gain en % (0–100) | auto-gain |
 | `--ppm` | `-p` | Correction fréquence (PPM) | `0` |
-| `--autogain` | `-Q` | AGC automatique | off |
 | `--sync-time` | `-d` | Timeout sync temps (sec) | `5` |
 | `--detect-time` | `-D` | Timeout détection ensemble (sec) | `10` |
-| `--sid` | `-s` | Service ID hex (ex: `0xF2F8`) | — |
 | `--label` | `-l` | Sélection par nom de service | — |
-| `--first` | `-1` | Jouer le premier service trouvé | off |
 | `--disable-dyn-fic` | `-F` | Désactiver les messages FIC sur stderr | off |
 | `--slide-dir` | `-S` | Sauvegarder les images slideshow dans ce dossier | — |
 | `--slide-base64` | | Sortir les slides en base64 JSON sur fd 3 | off |
 | `--silent` | | Mode silencieux (pas de log stderr) | off |
 | `--device-index` | | Index dongle RTL-SDR | `0` |
 
-**Sortie audio :** identique à `eti2pcm` — PCM signé 16-bit little-endian, stéréo, 48 kHz.
+**Sortie audio :** PCM signé 16-bit little-endian, stéréo, 48 kHz sur stdout.
 
-**Métadonnées JSON (fd 3) :** même format que `eti2pcm`.
-
-### `iq2eti` — RTL-SDR → ETI
-
-```
-dabctl iq2eti [OPTIONS]
-```
-
-| Option | Court | Description | Défaut |
-|---|---|---|---|
-| `--channel` | `-C` | Canal DAB (5A, 6C, 11C, 12C…) | `11C` |
-| `--gain` | `-G` | Gain en % (0–100) | `50` |
-| `--ppm` | `-p` | Correction fréquence (PPM) | `0` |
-| `--autogain` | `-Q` | AGC automatique | off |
-| `--sync-time` | `-d` | Timeout sync temps (sec) | `5` |
-| `--detect-time` | `-D` | Timeout détection ensemble (sec) | `10` |
-| `--output` | `-O` | Fichier de sortie (`-` = stdout) | stdout |
-| `--record-time` | `-t` | Durée enregistrement sec (-1 = ∞) | `-1` |
-| `--silent` | `-S` | Mode silencieux (pas de log stderr) | off |
-| `--device-index` | | Index dongle RTL-SDR | `0` |
-
-### `eti2pcm` — ETI → PCM audio
-
-```
-dabctl eti2pcm [OPTIONS] [FILE]
-```
-
-| Option | Court | Description | Défaut |
-|---|---|---|---|
-| `--sid` | `-s` | Service ID hex (ex: `0xF2F8`) | — |
-| `--label` | `-l` | Sélection par nom de service | — |
-| `--first` | `-1` | Jouer le premier service trouvé | off |
-| `--pcm` | `-p` | Sortie PCM 16-bit sur stdout | off |
-| `--disable-dyn-fic` | `-F` | Désactiver les messages FIC sur stderr | off |
-| `--slide-dir` | `-S` | Sauvegarder les images slideshow dans ce dossier | — |
-| `--slide-base64` | | Sortir les slides en base64 JSON sur fd 3 | off |
-| `[FILE]` | | Fichier ETI (défaut : stdin) | stdin |
-
-**Sortie audio :** PCM signé 16-bit little-endian, stéréo, 48 kHz (ou 32 kHz pour certains services DAB+).
-
-**Métadonnées JSON (fd 3) :** Si le file descriptor 3 est ouvert, `eti2pcm` y écrit les métadonnées DAB au format JSON, une ligne par événement :
+**Métadonnées JSON (fd 3 ou `-m`) :** une ligne par événement :
 - `{"ensemble":{"eid":"0x...","label":"..."}}` — informations ensemble
 - `{"service":{"sid":"0x...","label":"..."}}` — service sélectionné
 - `{"dl":"..."}` — Dynamic Label (texte en cours de diffusion)
 - `{"slide":{"contentName":"...","contentType":"image/jpeg","data":"base64..."}}` — slideshow (avec `--slide-base64`)
-
-**Slideshow :** Les images MOT (JPEG/PNG) diffusées via X-PAD peuvent être :
-- Sauvegardées sur disque avec `-S /chemin/dossier`
-- Envoyées en base64 JSON sur fd 3 avec `--slide-base64`
 
 ### Canaux bande III
 
@@ -339,138 +272,50 @@ dabctl eti2pcm [OPTIONS] [FILE]
 
 ## 💡 Exemples
 
-### Direct RTL-SDR → PCM (iq2pcm)
+### Écouter en direct
 
 ```bash
-# Écouter NRJ (SID 0xF2F8) sur le canal 6C — un seul processus, sans ETI
-sudo ./target/release/dabctl iq2pcm -C 6C -G 20 -s 0xF2F8 \
+# Écouter NRJ (SID 0xF2F8) sur le canal 6C (auto-gain)
+sudo ./target/release/dabctl -C 6C -s 0xF2F8 \
   | ffplay -f s16le -ar 48000 -ac 2 -nodisp -i -
 
-# Avec correction PPM et AGC
-sudo ./target/release/dabctl iq2pcm -C 6C -p 2 -Q -s 0xF2F8 \
+# Avec gain manuel (20%) et correction PPM
+sudo ./target/release/dabctl -C 6C -s 0xF2F8 -G 20 -p 2 \
   | ffplay -f s16le -ar 48000 -ac 2 -nodisp -i -
 
-# Jouer le premier service trouvé
-sudo ./target/release/dabctl iq2pcm -C 11C -G 50 -1 \
+# Avec aplay au lieu de ffplay
+sudo ./target/release/dabctl -C 11C -s 0xF2F8 -G 50 \
   | aplay -f S16_LE -r 48000 -c 2
+```
 
-# Avec métadonnées JSON et slideshow
-sudo ./target/release/dabctl iq2pcm -C 6C -G 20 -s 0xF2F8 \
+### Avec métadonnées JSON et slideshow
+
+```bash
+# Métadonnées JSON sur fd 3
+sudo ./target/release/dabctl -C 6C -s 0xF2F8 \
   --slide-base64 3>pad_metadata.json \
   | ffplay -f s16le -ar 48000 -ac 2 -nodisp -i -
 
-# Convertir en WAV
-sudo ./target/release/dabctl iq2pcm -C 6C -G 20 -s 0xF2F8 \
+# Avec slides sur disque + JSON sur fd 3
+sudo ./target/release/dabctl -C 6C -s 0xF2F8 \
+  --slide-dir /tmp/slides --slide-base64 3>pad_metadata.json \
+  | ffplay -f s16le -ar 48000 -ac 2 -nodisp -i -
+```
+
+### Convertir en WAV
+
+```bash
+sudo ./target/release/dabctl -C 6C -s 0xF2F8 -G 20 \
   | sox -t raw -r 48000 -b 16 -c 2 -e signed-integer -L - output.wav
 ```
 
-### Pipeline complète : RTL-SDR → PCM → lecteur audio
+### Capture automatisée
 
 ```bash
-# Écouter NRJ (SID 0xF2F8) sur le canal 6C — pipeline deux processus
-sudo ./target/release/dabctl iq2eti -S -C 6C -G 20 \
-  | ./target/release/dabctl eti2pcm -F -s 0xF2F8 -p \
-  | ffplay -f s16le -ar 48000 -ac 2 -nodisp -i -
+# Script prêt à l'emploi
+./live-capture-iq2pcm.sh 6C 0xF2F8 20
+# → audio (output.wav) + métadonnées (pad_metadata.json) + slides (slides/)
 ```
-
-### Pipeline avec métadonnées JSON
-
-```bash
-# fd 3 redirigé vers un fichier pour capturer DLS, ensemble, service
-sudo ./target/release/dabctl iq2eti -S -C 6C -G 20 \
-  | ./target/release/dabctl eti2pcm -F -s 0xF2F8 -p 3>metadata.json \
-  | ffplay -f s16le -ar 48000 -ac 2 -nodisp -i -
-```
-
-### Décoder un fichier ETI existant
-
-```bash
-# Décoder un fichier ETI capturé en PCM
-./target/release/dabctl eti2pcm -s 0xF2F8 -p capture.eti > output.raw
-ffplay -f s16le -ar 48000 -ac 2 output.raw
-
-# Ou par nom de service
-./target/release/dabctl eti2pcm -l "NRJ" -p capture.eti > output.raw
-```
-
-### Jouer le premier service trouvé
-
-```bash
-./target/release/dabctl eti2pcm -1 -p < capture.eti | aplay -f S16_LE -r 48000 -c 2
-```
-
-### Recevoir et sauvegarder un fichier ETI
-
-```bash
-sudo ./target/release/dabctl iq2eti -C 6C -G 20 -O "6C_$(date +%F_%H%M).eti"
-```
-
-### Pipeline vers dablin (compatibilité)
-
-```bash
-sudo ./target/release/dabctl iq2eti -S -C 6C -G 20 | dablin_gtk -L
-```
-
-### dablin CLI avec sélection de service
-
-```bash
-sudo ./target/release/dabctl iq2eti -S -C 6C -G 20 | dablin -F -s 0xF2F8 -p
-```
-
-### Enregistrement limité à 60 secondes
-
-```bash
-sudo ./target/release/dabctl iq2eti -C 6C -G 20 -t 60 -O capture.eti
-```
-
-### Convertir en WAV (via eti2pcm + ffmpeg)
-
-```bash
-sudo ./target/release/dabctl iq2eti -S -C 6C -G 20 -t 15 \
-  | ./target/release/dabctl eti2pcm -s 0xF2F8 -p \
-  | ffmpeg -f s16le -ar 48000 -ac 2 -i - output.wav
-```
-
-### Sauvegarder les images slideshow
-
-```bash
-sudo ./target/release/dabctl iq2eti -S -C 6C -G 20 \
-  | ./target/release/dabctl eti2pcm -s 0xF2F8 -p -S /tmp/slides \
-  | ffplay -f s16le -ar 48000 -ac 2 -nodisp -i -
-# Les images JPEG/PNG reçues sont sauvegardées dans /tmp/slides/
-```
-
-### Slideshow en base64 JSON (fd 3)
-
-```bash
-sudo ./target/release/dabctl iq2eti -S -C 6C -G 20 \
-  | ./target/release/dabctl eti2pcm -s 0xF2F8 -p --slide-base64 3>pad.json \
-  | ffplay -f s16le -ar 48000 -ac 2 -nodisp -i -
-# Le fichier pad.json contient les infos DAB + les slides en base64
-```
-
-### Capture automatisée avec live-capture.sh
-
-Un script prêt à l'emploi pour capturer, décoder et sauvegarder les métadonnées DAB, audio et images slideshow :
-
-```bash
-bash live-capture.sh
-```
-
-Ce script :
-- Compile le projet en release et lance les tests unitaires
-- Lance la capture live IQ → ETI → PCM sur 6C (modifiable dans le script)
-- Décode le flux, sauvegarde l'audio (output.wav), les métadonnées (pad_metadata.json) et les images slideshow (slides/)
-- Nettoie les anciens fichiers à chaque exécution
-
-Les options --slide-dir et --slide-base64 sont activées pour obtenir à la fois les images sur disque et en JSON base64.
-
-Résultats attendus :
-- `output.wav` : audio décodé
-- `pad_metadata.json` : métadonnées DAB + images slideshow (base64)
-- `slides/` : images JPEG/PNG extraites
-
-Adaptez le script selon vos besoins (canal, durée, SID, etc.).
 
 ---
 
@@ -516,50 +361,22 @@ Le DAB en France utilise la bande III. Les multiplexes principaux :
 
 ```bash
 # Tester un canal (ex: 6C à Paris)
-./dabctl.sh iq2eti -C 6C -G 20 -t 5 -O /dev/null
+sudo ./target/release/dabctl -C 6C -s 0xF2F8 --silent 2>/dev/null | head -c 0
 ```
 
-Si vous voyez `ensemble ... detected` et des `program ... is in the list`, le canal fonctionne.
+Si vous voyez `ensemble ... detected` et des `program ... is in the list` dans les logs (sans `--silent`), le canal fonctionne.
 
-### Étape 4 — Capturer un fichier ETI
-
-```bash
-# Capturer 60 secondes du canal 6C
-./dabctl.sh iq2eti -C 6C -G 20 -t 60 -O capture_6C.eti
-```
-
-Le fichier ETI peut être relu plus tard avec `eti2pcm` sans le dongle.
-
-### Étape 5 — Écouter en direct (pipeline intégrée)
+### Étape 4 — Écouter en direct
 
 ```bash
 # Écouter un programme spécifique (ex: NRJ, SID 0xF2F8)
-sudo ./target/release/dabctl iq2eti -S -C 6C -G 20 \
-  | ./target/release/dabctl eti2pcm -F -s 0xF2F8 -p \
+sudo ./target/release/dabctl -C 6C -s 0xF2F8 \
   | ffplay -f s16le -ar 48000 -ac 2 -nodisp -i -
-
-# Ou avec dablin (si installé)
-sudo ./target/release/dabctl iq2eti -S -C 6C -G 20 | dablin -s 0xF2F8
-
-# Ou avec l'interface graphique dablin
-sudo ./target/release/dabctl iq2eti -S -C 6C -G 20 | dablin_gtk
 ```
 
-> **Astuce** : lancez d'abord sans `-S` pour voir les SID des programmes disponibles dans stderr, puis relancez avec `-S` et `-s 0xSID`.
+> **Astuce** : lancez d'abord sans `--silent` pour voir les SID des programmes disponibles dans stderr.
 
-### Étape 6 — Relire une capture
-
-```bash
-# Relire le fichier ETI capturé avec eti2pcm (intégré)
-./target/release/dabctl eti2pcm -s 0xF2F8 -p capture_6C.eti \
-  | ffplay -f s16le -ar 48000 -ac 2 -nodisp -i -
-
-# Ou avec dablin (si installé)
-dablin -s 0xF2F8 < capture_6C.eti
-dablin_gtk < capture_6C.eti
-```
-
-### Étape 7 — Raspberry Pi
+### Étape 5 — Raspberry Pi
 
 ```bash
 # Cross-compiler pour Pi 4 (64-bit)
@@ -570,8 +387,7 @@ scp target/aarch64-unknown-linux-gnu/release/dabctl pi@raspberrypi:~
 
 # Sur le Pi — écouter en direct
 ssh pi@raspberrypi
-./dabctl iq2eti -S -C 6C -G 30 \
-  | ./dabctl eti2pcm -F -s 0xF2F8 -p \
+./dabctl -C 6C -s 0xF2F8 -G 30 \
   | aplay -f S16_LE -r 48000 -c 2
 ```
 
@@ -580,40 +396,34 @@ ssh pi@raspberrypi
 ## 🏗️ Architecture
 
 ```
-build.rs              Directives de linkage faad/mpg123 ; librtlsdr vendored
+build.rs              Directives de linkage faad/mpg123
 src/
-  main.rs             CLI (clap sous-commandes) → routage iq2pcm / iq2eti / eti2pcm
+  main.rs             CLI (clap) → pipeline RTL-SDR → PCM
   lib.rs              Déclarations modules
-  dab_frame.rs        Type DabFrame (transport in-process : FIC + sous-canaux)
-  iq2pcm_cmd.rs       Sous-commande iq2pcm (RTL-SDR → PCM direct)
-  iq2eti.rs           Sous-commande iq2eti (RTL-SDR → ETI)
-  eti2pcm_cmd.rs      Sous-commande eti2pcm (ETI → PCM)
-  dab_constants.rs    Constantes, CRC, bit utils
-  support/
-    dab_params.rs        Paramètres DAB Modes I–IV
-    band_handler.rs      Canal → fréquence
-    ringbuffer.rs        Buffer IQ thread-safe
-    subchannel_pool.rs   Pool de buffers réutilisables (zéro alloc/frame)
-  ofdm/
-    phase_table.rs       Table de phase Mode I
-    phase_reference.rs   Corrélation sync + CFO
-    freq_interleaver.rs  Permutation carriers
-    ofdm_processor.rs    Boucle OFDM principale
-  eti_handling/
-    prot_tables.rs       24 tables de poinçonnage
-    viterbi_handler.rs   Décodeur Viterbi {0155,0117,0123,0155}
-    fic_handler.rs       Dépoinçonnage/décodage FIC
-    fib_processor.rs     Parsing FIG0/0, FIG0/1, FIG1
-    protection.rs        Déconvolution EEP + UEP
-    cif_interleaver.rs   Entrelacement CIF 16 trames
-    eti_generator.rs     DabPipeline : OFDM blocs → DabFrame (canal mpsc)
-    eti_serializer.rs    EtiSerializer : DabFrame → 6144 octets ETI-NI (iq2eti seulement)
+  iq2pcm_cmd.rs       Pipeline principale : RTL-SDR → PCM
+  pipeline/
+    dab_constants.rs    Constantes, CRC, bit utils
+    dab_frame.rs        Type DabFrame (transport in-process : FIC + sous-canaux)
+    dab_params.rs       Paramètres DAB Modes I–IV
+    band_handler.rs     Canal → fréquence
+    ringbuffer.rs       Buffer IQ thread-safe
+    subchannel_pool.rs  Pool de buffers réutilisables (zéro alloc/frame)
+    eti_generator.rs    DabPipeline : OFDM blocs → DabFrame (canal mpsc)
+    fib_processor.rs    Parsing FIG0/0, FIG0/1, FIG1
+    fic_handler.rs      Dépoinçonnage/décodage FIC
+    viterbi_handler.rs  Décodeur Viterbi {0155,0117,0123,0155}
+    prot_tables.rs      24 tables de poinçonnage
+    protection.rs       Déconvolution EEP + UEP
+    cif_interleaver.rs  Entrelacement CIF 16 trames
+    ofdm/
+      phase_table.rs       Table de phase Mode I
+      phase_reference.rs   Corrélation sync + CFO
+      freq_interleaver.rs  Permutation carriers
+      ofdm_processor.rs    Boucle OFDM principale
   device/
     rtlsdr_handler.rs    RTL-SDR via rtl-sdr-rs
-  eti2pcm/
+  audio/
     crc.rs               CRC-16-CCITT + Fire Code
-    eti_reader.rs        Lecture trames ETI 6144 octets (sync FSYNC)
-    eti_frame.rs         Parsing en-tête ETI (ERR, FC, STC, EOH)
     fic_decoder.rs       Décodage FIC/FIG pour découverte services
     rs_decoder.rs        Reed-Solomon (120,110) GF(2^8) pur Rust
     superframe.rs        Superframe DAB+ (5 frames → RS → AU)
@@ -623,51 +433,28 @@ src/
     pad_output.rs        Sortie JSON métadonnées + slideshow sur fd 3
     mot_decoder.rs       X-PAD → MOT DataGroup (accumulation + CRC)
     mot_manager.rs       MOT DataGroup → objet MOT (header+body → image JPEG/PNG)
+    ebu_latin.rs         EBU Latin → UTF-8 conversion
 ```
 
-### Threads (iq2pcm)
+### Threads
 
 1. **OFDM** : `ofdm_processor.run()` lit IQ depuis le dongle, démodule, envoie des blocs à `DabPipeline`
 2. **DabPipeline** (thread interne) : reçoit les blocs OFDM via ring SPSC, effectue le FIC + CIF interleaving + déconvolution Viterbi des sous-canaux, émet un `DabFrame` par CIF via un canal `mpsc` à capacité bornée (4 frames ≈ 100 ms de back-pressure)
 3. **Audio/main** : consomme les `DabFrame` du canal, décode FIC, alimente `SuperframeFilter` → `AacDecoder`/`Mp2Decoder`, `PadDecoder` → sortie PCM stdout + JSON fd 3
 
-### Threads (iq2eti)
-
-1. **OFDM** : identique à `iq2pcm`
-2. **DabPipeline** (thread interne) : identique à `iq2pcm`, produit des `DabFrame`
-3. **EtiSerializer** (thread interne) : consomme les `DabFrame`, sérialise en trames ETI-NI 6144 octets (ETSI ETS 300 799), écrit sur stdout/fichier
-
-### Pipeline (eti2pcm)
+### Pipeline
 
 ```
-stdin/fichier ETI
-  → EtiReader (sync FSYNC, blocs 6144 octets)
-    → parse_eti_frame (en-tête, FIC, sous-canaux)
-      → FicDecoder (FIG 0/0, 0/1, 0/2, 1/0, 1/1 → découverte services)
-      → subchannel_data(subchid)
-        → SuperframeFilter (5 frames → RS(120,110) → AU)
-          → AacDecoder (libfaad2) ou Mp2Decoder (libmpg123)
+RTL-SDR (2.048 MHz IQ)
+  → RtlsdrHandler (USB → f32)
+    → OfdmProcessor (FFT, sync, phase)
+      → DabPipeline (FIC + CIF → DabFrame)
+        → FicDecoder (découverte services)
+        → SuperframeFilter (5 frames → RS → AU)
+          → AacDecoder (DAB+) ou Mp2Decoder (DAB)
             → PCM 16-bit stdout
-        → PadDecoder (F-PAD + X-PAD → DLS)
+        → PadDecoder (DLS + MOT)
           → PadOutput (JSON fd 3)
-```
-
-### Transport in-process DabFrame
-
-`DabFrame` est le type de transport interne entre `DabPipeline` et le consommateur audio (ou `EtiSerializer`). Il évite la sérialisation ETI-NI sur le chemin `iq2pcm` :
-
-```rust
-pub struct DabFrame {
-    pub fic_data: Box<[u8; 96]>,              // 3 FIBs packés, Mode I
-    pub cif_count_hi: u8,                      // compteur CIF (ETSI EN 300 401 §14.1)
-    pub cif_count_lo: u8,
-    pub subchannels: SmallVec<[SubchannelFrame; 8]>, // zéro alloc heap pour ≤8 sous-canaux
-}
-pub struct SubchannelFrame {
-    pub subchid: u8,
-    pub data: Arc<[u8]>,                       // zéro-copie entre threads
-    pub descriptor: SubchannelDescriptor,      // méta EtI STC (pour EtiSerializer)
-}
 ```
 
 ---
@@ -683,7 +470,7 @@ pub struct SubchannelFrame {
 ### Pas de sync / signal faible
 
 - Augmenter le gain : `-G 90`
-- Essayer autogain : `-Q`
+- Essayer auto-gain : ne pas passer `-G`
 - Vérifier l'antenne et sa polarisation
 
 ---

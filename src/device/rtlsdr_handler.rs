@@ -38,12 +38,8 @@ struct DeviceConfig {
     frequency: u32,
     ppm_offset: i32,
     autogain: bool,
-    /// Selected gain in tenths of dB; only used when `autogain` is false.
-    gain_value: i32,
-    /// Full ordered gain table (tenths of dB) used by the software AGC.
-    gains: Vec<i32>,
-    /// Index of the initially selected gain in `gains`.
-    gain_index: usize,
+    /// Gain as percentage (0..=100); only used when `autogain` is false.
+    gain_pct: i16,
 }
 
 pub struct RtlsdrHandler {
@@ -62,50 +58,13 @@ impl RtlsdrHandler {
         autogain: bool,
         device_index: u32,
     ) -> Result<Self, String> {
-        // Open briefly to validate the device and read the available gain list.
-        let mut sdr = RtlSdr::open(DeviceId::Index(device_index as usize))
-            .map_err(|e| format!("Opening RTL-SDR device {} failed: {}", device_index, e))?;
-
-        let gains = sdr
-            .get_tuner_gains()
-            .map_err(|e| format!("Reading tuner gains failed: {}", e))?;
-
-        let gains_str: Vec<String> = gains
-            .iter()
-            .map(|g| format!("{}.{}", g / 10, g % 10))
-            .collect();
-        info!(
-            "Supported gain values ({}): {}",
-            gains.len(),
-            gains_str.join(" ")
-        );
-
-        let (gain_value, gain_index) = if autogain {
-            info!("Auto gain enabled (hardware AGC)");
-            (0, 0)
-        } else {
-            let index = (gain.clamp(0, 100) as usize * (gains.len() - 1)) / 100;
-            let selected = gains[index];
-            info!(
-                "Manual gain set to {}.{} dB",
-                selected / 10,
-                selected.abs() % 10
-            );
-            (selected, index)
-        };
-
-        // Release USB before the worker thread re-opens the device.
-        let _ = sdr.close();
-
         Ok(RtlsdrHandler {
             config: DeviceConfig {
                 device_index: device_index as usize,
                 frequency,
                 ppm_offset,
                 autogain,
-                gain_value,
-                gains,
-                gain_index,
+                gain_pct: gain,
             },
             running: Arc::new(AtomicBool::new(false)),
             i_buffer: Arc::new(Mutex::new(VecDeque::with_capacity(4 * 1024 * 1024))),
@@ -128,20 +87,61 @@ impl RtlsdrHandler {
         let running = self.running.clone();
         let buffer = self.i_buffer.clone();
 
+        // Oneshot channel: worker reports init success/failure before entering
+        // the read loop.  This avoids opening the device twice.
+        let (init_tx, init_rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
+
         self.running.store(true, Ordering::SeqCst);
 
         self.worker_handle = Some(thread::spawn(move || {
             let mut sdr = match RtlSdr::open(DeviceId::Index(config.device_index)) {
                 Ok(d) => d,
                 Err(e) => {
-                    tracing::error!("Failed to open RTL-SDR in worker thread: {}", e);
+                    let msg = format!("Failed to open RTL-SDR device {}: {}", config.device_index, e);
+                    let _ = init_tx.send(Err(msg));
                     running.store(false, Ordering::SeqCst);
                     return;
                 }
             };
 
+            // Read gain table and select gain — all in a single device session.
+            let gains = match sdr.get_tuner_gains() {
+                Ok(g) => g,
+                Err(e) => {
+                    let msg = format!("Reading tuner gains failed: {}", e);
+                    let _ = init_tx.send(Err(msg));
+                    running.store(false, Ordering::SeqCst);
+                    return;
+                }
+            };
+
+            let gains_str: Vec<String> = gains
+                .iter()
+                .map(|g| format!("{}.{}", g / 10, g % 10))
+                .collect();
+            info!(
+                "Supported gain values ({}): {}",
+                gains.len(),
+                gains_str.join(" ")
+            );
+
+            let gain_value = if config.autogain {
+                info!("Auto gain enabled (hardware AGC)");
+                0i32
+            } else {
+                let index = (config.gain_pct.clamp(0, 100) as usize * (gains.len() - 1)) / 100;
+                let selected = gains[index];
+                info!(
+                    "Manual gain set to {}.{} dB",
+                    selected / 10,
+                    selected.abs() % 10
+                );
+                selected
+            };
+
             if let Err(e) = sdr.set_sample_rate(INPUT_RATE) {
-                tracing::error!("set_sample_rate failed: {}", e);
+                let msg = format!("set_sample_rate failed: {}", e);
+                let _ = init_tx.send(Err(msg));
                 running.store(false, Ordering::SeqCst);
                 return;
             }
@@ -161,14 +161,15 @@ impl RtlsdrHandler {
             let tuner_gain = if config.autogain {
                 TunerGain::Auto
             } else {
-                TunerGain::Manual(config.gain_value)
+                TunerGain::Manual(gain_value)
             };
             if let Err(e) = sdr.set_tuner_gain(tuner_gain) {
                 warn!("set_tuner_gain failed: {}", e);
             }
 
             if let Err(e) = sdr.reset_buffer() {
-                tracing::error!("reset_buffer failed: {}", e);
+                let msg = format!("reset_buffer failed: {}", e);
+                let _ = init_tx.send(Err(msg));
                 running.store(false, Ordering::SeqCst);
                 return;
             }
@@ -179,18 +180,8 @@ impl RtlsdrHandler {
                 sdr.get_sample_rate()
             );
 
-            // Software AGC: step down gain when ADC saturation is detected.
-            // Saturation = raw byte value == 0 or == 255.
-            // ETSI EN 300 401 does not mandate any AGC, but ADC saturation causes
-            // hard clipping that destroys the OFDM constellation.
-            let mut sat_bytes: u32 = 0;
-            let mut total_bytes: u32 = 0;
-            let mut current_gain_index = config.gain_index;
-            let mut gain_cooldown: u32 = 0;
-            // Evaluate saturation over ~10 reads (~40 ms) and cool down for ~25 reads (~1 s).
-            const SAT_WINDOW: u32 = (READLEN_DEFAULT * 10) as u32;
-            const SAT_THRESHOLD: f32 = 0.005; // 0.5 % saturation triggers a gain step-down
-            const GAIN_COOLDOWN_READS: u32 = 25;
+            // Signal successful initialization to the main thread.
+            let _ = init_tx.send(Ok(()));
 
             let mut raw = [0u8; READLEN_DEFAULT];
             loop {
@@ -199,39 +190,6 @@ impl RtlsdrHandler {
                 }
                 match sdr.read_sync(&mut raw) {
                     Ok(n) if n == READLEN_DEFAULT => {
-                        // Software AGC saturation check (manual gain mode only).
-                        if !config.autogain && config.gains.len() > 1 {
-                            for &b in &raw[..n] {
-                                if b == 0 || b == 255 {
-                                    sat_bytes += 1;
-                                }
-                            }
-                            total_bytes += n as u32;
-                            gain_cooldown = gain_cooldown.saturating_sub(1);
-
-                            if total_bytes >= SAT_WINDOW {
-                                if gain_cooldown == 0 {
-                                    let ratio = sat_bytes as f32 / total_bytes as f32;
-                                    if ratio > SAT_THRESHOLD && current_gain_index > 0 {
-                                        current_gain_index -= 1;
-                                        let new_gain = config.gains[current_gain_index];
-                                        match sdr.set_tuner_gain(TunerGain::Manual(new_gain)) {
-                                            Ok(()) => info!(
-                                                "SAGC: saturation {:.1}% → gain reduced to {}.{} dB",
-                                                ratio * 100.0,
-                                                new_gain / 10,
-                                                new_gain.abs() % 10
-                                            ),
-                                            Err(e) => warn!("SAGC: set_tuner_gain failed: {}", e),
-                                        }
-                                        gain_cooldown = GAIN_COOLDOWN_READS;
-                                    }
-                                }
-                                sat_bytes = 0;
-                                total_bytes = 0;
-                            }
-                        }
-
                         if let Ok(mut guard) = buffer.lock() {
                             for b in &raw[..n] {
                                 guard.push_back(*b);
@@ -252,7 +210,20 @@ impl RtlsdrHandler {
             // sdr dropped here; USB cleanup handled by rusb::DeviceHandle::Drop
         }));
 
-        true
+        // Wait for the worker to finish device initialization before returning.
+        match init_rx.recv() {
+            Ok(Ok(())) => true,
+            Ok(Err(msg)) => {
+                tracing::error!("{}", msg);
+                self.running.store(false, Ordering::SeqCst);
+                false
+            }
+            Err(_) => {
+                tracing::error!("Worker thread exited before completing init");
+                self.running.store(false, Ordering::SeqCst);
+                false
+            }
+        }
     }
 
     /// Signal the USB worker thread to stop (non-blocking).  The caller can then

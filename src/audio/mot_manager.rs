@@ -4,7 +4,7 @@
 /// and emits completed image files (JPEG/PNG).
 ///
 /// Reference: ETSI EN 301 234 (MOT), ETSI TS 101 756 (content types).
-use crate::eti2pcm::crc::crc16_ccitt;
+use crate::audio::crc::crc16_ccitt;
 use std::collections::BTreeMap;
 
 // --- Content types ---
@@ -43,7 +43,8 @@ impl MotFile {
             content_name_charset: String::new(),
             category_title: String::new(),
             click_through_url: String::new(),
-            trigger_time_now: false,
+            // ETSI EN 301 234 §6.3.4.1: absence of TriggerTime means immediate display
+            trigger_time_now: true,
         }
     }
 
@@ -303,15 +304,28 @@ impl MotObject {
         }
 
         if !self.header_received {
+            tracing::debug!("MOT object: header not yet received");
             return false;
         }
         if !self.body.is_finished() || self.body.size() != self.result_file.body_size {
+            tracing::debug!(
+                "MOT object: body incomplete ({}/{} bytes, finished={})",
+                self.body.size(),
+                self.result_file.body_size,
+                self.body.is_finished()
+            );
             return false;
         }
         if !self.result_file.trigger_time_now {
+            tracing::debug!("MOT object: trigger_time not now, skipping");
             return false;
         }
 
+        tracing::debug!(
+            "MOT object complete: {} ({} bytes)",
+            self.result_file.content_name,
+            self.result_file.body_size
+        );
         self.result_file.data = self.body.get_data();
         self.shown = true;
         true
@@ -331,7 +345,7 @@ impl MotObject {
 pub struct MotManager {
     object: MotObject,
     current_transport_id: i32,
-    crc: crate::eti2pcm::crc::CrcCalculator,
+    crc: crate::audio::crc::CrcCalculator,
 }
 
 impl Default for MotManager {
@@ -361,24 +375,36 @@ impl MotManager {
         // Parse Data Group header
         let dg_type = match self.parse_dg_header(dg, &mut offset) {
             Some(t) => t,
-            None => return (None, -1.0),
+            None => {
+                tracing::debug!("MOT DG header parse failed (dg_len={})", dg.len());
+                return (None, -1.0);
+            }
         };
 
         // Parse session header
         let (last_seg, seg_number, transport_id) = match self.parse_session_header(dg, &mut offset)
         {
             Some(v) => v,
-            None => return (None, -1.0),
+            None => {
+                tracing::debug!("MOT session header parse failed");
+                return (None, -1.0);
+            }
         };
 
         // Parse segmentation header
         let seg_size = match self.parse_segmentation_header(dg, &mut offset) {
             Some(s) => s,
-            None => return (None, -1.0),
+            None => {
+                tracing::debug!("MOT segmentation header parse failed (dg_type={}, seg_number={}, tid={})", dg_type, seg_number, transport_id);
+                return (None, -1.0);
+            }
         };
+
+        tracing::debug!("MOT segment: type={} seg={} last={} tid={} size={}", dg_type, seg_number, last_seg, transport_id, seg_size);
 
         // Reset object on transport ID change
         if self.current_transport_id != transport_id as i32 {
+            tracing::debug!("MOT new transport_id={} (was {})", transport_id, self.current_transport_id);
             self.current_transport_id = transport_id as i32;
             self.object = MotObject::new();
         }

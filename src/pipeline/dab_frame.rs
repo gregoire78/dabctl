@@ -83,7 +83,7 @@ pub struct SubchannelFrame {
     /// Sub-channel ID 0..63.  ETSI EN 300 401 §7.
     pub subchid: u8,
 
-    /// Audio payload bytes, ready for `SuperframeFilter` or `Mp2Decoder`.
+    /// Audio payload bytes, ready for `SuperframeFilter` (DAB+).
     pub data: Arc<[u8]>,
 
     /// ETI-level descriptor: needed only by `EtiSerializer` to reconstruct STC.

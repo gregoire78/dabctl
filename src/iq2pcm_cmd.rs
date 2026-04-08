@@ -10,25 +10,25 @@
 // Back-pressure: the bounded channel (capacity 4 ≈ 100 ms) ensures the OFDM thread
 // never allocates an unbounded queue of unprocessed frames when the audio decoder is slow.
 
-use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicI16, Ordering};
+use std::io::{IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, AtomicI16, AtomicI32, Ordering};
 use std::sync::Arc;
 use std::thread;
 
 use clap::Args;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use dabctl::dab_constants::BAND_III;
-use dabctl::dab_frame::DabFrame;
+use dabctl::audio::fic_decoder::FicDecoder;
+use dabctl::audio::pad_decoder::PadDecoder;
+use dabctl::audio::pad_output::PadOutput;
+use dabctl::audio::superframe::SuperframeFilter;
 use dabctl::device::rtlsdr_handler::RtlsdrHandler;
-use dabctl::eti2pcm::fic_decoder::FicDecoder;
-use dabctl::eti2pcm::pad_decoder::PadDecoder;
-use dabctl::eti2pcm::pad_output::PadOutput;
-use dabctl::eti2pcm::superframe::SuperframeFilter;
-use dabctl::eti_handling::eti_generator::DabPipeline;
-use dabctl::ofdm::ofdm_processor::OfdmProcessor;
-use dabctl::support::band_handler;
+use dabctl::pipeline::band_handler;
+use dabctl::pipeline::dab_constants::BAND_III;
+use dabctl::pipeline::dab_frame::DabFrame;
+use dabctl::pipeline::eti_generator::DabPipeline;
+use dabctl::pipeline::ofdm::ofdm_processor::OfdmProcessor;
 
 /// Bounded channel capacity in frames (~24 ms per frame → ~100 ms back-pressure).
 const CHANNEL_CAPACITY: usize = 4;
@@ -36,20 +36,16 @@ const CHANNEL_CAPACITY: usize = 4;
 #[derive(Args, Debug)]
 pub struct Iq2pcmArgs {
     /// DAB channel (e.g., 5A, 6C, 11C, 12C)
-    #[arg(short = 'C', long = "channel", default_value = "11C")]
+    #[arg(short = 'C', long = "channel")]
     channel: String,
 
-    /// Gain as percentage (0..100)
-    #[arg(short = 'G', long = "gain", default_value_t = 50)]
-    gain: i16,
+    /// Gain as percentage (0..100). If omitted, auto-gain is used.
+    #[arg(short = 'G', long = "gain")]
+    gain: Option<i16>,
 
     /// PPM frequency correction
     #[arg(short = 'p', long = "ppm", default_value_t = 0)]
     ppm: i32,
-
-    /// Auto-gain control
-    #[arg(short = 'Q', long = "autogain")]
-    autogain: bool,
 
     /// Time sync timeout in seconds
     #[arg(short = 'd', long = "sync-time", default_value_t = 5)]
@@ -61,15 +57,11 @@ pub struct Iq2pcmArgs {
 
     /// Service ID to play (hex, e.g., 0xF2F8)
     #[arg(short = 's', long = "sid")]
-    sid: Option<String>,
+    sid: String,
 
     /// Service label to play (matched by name)
     #[arg(short = 'l', long = "label")]
     label: Option<String>,
-
-    /// Play first service found
-    #[arg(short = '1', long = "first")]
-    first: bool,
 
     /// Disable dynamic FIC messages on stderr
     #[arg(short = 'F', long = "disable-dyn-fic")]
@@ -87,11 +79,6 @@ pub struct Iq2pcmArgs {
     #[arg(long = "silent")]
     silent: bool,
 
-    /// Write metadata JSON to this file instead of fd 3.
-    /// Use this when running under sudo (which closes fd 3).
-    #[arg(short = 'm', long = "metadata-out")]
-    metadata_out: Option<String>,
-
     /// RTL-SDR device index
     #[arg(long = "device-index", default_value_t = 0)]
     device_index: u32,
@@ -107,6 +94,7 @@ pub fn run(args: Iq2pcmArgs) {
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
+        .with_ansi(std::io::stderr().is_terminal())
         .with_writer(std::io::stderr)
         .init();
 
@@ -134,19 +122,17 @@ pub fn run(args: Iq2pcmArgs) {
     }
     info!("tunedFrequency = {}", freq as u32);
 
-    let mut input_device = match RtlsdrHandler::new(
-        freq as u32,
-        args.ppm,
-        args.gain,
-        args.autogain,
-        args.device_index,
-    ) {
-        Ok(dev) => dev,
-        Err(e) => {
-            error!("Installing device failed: {}", e);
-            std::process::exit(3);
-        }
-    };
+    let autogain = args.gain.is_none();
+    let gain = args.gain.unwrap_or(0);
+
+    let mut input_device =
+        match RtlsdrHandler::new(freq as u32, args.ppm, gain, autogain, args.device_index) {
+            Ok(dev) => dev,
+            Err(e) => {
+                error!("Installing device failed: {}", e);
+                std::process::exit(3);
+            }
+        };
 
     // ── Build the in-memory DabFrame channel ──────────────────────────────────
     // Capacity 4: ~100 ms of back-pressure before the OFDM thread blocks.
@@ -162,7 +148,7 @@ pub fn run(args: Iq2pcmArgs) {
         }));
     let program_cb: Option<Box<dyn Fn(&str, i32) + Send>> =
         Some(Box::new(move |name: &str, sid: i32| {
-            info!("program\t {}\t 0x{:X} is in the list", name.trim(), sid);
+            info!("program {} (0x{:X}) is in the list", name.trim(), sid);
         }));
     let fs = fic_success.clone();
     let fic_quality_cb: Option<Box<dyn Fn(i16) + Send>> = Some(Box::new(move |quality: i16| {
@@ -236,36 +222,55 @@ pub fn run(args: Iq2pcmArgs) {
     run.store(true, Ordering::SeqCst);
 
     // ── Thread 2 (main): audio decode loop ───────────────────────────────────
-    let target_sid = args.sid.as_ref().map(|s| parse_sid(s));
+    let target_sid = parse_sid(&args.sid);
     let slide_dir = args.slide_dir.as_ref().map(std::path::PathBuf::from);
-    let metadata_out = args.metadata_out.as_deref().map(std::path::Path::new);
 
     let mut fic_decoder = FicDecoder::new();
     let mut pad_decoder = PadDecoder::new();
     pad_decoder.set_mot_app_type(12);
-    let mut pad_output = PadOutput::new(slide_dir, args.slide_base64, metadata_out);
+    let mut pad_output = PadOutput::new(slide_dir, args.slide_base64);
     let mut superframe = SuperframeFilter::new();
-    let mut mp2_decoder: Option<dabctl::eti2pcm::mp2_decoder::Mp2Decoder> = None;
-    let mut aac_decoder: Option<dabctl::eti2pcm::aac_decoder::AacDecoder> = None;
+    let mut aac_decoder: Option<dabctl::audio::aac_decoder::AacDecoder> = None;
 
     let mut current_subchid: Option<u8> = None;
-    let mut is_dab_plus: Option<bool> = None;
     let mut ensemble_announced = false;
     let mut service_announced = false;
 
     let stdout = std::io::stdout();
     let mut stdout_lock = stdout.lock();
 
+    // Audio pipeline diagnostic counters
+    let frames_in = Arc::new(AtomicI32::new(0));
+    let frames_no_subch = Arc::new(AtomicI32::new(0));
+    let sync_ok = Arc::new(AtomicI32::new(0));
+    let sync_fail = Arc::new(AtomicI32::new(0));
+    let aus_decoded = Arc::new(AtomicI32::new(0));
+
     // Monitor thread to log status and respect record_time
     let status_run = run.clone();
     let sn2 = signal_noise.clone();
     let fs2 = fic_success.clone();
     let running2 = running.clone();
+    let c_fi = frames_in.clone();
+    let c_fns = frames_no_subch.clone();
+    let c_sok = sync_ok.clone();
+    let c_sfail = sync_fail.clone();
+    let c_au = aus_decoded.clone();
     thread::spawn(move || {
         while status_run.load(Ordering::SeqCst) {
-            info!(
+            let fi = c_fi.swap(0, Ordering::SeqCst);
+            let fns = c_fns.swap(0, Ordering::SeqCst);
+            let sok = c_sok.swap(0, Ordering::SeqCst);
+            let sfail = c_sfail.swap(0, Ordering::SeqCst);
+            let au = c_au.swap(0, Ordering::SeqCst);
+            debug!(
                 snr = sn2.load(Ordering::SeqCst),
                 fib_quality = fs2.load(Ordering::SeqCst),
+                frames = fi,
+                no_subch = fns,
+                sync_ok = sok,
+                sync_fail = sfail,
+                aus = au,
                 "status"
             );
             thread::sleep(std::time::Duration::from_secs(1));
@@ -305,63 +310,27 @@ pub fn run(args: Iq2pcmArgs) {
 
         // Resolve which sub-channel to play
         if current_subchid.is_none() {
-            let audio_service = if let Some(sid) = target_sid {
-                fic_decoder.find_audio_service(sid)
-            } else if let Some(ref label) = args.label {
-                fic_decoder
-                    .find_service_by_label(label)
-                    .and_then(|svc| fic_decoder.find_audio_service(svc.sid))
-            } else if args.first {
-                fic_decoder
-                    .services
-                    .values()
-                    .next()
-                    .and_then(|svc| fic_decoder.find_audio_service(svc.sid))
-            } else {
-                None
-            };
+            let audio_service = fic_decoder.find_audio_service(target_sid);
 
             if let Some(audio) = audio_service {
-                current_subchid = Some(audio.subchid);
-                is_dab_plus = Some(audio.dab_plus);
-                info!(
-                    "Playing sub-channel {} ({})",
-                    audio.subchid,
-                    if audio.dab_plus { "DAB+" } else { "DAB" }
-                );
-
                 if !audio.dab_plus {
-                    match dabctl::eti2pcm::mp2_decoder::Mp2Decoder::new() {
-                        Ok(dec) => mp2_decoder = Some(dec),
-                        Err(e) => {
-                            error!("Failed to create MP2 decoder: {}", e);
-                            std::process::exit(2);
-                        }
-                    }
+                    warn!(
+                        "Service 0x{:04X} is DAB (MP2), only DAB+ is supported — skipping",
+                        target_sid
+                    );
+                    continue;
                 }
+                current_subchid = Some(audio.subchid);
+                info!("Playing sub-channel {} (DAB+)", audio.subchid);
             }
         }
 
         // Announce service on fd 3
-        if !service_announced {
-            if let (Some(sid), Some(_)) = (target_sid, current_subchid) {
-                if let Some(svc) = fic_decoder.services.get(&sid) {
-                    if !svc.label.is_empty() {
-                        pad_output.write_service(&svc.label, &svc.short_label, svc.sid);
-                        info!("Service: {} (0x{:04X})", svc.label.trim(), svc.sid);
-                        service_announced = true;
-                    }
-                }
-            } else if let Some(ref label) = args.label {
-                if current_subchid.is_some() {
-                    if let Some(svc) = fic_decoder.find_service_by_label(label) {
-                        pad_output.write_service(&svc.label, &svc.short_label, svc.sid);
-                        service_announced = true;
-                    }
-                }
-            } else if args.first && current_subchid.is_some() {
-                if let Some(svc) = fic_decoder.services.values().next() {
+        if !service_announced && current_subchid.is_some() {
+            if let Some(svc) = fic_decoder.services.get(&target_sid) {
+                if !svc.label.is_empty() {
                     pad_output.write_service(&svc.label, &svc.short_label, svc.sid);
+                    info!("Service: {} (0x{:04X})", svc.label.trim(), svc.sid);
                     service_announced = true;
                 }
             }
@@ -372,15 +341,26 @@ pub fn run(args: Iq2pcmArgs) {
             None => continue,
         };
 
+        frames_in.fetch_add(1, Ordering::SeqCst);
+
         let subchannel_arc = match frame.subchannel_data(subchid) {
             Some(arc) => arc,
-            None => continue,
+            None => {
+                frames_no_subch.fetch_add(1, Ordering::SeqCst);
+                continue;
+            }
         };
         let subchannel_data: &[u8] = subchannel_arc;
 
         // ── DAB+ path: superframe → RS → AU → AAC → PCM ──────────────────────
-        if is_dab_plus == Some(true) {
+        {
             let result = superframe.feed(subchannel_data);
+            if result.sync_ok {
+                sync_ok.fetch_add(1, Ordering::SeqCst);
+            }
+            if result.sync_fail {
+                sync_fail.fetch_add(1, Ordering::SeqCst);
+            }
 
             if let Some(ref fmt) = result.format {
                 let asc = fmt.build_asc();
@@ -390,7 +370,7 @@ pub fn run(args: Iq2pcmArgs) {
                     fmt.sample_rate() / 1000,
                     fmt.channels()
                 );
-                match dabctl::eti2pcm::aac_decoder::AacDecoder::new(&asc) {
+                match dabctl::audio::aac_decoder::AacDecoder::new(&asc) {
                     Ok(dec) => {
                         info!("AAC decoder: {}Hz {}ch", dec.sample_rate, dec.channels);
                         aac_decoder = Some(dec);
@@ -402,6 +382,7 @@ pub fn run(args: Iq2pcmArgs) {
             if let Some(ref mut dec) = aac_decoder {
                 for au in &result.access_units {
                     if let Some(pcm) = dec.decode_frame(&au.data) {
+                        aus_decoded.fetch_add(1, Ordering::SeqCst);
                         write_pcm(&mut stdout_lock, &pcm);
                     }
                 }
@@ -413,7 +394,7 @@ pub fn run(args: Iq2pcmArgs) {
                 if let Some(ref label) = pad_result.dynamic_label {
                     pad_output.write_dl(&label.text);
                     if !args.disable_dyn_fic {
-                        info!("DLS: {}", label.text);
+                        debug!("DLS: {}", label.text);
                     }
                 }
                 if let Some(ref slide) = pad_result.slide {
@@ -426,14 +407,7 @@ pub fn run(args: Iq2pcmArgs) {
                             slide.data.len()
                         );
                     }
-                }
-            }
-        // ── DAB (MP2) path ────────────────────────────────────────────────────
-        } else if is_dab_plus == Some(false) {
-            if let Some(ref mut dec) = mp2_decoder {
-                let results = dec.feed(subchannel_data);
-                for pcm in results {
-                    write_pcm(&mut stdout_lock, &pcm);
+
                 }
             }
         }
@@ -451,10 +425,16 @@ pub fn run(args: Iq2pcmArgs) {
 }
 
 fn write_pcm(out: &mut impl Write, samples: &[i16]) {
+    // TODO
+    // corrige write_pcm utilise unsafe — La conversion &[i16] → &[u8] via from_raw_parts est correcte (même alignement, doublé de taille), mais pourrait utiliser bytemuck::cast_slice pour être plus idiomatique.
     let bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(samples.as_ptr() as *const u8, samples.len() * 2) };
-    let _ = out.write_all(bytes);
-    let _ = out.flush();
+    if let Err(e) = out.write_all(bytes) {
+        tracing::warn!("PCM write failed: {e}");
+    }
+    if let Err(e) = out.flush() {
+        tracing::warn!("PCM flush failed: {e}");
+    }
 }
 
 /// Parse a SID string (supports "0xF201" and "F201" hex formats).
@@ -497,27 +477,40 @@ mod tests {
     // ── CLI argument defaults ─────────────────────────────────────────────────
 
     #[test]
-    fn default_args_channel_is_11c() {
+    fn required_args_channel_and_sid() {
         use clap::Parser;
         #[derive(Parser)]
         struct Wrapper {
             #[command(flatten)]
             inner: Iq2pcmArgs,
         }
-        let args = Wrapper::parse_from(["test"]);
-        assert_eq!(args.inner.channel, "11C");
+        let args = Wrapper::parse_from(["test", "-C", "6C", "-s", "0xF2F8"]);
+        assert_eq!(args.inner.channel, "6C");
+        assert_eq!(args.inner.sid, "0xF2F8");
     }
 
     #[test]
-    fn default_args_gain_is_50() {
+    fn gain_defaults_to_autogain() {
         use clap::Parser;
         #[derive(Parser)]
         struct Wrapper {
             #[command(flatten)]
             inner: Iq2pcmArgs,
         }
-        let args = Wrapper::parse_from(["test"]);
-        assert_eq!(args.inner.gain, 50);
+        let args = Wrapper::parse_from(["test", "-C", "6C", "-s", "0xF2F8"]);
+        assert!(args.inner.gain.is_none());
+    }
+
+    #[test]
+    fn gain_explicit_value() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Wrapper {
+            #[command(flatten)]
+            inner: Iq2pcmArgs,
+        }
+        let args = Wrapper::parse_from(["test", "-C", "6C", "-s", "0xF2F8", "-G", "30"]);
+        assert_eq!(args.inner.gain, Some(30));
     }
 
     // ── Channel capacity ──────────────────────────────────────────────────────

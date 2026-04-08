@@ -1,6 +1,6 @@
 // Band handler - converted from band-handler.cpp (eti-cmdline)
 
-use crate::dab_constants::BAND_III;
+use crate::pipeline::dab_constants::BAND_III;
 
 struct DabFrequency {
     key: &'static str,
@@ -249,7 +249,7 @@ pub fn frequency(dab_band: u8, channel: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dab_constants::{BAND_III, L_BAND};
+    use crate::pipeline::dab_constants::{BAND_III, L_BAND};
 
     #[test]
     fn known_channel_11c() {

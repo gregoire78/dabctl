@@ -13,10 +13,10 @@ use std::sync::mpsc::{self, TrySendError};
 use std::sync::Arc;
 use std::thread;
 
-use crate::dab_frame::{DabFrame, SubchannelDescriptor, SubchannelFrame};
-use crate::eti_handling::fic_handler::FicHandler;
-use crate::eti_handling::protection::{EepProtection, Protection, UepProtection};
-use crate::support::dab_params::DabParams;
+use crate::pipeline::dab_frame::{DabFrame, SubchannelDescriptor, SubchannelFrame};
+use crate::pipeline::dab_params::DabParams;
+use crate::pipeline::fic_handler::FicHandler;
+use crate::pipeline::protection::{EepProtection, Protection, UepProtection};
 use rayon::prelude::*;
 use smallvec::SmallVec;
 
@@ -151,7 +151,9 @@ impl DabPipeline {
 
     pub fn process_block(&self, softbits: &[i16], blkno: i16) {
         let copy_len = softbits.len().min(self.bits_per_block);
-        let _ = self.ring.try_push(blkno, &softbits[..copy_len]);
+        if !self.ring.try_push(blkno, &softbits[..copy_len]) {
+            warn!(blkno, "OFDM ring buffer full, dropping block");
+        }
     }
 
     pub fn start_processing(&self) {

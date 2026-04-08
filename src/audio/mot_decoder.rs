@@ -4,7 +4,7 @@
 /// MOT Data Group, validates CRC, and returns the raw Data Group.
 ///
 /// Reference: ETSI EN 301 234 §5.1 (X-PAD Data Group transport)
-use crate::eti2pcm::crc::crc16_ccitt;
+use crate::audio::crc::crc16_ccitt;
 
 const MOT_DG_SIZE_MAX: usize = 16384; // 2^14, max MOT Data Group size
 const CRC_LEN: usize = 2;
@@ -14,7 +14,7 @@ pub struct MotDecoder {
     buffer: Vec<u8>,
     size: usize,
     size_needed: usize,
-    crc: crate::eti2pcm::crc::CrcCalculator,
+    crc: crate::audio::crc::CrcCalculator,
 }
 
 impl Default for MotDecoder {
@@ -65,13 +65,18 @@ impl MotDecoder {
 
         // Check if we have enough data
         if self.size_needed == 0 || self.size < self.size_needed {
+            if self.size_needed > 0 && self.size % 200 < data.len() {
+                tracing::debug!("MOT DG accumulating: {}/{} bytes", self.size, self.size_needed);
+            }
             return false;
         }
         // Validation CRC extraite
         if !self.is_valid_crc() {
+            tracing::debug!("MOT DG CRC INVALID (size={})", self.size_needed);
             self.reset();
             return false;
         }
+        tracing::debug!("MOT DG CRC OK (size={})", self.size_needed);
         true
     }
 

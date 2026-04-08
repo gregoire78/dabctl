@@ -1,6 +1,6 @@
 // FIB processor - converted from fib-processor.cpp (eti-cmdline)
 
-use crate::dab_constants::*;
+use crate::pipeline::dab_constants::*;
 
 /// Convert EBU Latin charset byte to UTF-8 char (EN 300 401, Table 1)
 fn ebu_to_char(ch: u8) -> char {

@@ -1,6 +1,6 @@
 /// PAD JSON output on file descriptor 3 (compatible with dablin-gregoire format).
 /// Also handles slideshow file saving and base64 JSON output.
-use crate::eti2pcm::mot_manager::MotFile;
+use crate::audio::mot_manager::MotFile;
 use base64::Engine;
 use serde::Serialize;
 use serde_json;
@@ -18,27 +18,13 @@ pub struct PadOutput {
 impl PadOutput {
     /// Create a new PadOutput.
     ///
-    /// Metadata JSON is written to:
-    /// - `metadata_out` path if provided (works through sudo, avoids fd 3 closure)
-    /// - fd 3 otherwise, if it is open (dablin-compatible legacy behaviour)
-    ///
-    /// Silently drops data if neither is available.
-    pub fn new(
-        slide_dir: Option<PathBuf>,
-        slide_base64: bool,
-        metadata_out: Option<&std::path::Path>,
-    ) -> Self {
-        let writer = if let Some(path) = metadata_out {
-            match std::fs::File::create(path) {
-                Ok(f) => Some(f),
-                Err(e) => {
-                    tracing::warn!("Cannot open metadata output {:?}: {}", path, e);
-                    None
-                }
-            }
-        } else if nix_fcntl_check(3) {
+    /// Metadata JSON is written to fd 3, if it is open.
+    /// Logs a warning if fd 3 is not available.
+    pub fn new(slide_dir: Option<PathBuf>, slide_base64: bool) -> Self {
+        let writer = if nix_fcntl_check(3) {
             Some(unsafe { std::fs::File::from_raw_fd(3) })
         } else {
+            tracing::warn!("fd 3 is not open — metadata JSON output will be discarded. Use 3>file or 3>&1 to capture it.");
             None
         };
 
@@ -170,9 +156,18 @@ impl PadOutput {
 
     fn write_json_struct<T: serde::Serialize>(&mut self, value: &T) {
         if let Some(ref mut writer) = self.writer {
-            if let Ok(json) = serde_json::to_string(value) {
-                let _ = writeln!(writer, "{}", json);
-                let _ = writer.flush();
+            match serde_json::to_string(value) {
+                Ok(json) => {
+                    if let Err(e) = writeln!(writer, "{}", json) {
+                        tracing::warn!("Metadata write to fd 3 failed: {e}");
+                    }
+                    if let Err(e) = writer.flush() {
+                        tracing::warn!("Metadata flush on fd 3 failed: {e}");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Metadata JSON serialization failed: {e}");
+                }
             }
         }
     }
