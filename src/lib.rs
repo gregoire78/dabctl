@@ -1,9 +1,5 @@
-// DABCTL Rust - conversion of eti-cmdline (C++)
+// dabctl — RTL-SDR → PCM audio pipeline for DAB/DAB+ radio
 
-pub mod dab_constants;
-pub mod dab_frame;
+pub mod audio;
 pub mod device;
-pub mod eti2pcm;
-pub mod eti_handling;
-pub mod ofdm;
-pub mod support;
+pub mod pipeline;

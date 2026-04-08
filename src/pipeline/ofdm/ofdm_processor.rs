@@ -5,12 +5,12 @@ use rustfft::{Fft, FftPlanner};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use crate::dab_constants::{jan_abs, DIFF_LENGTH, INPUT_RATE};
 use crate::device::rtlsdr_handler::RtlsdrHandler;
-use crate::eti_handling::eti_generator::DabPipeline;
-use crate::ofdm::freq_interleaver::FreqInterleaver;
-use crate::ofdm::phase_reference::PhaseReference;
-use crate::support::dab_params::DabParams;
+use crate::pipeline::dab_constants::{jan_abs, DIFF_LENGTH, INPUT_RATE};
+use crate::pipeline::dab_params::DabParams;
+use crate::pipeline::eti_generator::DabPipeline;
+use crate::pipeline::ofdm::freq_interleaver::FreqInterleaver;
+use crate::pipeline::ofdm::phase_reference::PhaseReference;
 
 pub struct OfdmProcessor {
     _params: DabParams,
@@ -22,6 +22,8 @@ pub struct OfdmProcessor {
     nr_blocks: usize,
     carriers: usize,
     carrier_diff: i32,
+    threshold_1: i16,
+    threshold_2: i16,
     phase_synchronizer: PhaseReference,
     freq_interleaver: FreqInterleaver,
     fft: Arc<dyn Fft<f32>>,
@@ -48,8 +50,8 @@ pub enum ProcessorError {
 impl OfdmProcessor {
     pub fn new(
         dab_mode: u8,
-        _threshold_1: i16,
-        _threshold_2: i16,
+        threshold_1: i16,
+        threshold_2: i16,
         running: Arc<AtomicBool>,
     ) -> Self {
         let params = DabParams::new(dab_mode);
@@ -81,6 +83,8 @@ impl OfdmProcessor {
             nr_blocks,
             carriers,
             carrier_diff,
+            threshold_1,
+            threshold_2,
             phase_synchronizer,
             freq_interleaver,
             fft,
@@ -358,7 +362,7 @@ impl OfdmProcessor {
 
             let start_index = self
                 .phase_synchronizer
-                .find_index(&self.ofdm_buffer[..self.t_u], 2);
+                .find_index(&self.ofdm_buffer[..self.t_u], self.threshold_1);
             if start_index < 0 {
                 continue; // notSynced
             }
@@ -458,7 +462,7 @@ impl OfdmProcessor {
                 }
 
                 start_index = {
-                    let idx = self.phase_synchronizer.find_index(&check_buf, 2);
+                    let idx = self.phase_synchronizer.find_index(&check_buf, self.threshold_2);
                     if idx < 0 {
                         break; // Lost sync, go back to notSynced
                     }

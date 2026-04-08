@@ -191,10 +191,7 @@ impl RsDecoder {
 
                 // t(x) = lambda(x) - delta * x * b(x)
                 let mut t = [0u8; NROOTS + 1];
-                for (t_val, (&lam_val, &b_val)) in t
-                    .iter_mut()
-                    .zip(lambda.iter().zip(b.iter()))
-                {
+                for (t_val, (&lam_val, &b_val)) in t.iter_mut().zip(lambda.iter().zip(b.iter())) {
                     *t_val = lam_val;
                     if b_val != 0 {
                         let idx = (gf.index_of[b_val as usize] as u16 + delta_idx as u16) % 255;
@@ -227,17 +224,17 @@ impl RsDecoder {
             let mut sum: u8 = 0;
             for (j, &lam_j) in lambda.iter().enumerate().take(NROOTS + 1) {
                 if lam_j != 0 {
-                    let idx = (gf.index_of[lam_j as usize] as u16
-                        + (j as u16 * i as u16) % 255)
-                        % 255;
+                    let idx =
+                        (gf.index_of[lam_j as usize] as u16 + (j as u16 * i as u16) % 255) % 255;
                     sum ^= gf.alpha_to[idx as usize];
                 }
             }
             if sum == 0 {
-                // Error at position NN - 1 - i
-                let pos = NN - 1 - i;
+                // Chien root at α^i → block position p where α^{p+1 mod 255} = α^i,
+                // so p = (i - 1) mod 255 = (i + 254) % 255.
+                let pos = (i + NN - 1) % NN;
                 if pos < PAD {
-                    // Error in padding (shouldn't happen in valid shortened code, but it's correctable)
+                    // Error in padding (shortened zeros) — correctable but outside data
                     continue;
                 }
                 error_locs.push(pos);
@@ -248,58 +245,58 @@ impl RsDecoder {
             return None; // Uncorrectable
         }
 
-        // Forney algorithm to compute error magnitudes
-        // First, compute omega (error evaluator polynomial)
+        // Forney algorithm — compute error magnitudes via explicit Ω.
+        // Ω(x) = S(x)·Λ(x) mod x^NROOTS   (error evaluator polynomial)
         let mut omega = [0u8; NROOTS + 1];
-        for (i, (om, &syn_i)) in omega
-            .iter_mut()
-            .zip(syndromes.iter())
-            .enumerate()
-            .take(NROOTS)
-        {
-            *om = syn_i;
+        for i in 0..NROOTS {
+            omega[i] = syndromes[i];
             for j in 1..=i.min(l) {
                 if lambda[j] != 0 && syndromes[i - j] != 0 {
                     let idx = (gf.index_of[lambda[j] as usize] as u16
                         + gf.index_of[syndromes[i - j] as usize] as u16)
                         % 255;
-                    *om ^= gf.alpha_to[idx as usize];
+                    omega[i] ^= gf.alpha_to[idx as usize];
                 }
             }
         }
 
-        // Compute error values
+        // For each error location, compute the error magnitude.
+        // Forney formula for FCR=0: e = X_j · Ω(X_j^{-1}) / Λ'(X_j^{-1})
+        // where X_j = α^{254-p} for block position p.  ETSI TS 102 563 §6.
         for &loc in &error_locs {
-            let xi_inv = (255 - loc as u16) % 255; // alpha^(-loc)
+            // Evaluation point: X_j^{-1} = α^{root} where root = (p+1) % 255
+            let root = (loc as u16 + 1) % 255;
 
-            // Evaluate omega at xi_inv
+            // Evaluate Ω at α^root
             let mut omega_val: u8 = 0;
             for (i, &om_i) in omega.iter().enumerate().take(NROOTS) {
                 if om_i != 0 {
                     let idx =
-                        (gf.index_of[om_i as usize] as u16 + xi_inv * i as u16 % 255) % 255;
+                        (gf.index_of[om_i as usize] as u16 + (i as u16 * root) % 255) % 255;
                     omega_val ^= gf.alpha_to[idx as usize];
                 }
             }
 
-            // Evaluate lambda' (formal derivative) at xi_inv
+            // Evaluate Λ'(α^root) — formal derivative: only odd-power terms in GF(2)
             let mut lambda_prime: u8 = 0;
             for i in (1..=l).step_by(2) {
                 if lambda[i] != 0 {
                     let idx = (gf.index_of[lambda[i] as usize] as u16
-                        + xi_inv * (i - 1) as u16 % 255)
+                        + ((i - 1) as u16 * root) % 255)
                         % 255;
                     lambda_prime ^= gf.alpha_to[idx as usize];
                 }
             }
 
-            if lambda_prime == 0 {
+            if lambda_prime == 0 || omega_val == 0 {
                 return None;
             }
 
-            // Error magnitude = omega / lambda'
+            // err = X_j · Ω / Λ' = α^{254-loc} · Ω_val / Λ'_val
+            let x_j_log = (254 - loc as u16 + 255) % 255; // log(X_j) = 254-loc (mod 255)
             let err_val_idx = (gf.index_of[omega_val as usize] as u16 + 255
-                - gf.index_of[lambda_prime as usize] as u16)
+                - gf.index_of[lambda_prime as usize] as u16
+                + x_j_log)
                 % 255;
             let err_val = gf.alpha_to[err_val_idx as usize];
 
@@ -341,5 +338,175 @@ mod tests {
         let mut block = [0u8; BLOCK_SIZE];
         let result = rs.decode_rs(&mut block);
         assert_eq!(result, Some(0));
+    }
+
+    /// Encode a RS(120,110) block: compute 10 parity bytes for 110 data bytes.
+    /// Uses systematic encoding with the generator polynomial.
+    fn rs_encode(data: &[u8; 110]) -> [u8; BLOCK_SIZE] {
+        let gf = GF_TABLES.get_or_init(build_gf_tables);
+        let mut codeword = [0u8; BLOCK_SIZE];
+        codeword[..110].copy_from_slice(data);
+
+        // Work on the full 255-byte frame (shortened code: PAD leading zeros)
+        let mut full = [0u8; NN];
+        full[PAD..PAD + 110].copy_from_slice(data);
+
+        // Systematic encoding: compute remainder of message polynomial
+        // divided by generator polynomial (both in index form).
+        let mut feedback;
+        let mut parity = [0u8; NROOTS];
+
+        for i in PAD..PAD + 110 {
+            feedback = gf.index_of[full[i] as usize ^ parity[0] as usize];
+            if feedback != 255 {
+                for j in 1..NROOTS {
+                    if gf.genpoly[NROOTS - j] != 255 {
+                        let idx = (feedback as u16 + gf.genpoly[NROOTS - j] as u16) % 255;
+                        parity[j] ^= gf.alpha_to[idx as usize];
+                    }
+                }
+            }
+            // Shift parity register
+            parity.copy_within(1.., 0);
+            if feedback != 255 {
+                let idx = (feedback as u16 + gf.genpoly[0] as u16) % 255;
+                parity[NROOTS - 1] = gf.alpha_to[idx as usize];
+            } else {
+                parity[NROOTS - 1] = 0;
+            }
+        }
+
+        codeword[110..120].copy_from_slice(&parity);
+        codeword
+    }
+
+    #[test]
+    fn test_encode_then_decode_no_errors() {
+        let rs = RsDecoder::new();
+        let mut data = [0u8; 110];
+        data[0] = 0x42;
+        data[50] = 0xFF;
+        data[109] = 0x01;
+        let mut block = rs_encode(&data);
+        let result = rs.decode_rs(&mut block);
+        assert_eq!(result, Some(0));
+        assert_eq!(&block[..110], &data[..]);
+    }
+
+    #[test]
+    fn test_correct_1_error() {
+        let rs = RsDecoder::new();
+        let mut data = [0u8; 110];
+        data[0] = 0xAB;
+        data[42] = 0xCD;
+        let original = data;
+        let mut block = rs_encode(&data);
+
+        // Introduce 1 error
+        block[20] ^= 0x55;
+
+        let result = rs.decode_rs(&mut block);
+        assert_eq!(result, Some(1));
+        assert_eq!(&block[..110], &original[..]);
+    }
+
+    #[test]
+    fn test_correct_2_errors() {
+        let rs = RsDecoder::new();
+        let mut data = [0u8; 110];
+        data[10] = 0x12;
+        data[99] = 0x34;
+        let original = data;
+        let mut block = rs_encode(&data);
+
+        // Introduce 2 errors
+        block[0] ^= 0xFF;
+        block[109] ^= 0x01;
+
+        let result = rs.decode_rs(&mut block);
+        assert_eq!(result, Some(2));
+        assert_eq!(&block[..110], &original[..]);
+    }
+
+    #[test]
+    fn test_correct_3_errors() {
+        let rs = RsDecoder::new();
+        let mut data = [0u8; 110];
+        for i in 0..110 {
+            data[i] = (i * 7 + 3) as u8;
+        }
+        let original = data;
+        let mut block = rs_encode(&data);
+
+        // Introduce 3 errors
+        block[5] ^= 0xAA;
+        block[55] ^= 0x55;
+        block[105] ^= 0xFF;
+
+        let result = rs.decode_rs(&mut block);
+        assert_eq!(result, Some(3));
+        assert_eq!(&block[..110], &original[..]);
+    }
+
+    #[test]
+    fn test_correct_5_errors_maximum() {
+        // RS(120,110) can correct up to NROOTS/2 = 5 byte errors
+        let rs = RsDecoder::new();
+        let mut data = [0u8; 110];
+        for i in 0..110 {
+            data[i] = (i as u8).wrapping_mul(13).wrapping_add(7);
+        }
+        let original = data;
+        let mut block = rs_encode(&data);
+
+        // Introduce 5 errors (maximum correctable)
+        block[0] ^= 0x01;
+        block[30] ^= 0x80;
+        block[60] ^= 0x42;
+        block[90] ^= 0xFE;
+        block[110] ^= 0x33; // error in parity byte
+
+        let result = rs.decode_rs(&mut block);
+        assert_eq!(result, Some(5));
+        assert_eq!(&block[..110], &original[..]);
+    }
+
+    #[test]
+    fn test_6_errors_uncorrectable() {
+        // 6 errors exceeds the correction capacity
+        let rs = RsDecoder::new();
+        let mut data = [0u8; 110];
+        data[0] = 0x42;
+        let mut block = rs_encode(&data);
+
+        // Introduce 6 errors
+        block[0] ^= 0x01;
+        block[20] ^= 0x02;
+        block[40] ^= 0x03;
+        block[60] ^= 0x04;
+        block[80] ^= 0x05;
+        block[100] ^= 0x06;
+
+        let result = rs.decode_rs(&mut block);
+        assert!(result.is_none(), "6 errors should be uncorrectable");
+    }
+
+    #[test]
+    fn test_superframe_single_column() {
+        // A superframe with subch_index=1 is a single 120-byte RS block
+        let rs = RsDecoder::new();
+        let mut data = [0u8; 110];
+        data[0] = 0x99;
+        let original = data;
+        let mut sf = rs_encode(&data).to_vec();
+
+        // Introduce 2 errors
+        sf[10] ^= 0xAA;
+        sf[50] ^= 0xBB;
+
+        let (corr, uncorr) = rs.decode_superframe(&mut sf);
+        assert_eq!(corr, 2);
+        assert!(!uncorr);
+        assert_eq!(&sf[..110], &original[..]);
     }
 }

@@ -1,7 +1,7 @@
 // Frequency interleaver - converted from freq-interleaver.cpp (eti-cmdline)
 // Section 14.6 of the DAB standard
 
-use crate::support::dab_params::DabParams;
+use crate::pipeline::dab_params::DabParams;
 
 pub struct FreqInterleaver {
     perm_table: Vec<i16>,
@@ -54,7 +54,7 @@ impl FreqInterleaver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::support::dab_params::DabParams;
+    use crate::pipeline::dab_params::DabParams;
 
     #[test]
     fn mode1_size() {

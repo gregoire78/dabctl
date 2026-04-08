@@ -1,12 +1,9 @@
 pub mod aac_decoder;
 pub mod crc;
 pub mod ebu_latin;
-pub mod eti_frame;
-pub mod eti_reader;
 pub mod fic_decoder;
 pub mod mot_decoder;
 pub mod mot_manager;
-pub mod mp2_decoder;
 pub mod pad_decoder;
 pub mod pad_output;
 pub mod rs_decoder;

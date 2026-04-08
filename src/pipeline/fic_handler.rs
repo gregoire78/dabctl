@@ -1,10 +1,10 @@
 // FIC handler - converted from fic-handler.cpp (eti-cmdline)
 
-use crate::dab_constants::{check_crc_bits, ChannelData};
-use crate::eti_handling::fib_processor::FibProcessor;
-use crate::eti_handling::prot_tables::get_pcodes;
-use crate::eti_handling::viterbi_handler::ViterbiSpiral;
-use crate::support::dab_params::DabParams;
+use crate::pipeline::dab_constants::{check_crc_bits, ChannelData};
+use crate::pipeline::dab_params::DabParams;
+use crate::pipeline::fib_processor::FibProcessor;
+use crate::pipeline::prot_tables::get_pcodes;
+use crate::pipeline::viterbi_handler::ViterbiSpiral;
 
 pub struct FicHandler {
     bits_per_block: usize,
@@ -159,7 +159,7 @@ impl FicHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::support::dab_params::DabParams;
+    use crate::pipeline::dab_params::DabParams;
 
     #[test]
     fn creation_mode1() {
@@ -206,4 +206,5 @@ mod tests {
         let mut valid = vec![false; 4];
         fh.process_fic_block(&data, &mut out, &mut valid);
     }
+
 }

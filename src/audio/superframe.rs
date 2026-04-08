@@ -1,7 +1,7 @@
 /// DAB+ superframe decoder: accumulates 5 frames, applies RS,
 /// checks fire code sync, extracts Access Units.
-use crate::eti2pcm::crc::{crc16_ccitt, crc_fire_code, CrcCalculator};
-use crate::eti2pcm::rs_decoder::RsDecoder;
+use crate::audio::crc::{crc16_ccitt, crc_fire_code, CrcCalculator};
+use crate::audio::rs_decoder::RsDecoder;
 
 const FPAD_LEN: usize = 2;
 
@@ -217,7 +217,10 @@ impl SuperframeFilter {
             // Slide by 1 frame: set count to 4 so we collect just one more frame.
             // write_head already points to the next slot to overwrite.
             self.frame_count = 4;
-            return SuperframeResult::default();
+            return SuperframeResult {
+                sync_fail: true,
+                ..SuperframeResult::default()
+            };
         }
 
         // Check format change
@@ -280,6 +283,8 @@ impl SuperframeFilter {
             } else {
                 None
             },
+            sync_ok: true,
+            sync_fail: false,
         }
     }
 
@@ -349,6 +354,10 @@ pub struct SuperframeResult {
     pub access_units: Vec<AccessUnit>,
     pub pad_data: Vec<PadData>,
     pub format: Option<SuperframeFormat>,
+    /// A superframe sync was attempted and succeeded
+    pub sync_ok: bool,
+    /// A superframe sync was attempted and failed (fire code CRC)
+    pub sync_fail: bool,
 }
 
 /// Extract PAD data from an AAC AU (embedded in Data Stream Element)

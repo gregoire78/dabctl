@@ -1,8 +1,8 @@
 /// FIC decoder for ETI consumer: decodes FIBs to extract service/subchannel mapping.
 /// Implements FIG 0/0 (ensemble), FIG 0/1 (subchannel config), FIG 0/2 (service→component),
 /// FIG 1/0 (ensemble label), FIG 1/1 (service label).
-use crate::eti2pcm::crc::crc16_ccitt;
-use crate::eti2pcm::ebu_latin::ebu_latin_char_to_utf8_string;
+use crate::audio::crc::crc16_ccitt;
+use crate::audio::ebu_latin::ebu_latin_char_to_utf8_string;
 use std::collections::HashMap;
 
 /// Audio service type
@@ -44,7 +44,7 @@ pub struct FicDecoder {
     pub ensemble: Option<EnsembleInfo>,
     pub services: HashMap<u16, ServiceInfo>,
     pub subchannels: HashMap<u8, SubchannelInfo>,
-    crc: crate::eti2pcm::crc::CrcCalculator,
+    crc: crate::audio::crc::CrcCalculator,
 }
 
 // EEP-A and EEP-B size factors
@@ -426,10 +426,9 @@ fn decode_ebu_label(data: &[u8]) -> String {
 fn extract_short_label(data: &[u8], mask: u16) -> String {
     let mut result = String::new();
     for i in 0..16 {
-        if mask & (1 << (15 - i)) != 0
-            && i < data.len() && data[i] != 0 {
-                result.push_str(&ebu_latin_char_to_utf8_string(data[i]));
-            }
+        if mask & (1 << (15 - i)) != 0 && i < data.len() && data[i] != 0 {
+            result.push_str(&ebu_latin_char_to_utf8_string(data[i]));
+        }
     }
     result
 }

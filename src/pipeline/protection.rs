@@ -1,7 +1,7 @@
 // Protection (EEP + UEP) - converted from eep-protection.cpp + uep-protection.cpp (eti-cmdline)
 
-use crate::eti_handling::prot_tables::get_pcodes;
-use crate::eti_handling::viterbi_handler::ViterbiSpiral;
+use crate::pipeline::prot_tables::get_pcodes;
+use crate::pipeline::viterbi_handler::ViterbiSpiral;
 
 pub struct EepProtection {
     out_size: usize,

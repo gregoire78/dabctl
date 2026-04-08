@@ -1,6 +1,6 @@
 // Phase reference - converted from phasereference.cpp (eti-cmdline)
 
-use crate::ofdm::phase_table::PhaseTable;
+use crate::pipeline::ofdm::phase_table::PhaseTable;
 use num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
 use std::sync::Arc;
@@ -53,7 +53,11 @@ impl PhaseReference {
         self.fft.process(&mut fft_buffer);
 
         // Correlate in frequency domain
-        for (fb, rt) in fft_buffer.iter_mut().zip(self.ref_table.iter()).take(self.t_u) {
+        for (fb, rt) in fft_buffer
+            .iter_mut()
+            .zip(self.ref_table.iter())
+            .take(self.t_u)
+        {
             *fb *= rt.conj();
         }
 

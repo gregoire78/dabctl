@@ -1,10 +1,10 @@
 /// PAD (Programme Associated Data) decoder for DLS (Dynamic Label Segment)
 /// and MOT (Multimedia Object Transfer) slideshow.
 /// Decodes F-PAD + X-PAD from DAB+ AU to extract Dynamic Label text and MOT images.
-use crate::eti2pcm::crc::crc16_ccitt;
-use crate::eti2pcm::ebu_latin::ebu_latin_char_to_utf8_string;
-use crate::eti2pcm::mot_decoder::MotDecoder;
-use crate::eti2pcm::mot_manager::{MotFile, MotManager};
+use crate::audio::crc::crc16_ccitt;
+use crate::audio::ebu_latin::ebu_latin_char_to_utf8_string;
+use crate::audio::mot_decoder::MotDecoder;
+use crate::audio::mot_manager::{MotFile, MotManager};
 use encoding_rs::{UTF_16BE, WINDOWS_1252};
 
 const MAX_XPAD_LEN: usize = 196;
@@ -151,7 +151,11 @@ impl DgliDecoder {
             let crc_stored = (self.data[2] as u16) << 8 | self.data[3] as u16;
             let crc_calced = crc.calc(&self.data[..2]);
             if crc_stored == crc_calced {
-                self.len = Some(((self.data[0] as usize) << 8 | self.data[1] as usize) & 0x3FFF);
+                let len = ((self.data[0] as usize) << 8 | self.data[1] as usize) & 0x3FFF;
+                tracing::debug!("DGLI received: len={}", len);
+                self.len = Some(len);
+            } else {
+                tracing::debug!("DGLI CRC invalid");
             }
         }
     }
@@ -166,7 +170,7 @@ impl DgliDecoder {
 struct DlDataGroupDecoder {
     data: Vec<u8>,
     dg_size_needed: usize,
-    crc: crate::eti2pcm::crc::CrcCalculator,
+    crc: crate::audio::crc::CrcCalculator,
 }
 
 impl DlDataGroupDecoder {
@@ -426,35 +430,44 @@ impl PadDecoder {
                     }
                     _ => {}
                 }
-                // Store single continuation CI for non-CI frames (like dablin)
+                // Store continuation CI for non-CI frames.
+                // ETSI EN 300 401 §7.4.3: after a start subfield in a CI frame,
+                // subsequent non-CI frames carry the corresponding continuation type.
+                // Start types (even) imply continuation types (odd = start + 1):
+                //   DL start (2) → DL continuation (3)
+                //   MOT start (app_type) → MOT continuation (app_type + 1)
                 if !cis.is_empty() {
-                    // Find the last continuation subfield type (odd types: 3=DL_cont, app_type+1=MOT_cont)
                     let mut last_continued_type: Option<u8> = None;
-                    let mut total_offset = cis_len;
                     for ci in &cis {
-                        total_offset += ci.len;
-                        if ci.ci_type == 3
-                            || (self.mot_app_type >= 0
-                                && ci.ci_type == (self.mot_app_type as u8) + 1)
-                        {
-                            last_continued_type = Some(ci.ci_type);
+                        if ci.ci_type == 2 || ci.ci_type == 3 {
+                            last_continued_type = Some(3);
+                        } else if self.mot_app_type >= 0 {
+                            let app_type = self.mot_app_type as u8;
+                            if ci.ci_type == app_type || ci.ci_type == app_type + 1 {
+                                last_continued_type = Some(app_type + 1);
+                            }
                         }
                     }
                     if let Some(cont_type) = last_continued_type {
                         self.last_xpad_ci = Some(XpadCi {
-                            len: total_offset - cis_len, // data bytes only (excluding CI header)
+                            len: 0, // not used; non-CI frames use full X-PAD length
                             ci_type: cont_type,
                         });
-                    } else {
-                        self.last_xpad_ci = None;
                     }
+                    // If no continuable type found (e.g. DGLI-only CI frame),
+                    // keep previous last_xpad_ci unchanged so ongoing MOT/DLS
+                    // continuations are not disrupted.
                 }
             } else {
                 // No CI flag: use single stored continuation CI (like dablin)
                 match xpad_ind {
                     0b01 | 0b10 => {
                         if let Some(ref stored_ci) = self.last_xpad_ci {
-                            cis.push(stored_ci.clone());
+                            // Non-CI frame: entire X-PAD data is one continuation subfield
+                            cis.push(XpadCi {
+                                len: used_len,
+                                ci_type: stored_ci.ci_type,
+                            });
                             cis_len = 0; // no CI bytes present in non-CI frames
                         }
                     }
@@ -511,11 +524,13 @@ impl PadDecoder {
                             // DGLI len is only valid for the immediate next DG
                             if start {
                                 let dgli_len = self.dgli_decoder.take_len();
+                                tracing::debug!("MOT start subfield (ci_type={}, dgli_len={})", ci.ci_type, dgli_len);
                                 self.mot_decoder.set_len(dgli_len);
                             }
 
                             if self.mot_decoder.process_subfield(start, subfield) {
                                 let dg = self.mot_decoder.get_data_group();
+                                tracing::debug!("MOT DG complete, forwarding to mot_manager (dg_len={})", dg.len());
                                 let (file, _fraction) = self.mot_manager.handle_data_group(&dg);
                                 if let Some(f) = file {
                                     if f.is_image() {
