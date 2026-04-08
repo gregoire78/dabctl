@@ -15,14 +15,14 @@ fn create_mapper(t_u: usize, v1: i16, lwb: i16, upb: i16) -> Vec<i16> {
     }
 
     let mut result = Vec::with_capacity(t_u);
-    for i in 0..t_u {
-        if tmp[i] == t_u as i16 / 2 {
+    for &t in tmp.iter().take(t_u) {
+        if t == t_u as i16 / 2 {
             continue;
         }
-        if tmp[i] < lwb || tmp[i] > upb {
+        if t < lwb || t > upb {
             continue;
         }
-        result.push(tmp[i] - t_u as i16 / 2);
+        result.push(t - t_u as i16 / 2);
     }
     result
 }
@@ -30,7 +30,7 @@ fn create_mapper(t_u: usize, v1: i16, lwb: i16, upb: i16) -> Vec<i16> {
 impl FreqInterleaver {
     pub fn new(params: &DabParams) -> Self {
         let t_u = params.t_u as usize;
-        let carriers = params.k as i16;
+        let carriers = params.k;
 
         let perm_table = match params.dab_mode {
             1 => create_mapper(t_u, 511, 256, 256 + carriers),
@@ -72,7 +72,12 @@ mod tests {
         let half_k = params.k / 2;
         for i in 0..params.k as usize {
             let m = fi.map_in(i);
-            assert!(m >= -half_k && m <= half_k, "map_in({}) = {} out of range", i, m);
+            assert!(
+                m >= -half_k && m <= half_k,
+                "map_in({}) = {} out of range",
+                i,
+                m
+            );
             assert_ne!(m, 0, "DC carrier should never appear");
         }
     }
@@ -99,7 +104,12 @@ mod tests {
             for i in 0..params.k as usize {
                 set.insert(fi.map_in(i));
             }
-            assert_eq!(set.len(), params.k as usize, "Mode {} should have K unique mappings", mode);
+            assert_eq!(
+                set.len(),
+                params.k as usize,
+                "Mode {} should have K unique mappings",
+                mode
+            );
         }
     }
 }

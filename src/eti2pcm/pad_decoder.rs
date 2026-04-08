@@ -5,7 +5,7 @@ use crate::eti2pcm::crc::crc16_ccitt;
 use crate::eti2pcm::ebu_latin::ebu_latin_char_to_utf8_string;
 use crate::eti2pcm::mot_decoder::MotDecoder;
 use crate::eti2pcm::mot_manager::{MotFile, MotManager};
-use encoding_rs::{WINDOWS_1252, UTF_16BE};
+use encoding_rs::{UTF_16BE, WINDOWS_1252};
 
 const MAX_XPAD_LEN: usize = 196;
 
@@ -249,7 +249,7 @@ impl DlDataGroupDecoder {
         }
 
         let real_len = 2 + field_len; // prefix(2) + field data
-        let needed = real_len + 2;    // + CRC(2)
+        let needed = real_len + 2; // + CRC(2)
 
         // Update needed size and check
         self.dg_size_needed = needed;
@@ -319,6 +319,12 @@ pub struct PadDecoder {
     /// Last emitted DLS text, to avoid repeating the same label
     last_dl_text: String,
     xpad_buf: [u8; MAX_XPAD_LEN],
+}
+
+impl Default for PadDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PadDecoder {
@@ -427,9 +433,10 @@ impl PadDecoder {
                     let mut total_offset = cis_len;
                     for ci in &cis {
                         total_offset += ci.len;
-                        if ci.ci_type == 3 {
-                            last_continued_type = Some(ci.ci_type);
-                        } else if self.mot_app_type >= 0 && ci.ci_type == (self.mot_app_type as u8) + 1 {
+                        if ci.ci_type == 3
+                            || (self.mot_app_type >= 0
+                                && ci.ci_type == (self.mot_app_type as u8) + 1)
+                        {
                             last_continued_type = Some(ci.ci_type);
                         }
                     }
@@ -516,7 +523,6 @@ impl PadDecoder {
                                     }
                                 }
                             }
-
                         }
                     }
                 }
@@ -532,11 +538,18 @@ impl PadDecoder {
 /// Decode label bytes to UTF-8 text
 fn decode_label_text(raw: &[u8], charset: u8, mot: bool) -> String {
     // Nettoyage des caractères de contrôle
-    let cleaned: Vec<u8> = raw.iter().copied().filter(|&ch| ch != 0x00 && ch != 0x0A && ch != 0x0B && ch != 0x1F).collect();
+    let cleaned: Vec<u8> = raw
+        .iter()
+        .copied()
+        .filter(|&ch| ch != 0x00 && ch != 0x0A && ch != 0x0B && ch != 0x1F)
+        .collect();
     match charset {
         0 => {
             // EBU Latin
-            cleaned.iter().map(|&ch| ebu_latin_char_to_utf8_string(ch)).collect()
+            cleaned
+                .iter()
+                .map(|&ch| ebu_latin_char_to_utf8_string(ch))
+                .collect()
         }
         4 if mot => {
             // ISO-8859-1 (MOT) (utilise WINDOWS_1252, compatible pour DAB)
@@ -545,7 +558,7 @@ fn decode_label_text(raw: &[u8], charset: u8, mot: bool) -> String {
         }
         6 if !mot => {
             // UCS-2BE (DAB only) : décodage direct via encoding_rs (UTF_16BE)
-            if raw.len() % 2 != 0 {
+            if !raw.len().is_multiple_of(2) {
                 return String::new();
             }
             let (cow, _, had_errors) = UTF_16BE.decode(raw);

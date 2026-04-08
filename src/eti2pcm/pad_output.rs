@@ -16,11 +16,27 @@ pub struct PadOutput {
 }
 
 impl PadOutput {
-    /// Create a new PadOutput that writes to fd 3.
-    /// Returns a writer that silently drops data if fd 3 is not open.
-    pub fn new(slide_dir: Option<PathBuf>, slide_base64: bool) -> Self {
-        // Check if fd 3 is available before taking ownership
-        let writer = if nix_fcntl_check(3) {
+    /// Create a new PadOutput.
+    ///
+    /// Metadata JSON is written to:
+    /// - `metadata_out` path if provided (works through sudo, avoids fd 3 closure)
+    /// - fd 3 otherwise, if it is open (dablin-compatible legacy behaviour)
+    ///
+    /// Silently drops data if neither is available.
+    pub fn new(
+        slide_dir: Option<PathBuf>,
+        slide_base64: bool,
+        metadata_out: Option<&std::path::Path>,
+    ) -> Self {
+        let writer = if let Some(path) = metadata_out {
+            match std::fs::File::create(path) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    tracing::warn!("Cannot open metadata output {:?}: {}", path, e);
+                    None
+                }
+            }
+        } else if nix_fcntl_check(3) {
             Some(unsafe { std::fs::File::from_raw_fd(3) })
         } else {
             None
@@ -33,7 +49,11 @@ impl PadOutput {
             }
         }
 
-        PadOutput { writer, slide_dir, slide_base64 }
+        PadOutput {
+            writer,
+            slide_dir,
+            slide_base64,
+        }
     }
 
     /// Write ensemble info as JSON
@@ -171,14 +191,19 @@ fn sanitize_filename(name: &str) -> String {
         .unwrap_or("slide.bin");
 
     base.chars()
-        .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     #[test]
     fn test_sanitize_filename_basic() {

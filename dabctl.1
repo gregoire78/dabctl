@@ -1,10 +1,35 @@
 .\" Man page for dabctl
 .\" Copyright (C) 2025 — GPL-2.0
-.TH DABCTL 1 "2025-07-12" "0.5.0" "DAB ETI Tools"
+.TH DABCTL 1 "2026-04-07" "0.6.0" "DAB Radio Tools"
 .SH NAME
-eti\-rtlsdr\-rust \- receive DAB radio via RTL-SDR (iq2eti) and decode ETI to PCM audio (eti2pcm)
+dabctl \- receive DAB radio via RTL-SDR and decode to PCM audio
 .SH SYNOPSIS
-.B eti\-rtlsdr\-rust iq2eti
+.B dabctl iq2pcm
+.RB [ \-C
+.IR channel ]
+.RB [ \-G
+.IR gain ]
+.RB [ \-p
+.IR ppm ]
+.RB [ \-Q ]
+.RB [ \-d
+.IR seconds ]
+.RB [ \-D
+.IR seconds ]
+.RB [ \-s
+.IR sid ]
+.RB [ \-l
+.IR label ]
+.RB [ \-1 ]
+.RB [ \-F ]
+.RB [ \-S
+.IR dir ]
+.RB [ \-\-slide\-base64 ]
+.RB [ \-\-silent ]
+.RB [ \-\-device\-index
+.IR n ]
+.PP
+.B dabctl iq2eti
 .RB [ \-C
 .IR channel ]
 .RB [ \-G
@@ -37,8 +62,16 @@ eti\-rtlsdr\-rust \- receive DAB radio via RTL-SDR (iq2eti) and decode ETI to PC
 .RB [ \-\-slide\-base64 ]
 .RI [ file ]
 .SH DESCRIPTION
-.B eti\-rtlsdr\-rust
-provides two subcommands for DAB (Digital Audio Broadcasting) processing:
+.B dabctl
+provides three subcommands for DAB (Digital Audio Broadcasting) processing:
+.SS iq2pcm
+Receives DAB signals from an RTL-SDR dongle, demodulates the OFDM signal,
+decodes the FIC (Fast Information Channel) and the selected audio service,
+and writes PCM audio directly to stdout.
+This is a single\-process pipeline: no ETI serialisation takes place,
+reducing latency and memory usage compared to the
+.I iq2eti | eti2pcm
+pipeline.
 .SS iq2eti
 Receives DAB signals from an RTL-SDR dongle, demodulates the OFDM signal,
 decodes the FIC (Fast Information Channel), and outputs ETI-NI frames
@@ -54,6 +87,67 @@ This is a port of
 .I dablin
 (C++) to Rust.
 .SH OPTIONS
+.SS iq2pcm options
+All options from both
+.B iq2eti
+and
+.B eti2pcm
+are available in a single invocation.
+.TP
+.BR \-C ", " \-\-channel " " \fIchannel\fR
+DAB channel to tune to (e.g., 5A, 6C, 11C).
+Default:
+.BR 11C .
+.TP
+.BR \-G ", " \-\-gain " " \fIpercent\fR
+Tuner gain as a percentage from 0 to 100.
+Default:
+.BR 50 .
+.TP
+.BR \-p ", " \-\-ppm " " \fIppm\fR
+Frequency correction in parts per million.
+Default:
+.BR 0 .
+.TP
+.BR \-Q ", " \-\-autogain
+Enable automatic gain control (AGC). Overrides
+.BR \-G .
+.TP
+.BR \-d ", " \-\-sync\-time " " \fIseconds\fR
+Timeout for time synchronization.
+Default:
+.BR 5 .
+.TP
+.BR \-D ", " \-\-detect\-time " " \fIseconds\fR
+Timeout for ensemble detection.
+Default:
+.BR 10 .
+.TP
+.BR \-s ", " \-\-sid " " \fIsid\fR
+Service ID in hexadecimal (e.g., 0xF2F8). Selects the audio service to decode.
+.TP
+.BR \-l ", " \-\-label " " \fIlabel\fR
+Select service by label name.
+.TP
+.BR \-1 ", " \-\-first
+Play the first audio service found in the ensemble.
+.TP
+.BR \-F ", " \-\-disable\-dyn\-fic
+Disable dynamic FIC messages on stderr.
+.TP
+.BR \-S ", " \-\-slide\-dir " " \fIdir\fR
+Save slideshow images to the specified directory.
+.TP
+.BR \-\-slide\-base64
+Output slideshow images as base64\-encoded JSON on file descriptor 3.
+.TP
+.BR \-\-silent
+Suppress all log output on stderr.
+.TP
+.BI \-\-device\-index " n"
+RTL-SDR device index.
+Default:
+.BR 0 .
 .SS iq2eti options
 .TP
 .BR \-C ", " \-\-channel " " \fIchannel\fR
@@ -155,11 +249,34 @@ Invalid channel name.
 Failed to start RTL-SDR reader.
 .SH EXAMPLES
 .PP
+.B Direct RTL-SDR to PCM (single process):
+.RS
+.nf
+dabctl iq2pcm \-C 6C \-G 20 \-s 0xF2F8 \\
+  | ffplay \-f s16le \-ar 48000 \-ac 2 \-nodisp \-i \-
+.fi
+.RE
+.PP
+.B Direct with JSON metadata on fd 3:
+.RS
+.nf
+dabctl iq2pcm \-C 6C \-G 20 \-s 0xF2F8 \-\-slide\-base64 3>meta.json \\
+  | ffplay \-f s16le \-ar 48000 \-ac 2 \-nodisp \-i \-
+.fi
+.RE
+.PP
+.B Direct, play first service with AGC:
+.RS
+.nf
+dabctl iq2pcm \-C 11C \-Q \-1 | aplay \-f S16_LE \-r 48000 \-c 2
+.fi
+.RE
+.PP
 .B Full pipeline \(em RTL-SDR to audio:
 .RS
 .nf
-eti\-rtlsdr\-rust iq2eti \-S \-C 6C \-G 20 \\
-  | eti\-rtlsdr\-rust eti2pcm \-F \-s 0xF2F8 \-p \\
+dabctl iq2eti \-S \-C 6C \-G 20 \\
+  | dabctl eti2pcm \-F \-s 0xF2F8 \-p \\
   | ffplay \-f s16le \-ar 48000 \-ac 2 \-nodisp \-i \-
 .fi
 .RE
@@ -167,8 +284,8 @@ eti\-rtlsdr\-rust iq2eti \-S \-C 6C \-G 20 \\
 .B Pipeline with JSON metadata on fd 3:
 .RS
 .nf
-eti\-rtlsdr\-rust iq2eti \-S \-C 6C \-G 20 \\
-  | eti\-rtlsdr\-rust eti2pcm \-F \-s 0xF2F8 \-p 3>metadata.json \\
+dabctl iq2eti \-S \-C 6C \-G 20 \\
+  | dabctl eti2pcm \-F \-s 0xF2F8 \-p 3>metadata.json \\
   | ffplay \-f s16le \-ar 48000 \-ac 2 \-nodisp \-i \-
 .fi
 .RE
@@ -176,63 +293,52 @@ eti\-rtlsdr\-rust iq2eti \-S \-C 6C \-G 20 \\
 .B Save ETI to a file:
 .RS
 .nf
-eti\-rtlsdr\-rust iq2eti \-C 6C \-G 20 \-O capture.eti
+dabctl iq2eti \-C 6C \-G 20 \-O capture.eti
 .fi
 .RE
 .PP
 .B Decode an ETI file to PCM:
 .RS
 .nf
-eti\-rtlsdr\-rust eti2pcm \-s 0xF2F8 \-p capture.eti > output.raw
+dabctl eti2pcm \-s 0xF2F8 \-p capture.eti > output.raw
 ffplay \-f s16le \-ar 48000 \-ac 2 output.raw
+.fi
+.RE
+.PP
+.B Convert to WAV (iq2pcm):
+.RS
+.nf
+dabctl iq2pcm \-C 6C \-G 20 \-s 0xF2F8 \\
+  | sox \-t raw \-r 48000 \-b 16 \-c 2 \-e signed\-integer \-L \- output.wav
+.fi
+.RE
+.PP
+.B Record 60 seconds of ETI:
+.RS
+.nf
+dabctl iq2eti \-C 5A \-G 70 \-t 60 \-O capture.eti
 .fi
 .RE
 .PP
 .B Play first service from stdin:
 .RS
 .nf
-eti\-rtlsdr\-rust eti2pcm \-1 \-p < capture.eti | aplay \-f S16_LE \-r 48000 \-c 2
+dabctl eti2pcm \-1 \-p < capture.eti | aplay \-f S16_LE \-r 48000 \-c 2
+.fi
+.RE
+.PP
+.B Save slideshow images:
+.RS
+.nf
+dabctl iq2pcm \-C 6C \-G 20 \-s 0xF2F8 \-S /tmp/slides \\
+  | ffplay \-f s16le \-ar 48000 \-ac 2 \-nodisp \-i \-
 .fi
 .RE
 .PP
 .B Pipe to dablin (compatibility):
 .RS
 .nf
-eti\-rtlsdr\-rust iq2eti \-S \-C 6C \-G 20 | dablin \-s 0xF2F8
-.fi
-.RE
-.PP
-.B Record 60 seconds:
-.RS
-.nf
-eti\-rtlsdr\-rust iq2eti \-C 5A \-G 70 \-t 60 \-O capture.eti
-.fi
-.RE
-.PP
-.B Convert to WAV:
-.RS
-.nf
-eti\-rtlsdr\-rust iq2eti \-S \-C 6C \-G 20 \-t 15 \\
-  | eti\-rtlsdr\-rust eti2pcm \-s 0xF2F8 \-p \\
-  | ffmpeg \-f s16le \-ar 48000 \-ac 2 \-i \- output.wav
-.fi
-.RE
-.PP
-.B Save slideshow images to a directory:
-.RS
-.nf
-eti\-rtlsdr\-rust iq2eti \-S \-C 6C \-G 20 \\
-  | eti\-rtlsdr\-rust eti2pcm \-s 0xF2F8 \-p \-S /tmp/slides \\
-  | ffplay \-f s16le \-ar 48000 \-ac 2 \-nodisp \-i \-
-.fi
-.RE
-.PP
-.B Get slideshow as base64 JSON on fd 3:
-.RS
-.nf
-eti\-rtlsdr\-rust iq2eti \-S \-C 6C \-G 20 \\
-  | eti\-rtlsdr\-rust eti2pcm \-s 0xF2F8 \-p \-\-slide\-base64 3>pad.json \\
-  | ffplay \-f s16le \-ar 48000 \-ac 2 \-nodisp \-i \-
+dabctl iq2eti \-S \-C 6C \-G 20 | dablin \-s 0xF2F8
 .fi
 .RE
 .SH ETI FORMAT
@@ -326,8 +432,11 @@ The helper script
 sets this automatically.
 .SH FILES
 .TP
-.I eti\-rtlsdr\-rust.sh
+.I dabctl.sh
 Shell wrapper that sets LD_LIBRARY_PATH and runs the binary.
+.TP
+.I live\-capture.sh
+Full live\-capture script (iq2eti | eti2pcm, saves WAV + metadata + slides).
 .TP
 .I test\-capture.sh
 Automated functional test script.

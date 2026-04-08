@@ -11,8 +11,10 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use dabctl::dab_constants::BAND_III;
+use dabctl::dab_frame::DabFrame;
 use dabctl::device::rtlsdr_handler::RtlsdrHandler;
-use dabctl::eti_handling::eti_generator::{EtiGenerator, EtiWriterFn};
+use dabctl::eti_handling::eti_generator::DabPipeline;
+use dabctl::eti_handling::eti_serializer::{EtiSerializer, EtiWriterFn};
 use dabctl::ofdm::ofdm_processor::OfdmProcessor;
 use dabctl::support::band_handler;
 
@@ -59,6 +61,7 @@ pub struct Iq2etiArgs {
     device_index: u32,
 }
 
+#[allow(clippy::type_complexity)]
 pub fn run(args: Iq2etiArgs) {
     let filter = if args.silent {
         EnvFilter::new("off")
@@ -130,7 +133,13 @@ pub fn run(args: Iq2etiArgs) {
         })
     };
 
-    let mut input_device = match RtlsdrHandler::new(frequency, args.ppm, args.gain, args.autogain, args.device_index) {
+    let mut input_device = match RtlsdrHandler::new(
+        frequency,
+        args.ppm,
+        args.gain,
+        args.autogain,
+        args.device_index,
+    ) {
         Ok(dev) => dev,
         Err(e) => {
             error!("Installing device failed: {}", e);
@@ -139,20 +148,24 @@ pub fn run(args: Iq2etiArgs) {
     };
 
     let er = ensemble_recognized.clone();
-    let ensemble_cb: Option<Box<dyn Fn(&str, u32) + Send>> = Some(Box::new(move |name: &str, _eid: u32| {
-        if !er.load(Ordering::SeqCst) {
-            info!("ensemble {} detected", name);
-            er.store(true, Ordering::SeqCst);
-        }
-    }));
-    let program_cb: Option<Box<dyn Fn(&str, i32) + Send>> = Some(Box::new(move |name: &str, sid: i32| {
-        info!("program\t {}\t 0x{:X} is in the list", name.trim(), sid);
-    }));
+    let ensemble_cb: Option<Box<dyn Fn(&str, u32) + Send>> =
+        Some(Box::new(move |name: &str, _eid: u32| {
+            if !er.load(Ordering::SeqCst) {
+                info!("ensemble {} detected", name);
+                er.store(true, Ordering::SeqCst);
+            }
+        }));
+    let program_cb: Option<Box<dyn Fn(&str, i32) + Send>> =
+        Some(Box::new(move |name: &str, sid: i32| {
+            info!("program\t {}\t 0x{:X} is in the list", name.trim(), sid);
+        }));
     let fs = fic_success.clone();
     let fic_quality_cb: Option<Box<dyn Fn(i16) + Send>> = Some(Box::new(move |quality: i16| {
         fs.store(quality, Ordering::SeqCst);
     }));
-    let eti_generator = EtiGenerator::new(1, eti_writer, ensemble_cb, program_cb, fic_quality_cb);
+    let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<DabFrame>(32);
+    let _serializer = EtiSerializer::new(frame_rx, eti_writer);
+    let eti_generator = DabPipeline::new(1, frame_tx, ensemble_cb, program_cb, fic_quality_cb);
     let eti_processing_flag = eti_generator.processing_flag();
 
     let ts = time_synced.clone();
@@ -170,6 +183,8 @@ pub fn run(args: Iq2etiArgs) {
         std::process::exit(5);
     }
 
+    let rtlsdr_running = input_device.reader_running();
+
     let ofdm_thread = thread::spawn(move || {
         let mut eti_gen = eti_generator;
         ofdm_processor.run(&input_device, &mut eti_gen);
@@ -185,6 +200,7 @@ pub fn run(args: Iq2etiArgs) {
     if !time_synced.load(Ordering::SeqCst) {
         warn!("There does not seem to be a DAB signal here");
         running.store(false, Ordering::SeqCst);
+        rtlsdr_running.store(false, Ordering::SeqCst);
         let _ = ofdm_thread.join();
         std::process::exit(1);
     }
@@ -218,6 +234,8 @@ pub fn run(args: Iq2etiArgs) {
     }
 
     running.store(false, Ordering::SeqCst);
+    // Unblock the USB worker so RtlsdrHandler::drop does not stall on read_sync.
+    rtlsdr_running.store(false, Ordering::SeqCst);
     info!("terminating");
 
     let result = ofdm_thread.join();

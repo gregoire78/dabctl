@@ -1,5 +1,4 @@
 /// AAC decoder using libfaad2 FFI for DAB+ (HE-AAC v2, 960-sample transform)
-
 // FAAD2 FFI bindings
 #[allow(non_camel_case_types)]
 mod ffi {
@@ -46,8 +45,13 @@ mod ffi {
         pub fn NeAACDecGetCapabilities() -> c_ulong;
         pub fn NeAACDecOpen() -> NeAACDecHandle;
         pub fn NeAACDecClose(handle: NeAACDecHandle);
-        pub fn NeAACDecGetCurrentConfiguration(handle: NeAACDecHandle) -> *mut NeAACDecConfiguration;
-        pub fn NeAACDecSetConfiguration(handle: NeAACDecHandle, config: *mut NeAACDecConfiguration) -> c_uchar;
+        pub fn NeAACDecGetCurrentConfiguration(
+            handle: NeAACDecHandle,
+        ) -> *mut NeAACDecConfiguration;
+        pub fn NeAACDecSetConfiguration(
+            handle: NeAACDecHandle,
+            config: *mut NeAACDecConfiguration,
+        ) -> c_uchar;
         pub fn NeAACDecInit2(
             handle: NeAACDecHandle,
             buffer: *const c_uchar,

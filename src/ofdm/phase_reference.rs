@@ -1,10 +1,9 @@
 // Phase reference - converted from phasereference.cpp (eti-cmdline)
 
-use num_complex::Complex32;
-use rustfft::{FftPlanner, Fft};
-use std::sync::Arc;
 use crate::ofdm::phase_table::PhaseTable;
-
+use num_complex::Complex32;
+use rustfft::{Fft, FftPlanner};
+use std::sync::Arc;
 
 pub struct PhaseReference {
     t_u: usize,
@@ -34,8 +33,8 @@ impl PhaseReference {
         // Prepare phase differences table for coarse frequency offset estimation
         let mut phase_differences = vec![Complex32::new(0.0, 0.0); diff_length];
         for i in 1..=diff_length {
-            phase_differences[i - 1] = ref_table[(t_u + i) % t_u]
-                * ref_table[(t_u + i + 1) % t_u].conj();
+            phase_differences[i - 1] =
+                ref_table[(t_u + i) % t_u] * ref_table[(t_u + i + 1) % t_u].conj();
         }
 
         PhaseReference {
@@ -54,8 +53,8 @@ impl PhaseReference {
         self.fft.process(&mut fft_buffer);
 
         // Correlate in frequency domain
-        for i in 0..self.t_u {
-            fft_buffer[i] = fft_buffer[i] * self.ref_table[i].conj();
+        for (fb, rt) in fft_buffer.iter_mut().zip(self.ref_table.iter()).take(self.t_u) {
+            *fb *= rt.conj();
         }
 
         // Back to time domain
@@ -71,8 +70,8 @@ impl PhaseReference {
         let mut max_val: f32 = -10000.0;
         let mut max_index: i32 = -1;
 
-        for i in 0..self.t_u {
-            let v = fft_buffer[i].norm();
+        for (i, f) in fft_buffer.iter().enumerate().take(self.t_u) {
+            let v = f.norm();
             if v > max_val {
                 max_val = v;
                 max_index = i as i32;

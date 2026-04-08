@@ -5,14 +5,14 @@
 	// Or use a Dockerfile or Docker Compose file. More info: https://containers.dev/guide/dockerfile
 	"image": "mcr.microsoft.com/devcontainers/rust:2-1-trixie",
 
-	// Use 'mounts' to make the cargo cache persistent in a Docker Volume.
-	// "mounts": [
-	// 	{
-	// 		"source": "devcontainer-cargo-cache-${devcontainerId}",
-	// 		"target": "/usr/local/cargo",
-	// 		"type": "volume"
-	// 	}
-	// ]
+	// Mount the host USB bus so RTL-SDR devices are accessible inside the container.
+	//"mounts": [
+	//	{
+	//		"source": "/dev/bus/usb",
+	//		"target": "/dev/bus/usb",
+	//		"type": "bind"
+	//	}
+	//],
 
 	// Features to add to the dev container. More info: https://containers.dev/features.
 	"features": {

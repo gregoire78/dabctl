@@ -90,7 +90,7 @@ pub fn run(args: Eti2pcmArgs) {
     // MOT Slideshow app type is typically 12 (X-PAD CI type for MOT start)
     pad_decoder.set_mot_app_type(12);
     let slide_dir = args.slide_dir.as_ref().map(PathBuf::from);
-    let mut pad_output = PadOutput::new(slide_dir, args.slide_base64);
+    let mut pad_output = PadOutput::new(slide_dir, args.slide_base64, None);
     let mut superframe = SuperframeFilter::new();
     let mut mp2_decoder: Option<dabctl::eti2pcm::mp2_decoder::Mp2Decoder> = None;
     let mut aac_decoder: Option<dabctl::eti2pcm::aac_decoder::AacDecoder> = None;
@@ -241,10 +241,7 @@ pub fn run(args: Eti2pcmArgs) {
                 );
                 match dabctl::eti2pcm::aac_decoder::AacDecoder::new(&asc) {
                     Ok(dec) => {
-                        info!(
-                            "AAC decoder: {}Hz {}ch",
-                            dec.sample_rate, dec.channels
-                        );
+                        info!("AAC decoder: {}Hz {}ch", dec.sample_rate, dec.channels);
                         aac_decoder = Some(dec);
                     }
                     Err(e) => {
@@ -266,12 +263,8 @@ pub fn run(args: Eti2pcmArgs) {
 
             // Process PAD for DLS and slideshow
             for pad in &result.pad_data {
-                let pad_result = pad_decoder.process_full(
-                    &pad.xpad,
-                    pad.xpad.len(),
-                    true,
-                    &pad.fpad,
-                );
+                let pad_result =
+                    pad_decoder.process_full(&pad.xpad, pad.xpad.len(), true, &pad.fpad);
                 if let Some(ref label) = pad_result.dynamic_label {
                     pad_output.write_dl(&label.text);
                     if !args.disable_dyn_fic {
@@ -283,7 +276,9 @@ pub fn run(args: Eti2pcmArgs) {
                     if !args.disable_dyn_fic {
                         info!(
                             "Slide: {} ({}, {} bytes)",
-                            slide.content_name, slide.mime_type(), slide.data.len()
+                            slide.content_name,
+                            slide.mime_type(),
+                            slide.data.len()
                         );
                     }
                 }
@@ -305,9 +300,8 @@ pub fn run(args: Eti2pcmArgs) {
 /// Write PCM i16 samples to stdout
 fn write_pcm(out: &mut impl Write, samples: &[i16]) {
     // Write as raw little-endian bytes (standard PCM format for ffmpeg)
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(samples.as_ptr() as *const u8, samples.len() * 2)
-    };
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(samples.as_ptr() as *const u8, samples.len() * 2) };
     let _ = out.write_all(bytes);
     let _ = out.flush();
 }
@@ -315,7 +309,10 @@ fn write_pcm(out: &mut impl Write, samples: &[i16]) {
 /// Parse a SID string (supports "0xF201" and "F201" hex formats)
 fn parse_sid(s: &str) -> u16 {
     let s = s.trim();
-    let hex_str = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    let hex_str = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
     u16::from_str_radix(hex_str, 16).unwrap_or_else(|_| {
         error!("Invalid SID: {}", s);
         std::process::exit(1);
