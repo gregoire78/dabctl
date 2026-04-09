@@ -1,3 +1,0 @@
-[submodule "rtl-sdr"]
-	path = rtl-sdr
-	url = https://github.com/osmocom/rtl-sdr

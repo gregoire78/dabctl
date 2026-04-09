@@ -31,7 +31,7 @@
 	"privileged": true,
 
 	// Use 'postCreateCommand' to run commands after the container is created.
-	"postCreateCommand": "bash -lc 'set -euo pipefail; echo \"deb http://deb.debian.org/debian trixie non-free non-free-firmware\" | sudo tee /etc/apt/sources.list.d/non-free.list && sudo apt-get update && sudo apt-get install -y libfdk-aac-dev && sudo dpkg --add-architecture arm64 && sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev:arm64; rustup update stable; rustup target add aarch64-unknown-linux-gnu; rustup component add llvm-tools; cargo --version; rustc --version'",
+	"postCreateCommand": "bash -lc 'set -euo pipefail; echo \"deb http://deb.debian.org/debian trixie non-free non-free-firmware\" | sudo tee /etc/apt/sources.list.d/non-free.list && sudo apt-get update && sudo apt-get install -y libfdk-aac-dev && sudo dpkg --add-architecture arm64 && sudo apt-get update && sudo apt-get install -y libusb-1.0-0-dev:arm64; rustup update stable; rustup target add aarch64-unknown-linux-gnu; rustup component add llvm-tools; cargo --version; rustc --version; curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh | sh && rtk --version && rtk init -g --copilot'",
 
 	"containerEnv": {
 		"LIBCLANG_PATH": "/usr/lib/llvm-19/lib"
