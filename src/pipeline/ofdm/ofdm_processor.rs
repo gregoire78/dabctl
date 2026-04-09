@@ -8,7 +8,7 @@ use std::sync::Arc;
 use crate::device::rtlsdr_handler::RtlsdrHandler;
 use crate::pipeline::dab_constants::{jan_abs, DIFF_LENGTH, INPUT_RATE};
 use crate::pipeline::dab_params::DabParams;
-use crate::pipeline::eti_generator::DabPipeline;
+use crate::pipeline::dab_pipeline::DabPipeline;
 use crate::pipeline::ofdm::freq_interleaver::FreqInterleaver;
 use crate::pipeline::ofdm::phase_reference::PhaseReference;
 

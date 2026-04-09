@@ -1,4 +1,4 @@
-/// FIC decoder for ETI consumer: decodes FIBs to extract service/subchannel mapping.
+/// FIC decoder: decodes FIBs to extract service/subchannel mapping.
 /// Implements FIG 0/0 (ensemble), FIG 0/1 (subchannel config), FIG 0/2 (service→component),
 /// FIG 1/0 (ensemble label), FIG 1/1 (service label).
 use crate::audio::crc::crc16_ccitt;

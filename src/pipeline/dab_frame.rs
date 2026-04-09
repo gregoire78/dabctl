@@ -1,12 +1,11 @@
-/// In-memory DAB frame: replaces the 6 144-byte ETI wire format for in-process pipelines.
+/// In-memory DAB frame: one multiplex frame as produced by `DabPipeline`.
 ///
 /// This type carries the logical content of one DAB multiplex frame as defined in
-/// ETSI EN 300 401 §3.2, without any ETI serialisation overhead (no CRC computation,
-/// no FSYNC/ERR bytes, no bit-packing round-trip).
+/// ETSI EN 300 401 §3.2, with no serialisation overhead.
 ///
 /// # Layout (ETSI EN 300 401 §3.2)
 /// - FIC data   : 3 FIBs × 32 bytes = 96 bytes, Mode I  (§3.2.1)
-/// - CIF counter: two-part counter hi/lo matching ETI FCT             (§14.1)
+/// - CIF counter: two-part counter hi/lo                             (§14.1)
 /// - Subchannels: one `SubchannelFrame` per active sub-channel        (§7)
 use std::sync::Arc;
 
@@ -49,17 +48,8 @@ impl DabFrame {
     }
 
     /// Append a sub-channel payload to this frame.
-    pub fn push_subchannel(
-        &mut self,
-        subchid: u8,
-        data: Arc<[u8]>,
-        descriptor: SubchannelDescriptor,
-    ) {
-        self.subchannels.push(SubchannelFrame {
-            subchid,
-            data,
-            descriptor,
-        });
+    pub fn push_subchannel(&mut self, subchid: u8, data: Arc<[u8]>) {
+        self.subchannels.push(SubchannelFrame { subchid, data });
     }
 
     /// Return the payload for the given sub-channel ID, if present in this frame.
@@ -73,11 +63,8 @@ impl DabFrame {
 
 /// Payload for one active DAB sub-channel, post-deconvolution post-descramble.
 ///
-/// `data` is reference-counted (Arc<[u8]>) so the audio thread and the PAD decoder
+/// `data` is reference-counted (`Arc<[u8]>`) so the audio thread and the PAD decoder
 /// can each hold a reference without copying the bytes.
-///
-/// `descriptor` carries the STC fields required to rebuild an ETI header in
-/// `EtiSerializer` (ETSI ETS 300 799 §3.2 — STC section).
 #[derive(Debug, Clone)]
 pub struct SubchannelFrame {
     /// Sub-channel ID 0..63.  ETSI EN 300 401 §7.
@@ -85,23 +72,6 @@ pub struct SubchannelFrame {
 
     /// Audio payload bytes, ready for `SuperframeFilter` (DAB+).
     pub data: Arc<[u8]>,
-
-    /// ETI-level descriptor: needed only by `EtiSerializer` to reconstruct STC.
-    pub descriptor: SubchannelDescriptor,
-}
-
-/// Sub-channel configuration fields required to build the ETI STC section.
-/// ETSI ETS 300 799 §3.2 — Stream Table Configuration.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SubchannelDescriptor {
-    /// Start Capacity Unit.  ETSI EN 300 401 §7.
-    pub start_cu: u16,
-    /// True → UEP (Unequal Error Protection), false → EEP.  ETSI EN 300 401 §11.
-    pub uep_flag: bool,
-    /// Protection level (0 = highest).  ETSI EN 300 401 §11.
-    pub protlev: u8,
-    /// Audio bit-rate in kb/s.
-    pub bitrate: u16,
 }
 
 #[cfg(test)]
@@ -130,7 +100,7 @@ mod tests {
     fn push_and_lookup_subchannel() {
         let payload: Arc<[u8]> = Arc::from(vec![1u8, 2, 3, 4].as_slice());
         let mut frame = DabFrame::new([0u8; 96], 0, 0);
-        frame.push_subchannel(5, payload.clone(), SubchannelDescriptor::default());
+        frame.push_subchannel(5, payload.clone());
 
         let found = frame.subchannel_data(5).expect("subchid 5 must be present");
         assert_eq!(found.as_ref(), &[1u8, 2, 3, 4]);
@@ -153,7 +123,7 @@ mod tests {
         let mut frame = DabFrame::new([0u8; 96], 0, 0);
         for id in 0u8..8 {
             let data: Arc<[u8]> = Arc::from(vec![id; 4].as_slice());
-            frame.push_subchannel(id, data, SubchannelDescriptor::default());
+            frame.push_subchannel(id, data);
         }
         assert!(
             !frame.subchannels.spilled(),
@@ -166,7 +136,7 @@ mod tests {
     fn arc_data_zero_copy_across_clones() {
         let payload: Arc<[u8]> = Arc::from(vec![0xFFu8; 576].as_slice());
         let mut frame = DabFrame::new([0u8; 96], 0, 0);
-        frame.push_subchannel(0, payload.clone(), SubchannelDescriptor::default());
+        frame.push_subchannel(0, payload.clone());
 
         // The two Arc instances point to the same allocation
         let retrieved = frame.subchannel_data(0).unwrap();
@@ -181,14 +151,7 @@ mod tests {
         let (tx, rx) = mpsc::sync_channel::<DabFrame>(4);
 
         let mut frame = DabFrame::new([0xCD; 96], 1, 42);
-        frame.push_subchannel(
-            7,
-            payload.clone(),
-            SubchannelDescriptor {
-                bitrate: 128,
-                ..Default::default()
-            },
-        );
+        frame.push_subchannel(7, payload.clone());
         tx.send(frame).unwrap();
 
         let received = rx.recv().unwrap();

@@ -1,19 +1,16 @@
-// DAB Pipeline - refactored from eti-generator.cpp (eti-cmdline)
+// DAB Pipeline - adapted from eti-generator.cpp (eti-cmdline)
 //
 // `DabPipeline` drives the OFDM → FIC/CIF processing chain and emits
-// `DabFrame` values via a bounded channel.  The ETI binary serialization
-// is now handled exclusively by `EtiSerializer` (in eti_serializer.rs),
-// so this module is free of all ETI wire-format code (no CRC, no FSYNC,
-// no 6 144-byte buffer).
+// `DabFrame` values via a bounded channel.
 
 use tracing::warn;
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, TrySendError};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
-use crate::pipeline::dab_frame::{DabFrame, SubchannelDescriptor, SubchannelFrame};
+use crate::pipeline::dab_frame::{DabFrame, SubchannelFrame};
 use crate::pipeline::dab_params::DabParams;
 use crate::pipeline::fic_handler::FicHandler;
 use crate::pipeline::protection::{EepProtection, Protection, UepProtection};
@@ -38,6 +35,13 @@ struct SpscRing {
     write_pos: AtomicUsize,
     read_pos: AtomicUsize,
     slot_size: usize,
+    /// Paired with `wait_condvar` so the consumer can block instead of
+    /// spinning with `sleep(100 µs)` when the ring is empty.
+    wait_mutex: Mutex<()>,
+    wait_condvar: Condvar,
+    /// Set by `notify()` (shutdown path) to unblock `wait_non_empty()` even
+    /// when no data has been pushed into the ring.
+    wake_requested: AtomicBool,
 }
 
 unsafe impl Sync for SpscRing {}
@@ -57,6 +61,9 @@ impl SpscRing {
             write_pos: AtomicUsize::new(0),
             read_pos: AtomicUsize::new(0),
             slot_size,
+            wait_mutex: Mutex::new(()),
+            wait_condvar: Condvar::new(),
+            wake_requested: AtomicBool::new(false),
         }
     }
 
@@ -72,7 +79,38 @@ impl SpscRing {
         let len = src.len().min(self.slot_size);
         slot.data[..len].copy_from_slice(&src[..len]);
         self.write_pos.store(next, Ordering::Release);
+        // Wake the consumer if it is waiting in wait_non_empty().
+        // Calling notify_one() without holding wait_mutex is intentional:
+        // wait_non_empty() re-checks write_pos under Acquire ordering AFTER
+        // it acquires wait_mutex, so a missed notification at most delays the
+        // consumer by one additional push cycle (~1.25 ms for DAB Mode I),
+        // which is far better than the previous 100 µs busy-poll.
+        self.wait_condvar.notify_one();
         true
+    }
+
+    /// Block the calling thread until at least one slot is available to pop,
+    /// or until `notify()` is called (e.g. on shutdown).
+    fn wait_non_empty(&self) {
+        let guard = self.wait_mutex.lock().unwrap();
+        drop(
+            self.wait_condvar
+                .wait_while(guard, |_| {
+                    // Re-check under the mutex so we never miss a wakeup that
+                    // arrived between try_pop() returning None and this call.
+                    // Also exit when wake_requested is set (shutdown path).
+                    self.write_pos.load(Ordering::Acquire) == self.read_pos.load(Ordering::Relaxed)
+                        && !self.wake_requested.load(Ordering::Acquire)
+                })
+                .unwrap(),
+        );
+    }
+
+    /// Wake the consumer unconditionally — used on shutdown so a thread
+    /// blocked in `wait_non_empty()` can observe `running == false` and exit.
+    fn notify(&self) {
+        self.wake_requested.store(true, Ordering::Release);
+        self.wait_condvar.notify_one();
     }
 
     fn try_pop(&self) -> Option<(i16, &[i16])> {
@@ -166,6 +204,7 @@ impl DabPipeline {
 
     pub fn reset(&mut self, sender: mpsc::SyncSender<DabFrame>) {
         self.running.store(false, Ordering::SeqCst);
+        self.ring.notify(); // unblock the consumer so it exits cleanly
         if let Some(handle) = self.thread_handle.take() {
             let _ = handle.join();
         }
@@ -227,16 +266,20 @@ impl DabPipeline {
             let (blkno, bdata) = match ring.try_pop() {
                 Some(v) => v,
                 None => {
-                    std::thread::sleep(std::time::Duration::from_micros(100));
+                    // Block until the OFDM thread pushes a block, eliminating
+                    // the previous 100 µs busy-poll sleep.
+                    ring.wait_non_empty();
                     continue;
                 }
             };
 
             if blkno != expected_block {
                 warn!("got {}, expected {}", blkno, expected_block);
+                // Reset only the within-frame position; the CIF interleaver
+                // history (index_out, amount) is NOT reset: the 16-CIF sliding
+                // window survives a single dropped block, and resetting it would
+                // cause ~360 ms of unnecessary warm-up latency (15 × 24 ms).
                 expected_block = 2;
-                index_out = 0;
-                amount = 0;
                 minor = 0;
                 ring.pop_commit();
                 continue;
@@ -354,6 +397,8 @@ impl DabPipeline {
 impl Drop for DabPipeline {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
+        // Wake the consumer so it can observe running == false and exit.
+        self.ring.notify();
         if let Some(handle) = self.thread_handle.take() {
             let _ = handle.join();
         }
@@ -409,7 +454,6 @@ fn process_cif_to_frames(
         size: usize,
         out_size: usize,
         byte_size: usize,
-        descriptor: SubchannelDescriptor,
     }
 
     let mut jobs: SmallVec<[SubchJob; INLINE_SUBCH]> = SmallVec::new();
@@ -427,12 +471,6 @@ fn process_cif_to_frames(
                 size,
                 out_size,
                 byte_size: out_size / 8,
-                descriptor: SubchannelDescriptor {
-                    start_cu: data.start_cu as u16,
-                    uep_flag: data.uep_flag,
-                    protlev: data.protlev as u8,
-                    bitrate: data.bitrate as u16,
-                },
             });
         }
     }
@@ -475,7 +513,6 @@ fn process_cif_to_frames(
                 SubchannelFrame {
                     subchid: job.subchid,
                     data: Arc::from(packed.as_slice()),
-                    descriptor: job.descriptor,
                 }
             })
         })
@@ -571,5 +608,43 @@ mod tests {
             let f = rx.recv().unwrap();
             assert_eq!(f.cif_count_lo, i);
         }
+    }
+
+    /// A thread blocking in wait_non_empty() must be woken by try_push().
+    #[test]
+    fn spsc_ring_wait_non_empty_wakes_on_push() {
+        use std::sync::Arc;
+        let ring = Arc::new(SpscRing::new(4));
+        let rx = ring.clone();
+
+        let consumer = std::thread::spawn(move || {
+            rx.wait_non_empty();
+            rx.try_pop().is_some()
+        });
+
+        // Give the consumer thread time to enter wait_non_empty().
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        ring.try_push(42, &[1, 2, 3, 4]);
+
+        assert!(consumer.join().unwrap());
+    }
+
+    /// notify() must unblock wait_non_empty() even when the ring is still empty
+    /// (simulates the shutdown path).
+    #[test]
+    fn spsc_ring_notify_unblocks_wait_on_shutdown() {
+        use std::sync::Arc;
+        let ring = Arc::new(SpscRing::new(4));
+        let rx = ring.clone();
+
+        let consumer = std::thread::spawn(move || {
+            rx.wait_non_empty();
+            rx.try_pop().is_none() // woken by notify(), no data pushed
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        ring.notify(); // wake without data (shutdown signal)
+
+        assert!(consumer.join().unwrap()); // is_none() returned true
     }
 }

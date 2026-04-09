@@ -27,7 +27,7 @@ use dabctl::device::rtlsdr_handler::{GainMode, RtlsdrHandler};
 use dabctl::pipeline::band_handler;
 use dabctl::pipeline::dab_constants::BAND_III;
 use dabctl::pipeline::dab_frame::DabFrame;
-use dabctl::pipeline::eti_generator::DabPipeline;
+use dabctl::pipeline::dab_pipeline::DabPipeline;
 use dabctl::pipeline::ofdm::ofdm_processor::OfdmProcessor;
 
 /// Bounded channel capacity in frames (~24 ms per frame → ~100 ms back-pressure).
