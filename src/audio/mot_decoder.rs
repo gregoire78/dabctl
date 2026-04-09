@@ -66,17 +66,21 @@ impl MotDecoder {
         // Check if we have enough data
         if self.size_needed == 0 || self.size < self.size_needed {
             if self.size_needed > 0 && self.size % 200 < data.len() {
-                tracing::debug!("MOT DG accumulating: {}/{} bytes", self.size, self.size_needed);
+                tracing::trace!(
+                    "MOT DG accumulating: {}/{} bytes",
+                    self.size,
+                    self.size_needed
+                );
             }
             return false;
         }
         // Validation CRC extraite
         if !self.is_valid_crc() {
-            tracing::debug!("MOT DG CRC INVALID (size={})", self.size_needed);
+            tracing::trace!("MOT DG CRC INVALID (size={})", self.size_needed);
             self.reset();
             return false;
         }
-        tracing::debug!("MOT DG CRC OK (size={})", self.size_needed);
+        tracing::trace!("MOT DG CRC OK (size={})", self.size_needed);
         true
     }
 

@@ -304,11 +304,11 @@ impl MotObject {
         }
 
         if !self.header_received {
-            tracing::debug!("MOT object: header not yet received");
+            tracing::trace!("MOT object: header not yet received");
             return false;
         }
         if !self.body.is_finished() || self.body.size() != self.result_file.body_size {
-            tracing::debug!(
+            tracing::trace!(
                 "MOT object: body incomplete ({}/{} bytes, finished={})",
                 self.body.size(),
                 self.result_file.body_size,
@@ -395,16 +395,32 @@ impl MotManager {
         let seg_size = match self.parse_segmentation_header(dg, &mut offset) {
             Some(s) => s,
             None => {
-                tracing::debug!("MOT segmentation header parse failed (dg_type={}, seg_number={}, tid={})", dg_type, seg_number, transport_id);
+                tracing::trace!(
+                    "MOT segmentation header parse failed (dg_type={}, seg_number={}, tid={})",
+                    dg_type,
+                    seg_number,
+                    transport_id
+                );
                 return (None, -1.0);
             }
         };
 
-        tracing::debug!("MOT segment: type={} seg={} last={} tid={} size={}", dg_type, seg_number, last_seg, transport_id, seg_size);
+        tracing::trace!(
+            "MOT segment: type={} seg={} last={} tid={} size={}",
+            dg_type,
+            seg_number,
+            last_seg,
+            transport_id,
+            seg_size
+        );
 
         // Reset object on transport ID change
         if self.current_transport_id != transport_id as i32 {
-            tracing::debug!("MOT new transport_id={} (was {})", transport_id, self.current_transport_id);
+            tracing::trace!(
+                "MOT new transport_id={} (was {})",
+                transport_id,
+                self.current_transport_id
+            );
             self.current_transport_id = transport_id as i32;
             self.object = MotObject::new();
         }

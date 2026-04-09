@@ -6,9 +6,11 @@
 #   GAIN    : gain en % 0-100 (si omis → auto-gain)
 set -e
 
+#CHANNEL="${1:-8C}"
+#SID="${2:-0xF201}"
 CHANNEL="${1:-6C}"
 SID="${2:-0xF2F8}"
-GAIN="${3:-75}"
+GAIN="${3:-}"
 
 mkdir -p test-local
 cd "$(dirname "$0")/test-local" || { echo "[ERREUR] Impossible de changer de répertoire"; exit 1; }
@@ -17,7 +19,7 @@ cd "$(dirname "$0")/test-local" || { echo "[ERREUR] Impossible de changer de ré
 echo "[build] Compilation en release..."
 pushd .. > /dev/null
 cargo test --lib || { echo "[ERREUR] Tests unitaires échoués"; exit 1; }
-cargo build --release || { echo "[ERREUR] Build release échoué"; exit 1; }
+cargo build --release --features fdk-aac || { echo "[ERREUR] Build release échoué"; exit 1; }
 popd > /dev/null
 
 # Nettoyer les anciens fichiers
@@ -37,13 +39,15 @@ fi
 
 # Pipeline direct : RTL-SDR → décodage DAB/DAB+ → PCM
 # sudo closes inherited fd >= 3; open fd 3 inside the sudo shell.
-sudo sh -c 'exec 3>pad_metadata.json; exec "$@"' _ \
+# RUST_LOG is passed explicitly because sudo strips the environment.
+sudo RUST_LOG="${RUST_LOG:-info}" sh -c 'exec 3>pad_metadata.json; exec "$@"' _ \
   ../target/release/dabctl \
   -C "$CHANNEL" \
   -s "$SID" \
   "${GAIN_ARGS[@]}" \
   --slide-dir ./slides \
   --slide-base64 \
+  --aac-decoder fdk-aac \
   2>iq2pcm.log \
   | ffmpeg -y -f s16le -ar 48000 -ac 2 -i pipe:0 output.wav
 

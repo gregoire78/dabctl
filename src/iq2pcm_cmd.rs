@@ -23,7 +23,7 @@ use dabctl::audio::fic_decoder::FicDecoder;
 use dabctl::audio::pad_decoder::PadDecoder;
 use dabctl::audio::pad_output::PadOutput;
 use dabctl::audio::superframe::SuperframeFilter;
-use dabctl::device::rtlsdr_handler::RtlsdrHandler;
+use dabctl::device::rtlsdr_handler::{GainMode, RtlsdrHandler};
 use dabctl::pipeline::band_handler;
 use dabctl::pipeline::dab_constants::BAND_III;
 use dabctl::pipeline::dab_frame::DabFrame;
@@ -39,9 +39,14 @@ pub struct Iq2pcmArgs {
     #[arg(short = 'C', long = "channel")]
     channel: String,
 
-    /// Gain as percentage (0..100). If omitted, auto-gain is used.
-    #[arg(short = 'G', long = "gain")]
+    /// Gain as percentage (0..100). If omitted, software AGC (SAGC) is used.
+    #[arg(short = 'G', long = "gain", conflicts_with = "hardware_agc")]
     gain: Option<i16>,
+
+    /// Use the RTL-SDR chip's built-in hardware AGC.
+    /// By default, software AGC (SAGC) is used. Mutually exclusive with -G.
+    #[arg(long = "hardware-agc", conflicts_with = "gain")]
+    hardware_agc: bool,
 
     /// PPM frequency correction
     #[arg(short = 'p', long = "ppm", default_value_t = 0)]
@@ -82,6 +87,23 @@ pub struct Iq2pcmArgs {
     /// RTL-SDR device index
     #[arg(long = "device-index", default_value_t = 0)]
     device_index: u32,
+
+    /// AAC decoder backend: faad2 or fdk-aac.
+    /// Only available when built with `--features fdk-aac`.
+    #[cfg(feature = "fdk-aac")]
+    #[arg(long = "aac-decoder", default_value = "fdk-aac", value_enum)]
+    aac_decoder: AacBackend,
+}
+
+/// Runtime AAC backend selection. Available only with the `fdk-aac` Cargo feature.
+#[cfg(feature = "fdk-aac")]
+#[derive(Debug, Clone, clap::ValueEnum)]
+pub enum AacBackend {
+    /// libfaad2 — open-source, permissive licence (default without feature)
+    Faad2,
+    /// Fraunhofer FDK AAC — higher quality, non-free licence
+    #[value(name = "fdk-aac")]
+    FdkAac,
 }
 
 #[allow(clippy::type_complexity)]
@@ -89,7 +111,7 @@ pub fn run(args: Iq2pcmArgs) {
     let filter = if args.silent {
         EnvFilter::new("off")
     } else {
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"))
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,rtl_sdr_rs=warn"))
     };
     tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -120,13 +142,18 @@ pub fn run(args: Iq2pcmArgs) {
         error!("Cannot handle channel {}", channel);
         std::process::exit(4);
     }
-    info!("tunedFrequency = {}", freq as u32);
+    debug!("tunedFrequency = {}", freq as u32);
 
-    let autogain = args.gain.is_none();
-    let gain = args.gain.unwrap_or(0);
+    let gain_mode = if args.hardware_agc {
+        GainMode::Hardware
+    } else if let Some(pct) = args.gain {
+        GainMode::Manual(pct)
+    } else {
+        GainMode::Software
+    };
 
     let mut input_device =
-        match RtlsdrHandler::new(freq as u32, args.ppm, gain, autogain, args.device_index) {
+        match RtlsdrHandler::new(freq as u32, args.ppm, gain_mode, args.device_index) {
             Ok(dev) => dev,
             Err(e) => {
                 error!("Installing device failed: {}", e);
@@ -148,7 +175,7 @@ pub fn run(args: Iq2pcmArgs) {
         }));
     let program_cb: Option<Box<dyn Fn(&str, i32) + Send>> =
         Some(Box::new(move |name: &str, sid: i32| {
-            info!("program {} (0x{:X}) is in the list", name.trim(), sid);
+            debug!("program {} (0x{:X}) is in the list", name.trim(), sid);
         }));
     let fs = fic_success.clone();
     let fic_quality_cb: Option<Box<dyn Fn(i16) + Send>> = Some(Box::new(move |quality: i16| {
@@ -209,7 +236,7 @@ pub fn run(args: Iq2pcmArgs) {
     // ── Wait for ensemble detection ───────────────────────────────────────────
     let mut freq_sync_time = args.detect_time;
     while freq_sync_time > 0 {
-        info!("still at most {} seconds to wait", freq_sync_time);
+        debug!("still at most {} seconds to wait", freq_sync_time);
         thread::sleep(std::time::Duration::from_secs(1));
         freq_sync_time -= 1;
         if ensemble_recognized.load(Ordering::SeqCst) {
@@ -370,12 +397,28 @@ pub fn run(args: Iq2pcmArgs) {
                     fmt.sample_rate() / 1000,
                     fmt.channels()
                 );
-                match dabctl::audio::aac_decoder::AacDecoder::new(&asc) {
-                    Ok(dec) => {
-                        info!("AAC decoder: {}Hz {}ch", dec.sample_rate, dec.channels);
-                        aac_decoder = Some(dec);
+                {
+                    #[cfg(not(feature = "fdk-aac"))]
+                    let init = dabctl::audio::aac_decoder::AacDecoder::new(&asc);
+
+                    #[cfg(feature = "fdk-aac")]
+                    let init = match args.aac_decoder {
+                        AacBackend::Faad2 => {
+                            dabctl::audio::aac_decoder::AacDecoder::new_faad2(&asc)
+                        }
+                        AacBackend::FdkAac => dabctl::audio::aac_decoder::AacDecoder::new_fdk_aac(
+                            &asc,
+                            fmt.channels(),
+                        ),
+                    };
+
+                    match init {
+                        Ok(dec) => {
+                            info!("AAC decoder: {}Hz {}ch", dec.sample_rate, dec.channels);
+                            aac_decoder = Some(dec);
+                        }
+                        Err(e) => error!("AAC decoder init failed: {}", e),
                     }
-                    Err(e) => error!("AAC decoder init failed: {}", e),
                 }
             }
 
@@ -400,14 +443,13 @@ pub fn run(args: Iq2pcmArgs) {
                 if let Some(ref slide) = pad_result.slide {
                     pad_output.write_slide(slide);
                     if !args.disable_dyn_fic {
-                        info!(
+                        debug!(
                             "Slide: {} ({}, {} bytes)",
                             slide.content_name,
                             slide.mime_type(),
                             slide.data.len()
                         );
                     }
-
                 }
             }
         }
@@ -425,11 +467,9 @@ pub fn run(args: Iq2pcmArgs) {
 }
 
 fn write_pcm(out: &mut impl Write, samples: &[i16]) {
-    // TODO
-    // corrige write_pcm utilise unsafe — La conversion &[i16] → &[u8] via from_raw_parts est correcte (même alignement, doublé de taille), mais pourrait utiliser bytemuck::cast_slice pour être plus idiomatique.
-    let bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(samples.as_ptr() as *const u8, samples.len() * 2) };
-    if let Err(e) = out.write_all(bytes) {
+    // Encode each sample as little-endian bytes (PCM S16LE, ETSI TS 102 563 §5.2).
+    let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+    if let Err(e) = out.write_all(&bytes) {
         tracing::warn!("PCM write failed: {e}");
     }
     if let Err(e) = out.flush() {

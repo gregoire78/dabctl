@@ -40,12 +40,25 @@ sudo ./target/release/dabctl -C 6C -s 0xF2F8 -G 20 \
 | `libusb-1.0-0-dev` | USB backend pour RTL-SDR (requis par `rtl-sdr-rs`) |
 | `pkg-config` | Découverte de libs système |
 | `build-essential` | Compilateur C (requis par libfaad2/libmpg123) |
-| `libfaad-dev` | Décodeur AAC pour DAB+ |
+| `libfaad-dev` | Décodeur AAC pour DAB+ (backend par défaut) |
+| `libfdk-aac-dev` | Décodeur AAC alternatif — Fraunhofer FDK (optionnel, feature `fdk-aac`) |
 | `libmpg123-dev` | Décodeur MP2 pour DAB classique |
 
 ```bash
+# Backend faad2 (défaut)
 sudo apt install -y libusb-1.0-0-dev pkg-config build-essential libfaad-dev libmpg123-dev
+
+# Backend fdk-aac (optionnel) — requiert le composant non-free de Debian/Ubuntu
+# Sur Debian Trixie :
+sudo sed -i 's/Components: main$/Components: main non-free/' /etc/apt/sources.list.d/debian.sources
+sudo apt update
+sudo apt install -y libusb-1.0-0-dev pkg-config build-essential libfdk-aac-dev libmpg123-dev
+# Sur Ubuntu :
+# sudo add-apt-repository universe && sudo apt install -y libfdk-aac-dev
 ```
+
+> **Note :** `libfdk-aac-dev` est dans le composant `non-free` de Debian (brevets audio Fraunhofer).
+> Sur les systèmes où `non-free` n'est pas disponible, utilisez le backend par défaut **faad2**.
 
 ### Rust
 
@@ -58,7 +71,8 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 | Bibliothèque | Version | Rôle | Lien |
 |---|---|---|---|
 | **libusb-1.0** | 1.0+ | Backend USB pour RTL-SDR (via `rtl-sdr-rs`) | [libusb.info](https://libusb.info) |
-| **libfaad2** | 2.11+ | Décodeur AAC (DAB+) pour `eti2pcm` | [knik-o/faad2](https://github.com/knik-o/faad2) |
+| **libfaad2** | 2.11+ | Décodeur AAC DAB+ — backend par défaut | [knik-o/faad2](https://github.com/knik-o/faad2) |
+| **libfdk-aac** | 2.0+ | Décodeur AAC DAB+ — backend optionnel (feature `fdk-aac`) | [Fraunhofer FDK AAC](https://github.com/mstorsjo/fdk-aac) |
 | **libmpg123** | 1.32+ | Décodeur MP2 (DAB classique) pour `eti2pcm` | [mpg123.de](https://mpg123.de) |
 
 > **Note :** Le pilote RTL-SDR est géré par la crate Rust [`rtl-sdr-rs`](https://github.com/ccostes/rtl-sdr-rs), un port pur Rust de la bibliothèque Osmocom. Aucun CMake, `bindgen` ni `libclang` n'est requis. Seule `libusb-1.0` doit être installée sur le système.
@@ -117,6 +131,23 @@ Ouvrir le projet :
 
 ## 🔨 Compilation & Tests
 
+### Décodeur AAC : faad2 (défaut) vs fdk-aac (optionnel)
+
+La sélection du backend AAC est inspirée de l'option `USE_FDKAAC` de [AbracaDABra](https://github.com/KejPi/AbracaDABra) (KejPi, MIT licence), adaptée en Cargo feature.
+
+| Feature | Backend | Librairie système |
+|---|---|---|
+| *(aucune)* | faad2 (défaut) | `libfaad-dev` |
+| `fdk-aac` | Fraunhofer FDK AAC | `libfdk-aac-dev` |
+
+```bash
+# faad2 (défaut) — aucune option requise
+cargo build --release
+
+# fdk-aac (optionnel)
+cargo build --release --features fdk-aac
+```
+
 ### Compilation
 
 ```bash
@@ -124,7 +155,7 @@ cargo build              # debug
 cargo build --release    # optimisé
 ```
 
-Le `build.rs` ne contient que les directives de linkage pour `libfaad2` et `libmpg123`. Le pilote RTL-SDR est intégralement géré par la crate `rtl-sdr-rs` via `rusb` (pas de CMake, pas de C compilé).
+Le `build.rs` ne contient que les directives de linkage pour le décodeur AAC et `libmpg123`. Le pilote RTL-SDR est intégralement géré par la crate `rtl-sdr-rs` via `rusb` (pas de CMake, pas de C compilé).
 
 ### Tests unitaires
 
@@ -255,6 +286,7 @@ dabctl [OPTIONS]
 | `--slide-base64` | | Sortir les slides en base64 JSON sur fd 3 | off |
 | `--silent` | | Mode silencieux (pas de log stderr) | off |
 | `--device-index` | | Index dongle RTL-SDR | `0` |
+| `--aac-decoder` | | Backend AAC : `faad2` ou `fdk-aac` (feature `fdk-aac` requise) | `fdk-aac` |
 
 **Sortie audio :** PCM signé 16-bit little-endian, stéréo, 48 kHz sur stdout.
 

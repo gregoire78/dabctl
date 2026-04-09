@@ -21,6 +21,11 @@ encoding_rs = "0.8.35"
 rtl-sdr-rs = "0.3"
 smallvec = { version = "1", features = ["union"] }
 
+[features]
+# Enable the Fraunhofer fdk-aac decoder instead of the default faad2.
+# Install libfdk-aac-dev and build with: cargo build --features fdk-aac
+fdk-aac = []
+
 [build-dependencies]
 
 [[bin]]

@@ -1,26 +1,23 @@
 .\" Man page for dabctl
 .\" Copyright (C) 2025 — GPL-2.0
-.TH DABCTL 1 "2026-04-07" "0.6.0" "DAB Radio Tools"
+.TH DABCTL 1 "2026-04-09" "0.1.0" "DAB Radio Tools"
 .SH NAME
-dabctl \- receive DAB radio via RTL-SDR and decode to PCM audio
+dabctl \- receive DAB+ radio via RTL-SDR and decode to PCM audio
 .SH SYNOPSIS
-.B dabctl iq2pcm
-.RB [ \-C
-.IR channel ]
+.B dabctl
+.B \-C
+.I channel
+.B \-s
+.I sid
 .RB [ \-G
-.IR gain ]
+.IR percent ]
+.RB [ \-\-hardware\-agc ]
 .RB [ \-p
 .IR ppm ]
-.RB [ \-Q ]
 .RB [ \-d
 .IR seconds ]
 .RB [ \-D
 .IR seconds ]
-.RB [ \-s
-.IR sid ]
-.RB [ \-l
-.IR label ]
-.RB [ \-1 ]
 .RB [ \-F ]
 .RB [ \-S
 .IR dir ]
@@ -28,219 +25,114 @@ dabctl \- receive DAB radio via RTL-SDR and decode to PCM audio
 .RB [ \-\-silent ]
 .RB [ \-\-device\-index
 .IR n ]
-.PP
-.B dabctl iq2eti
-.RB [ \-C
-.IR channel ]
-.RB [ \-G
-.IR gain ]
-.RB [ \-p
-.IR ppm ]
-.RB [ \-Q ]
-.RB [ \-d
-.IR seconds ]
-.RB [ \-D
-.IR seconds ]
-.RB [ \-O
-.IR file ]
-.RB [ \-t
-.IR seconds ]
-.RB [ \-S ]
-.RB [ \-\-device\-index
-.IR n ]
-.PP
-.B eti\-rtlsdr\-rust eti2pcm
-.RB [ \-s
-.IR sid ]
-.RB [ \-l
-.IR label ]
-.RB [ \-1 ]
-.RB [ \-p ]
-.RB [ \-F ]
-.RB [ \-S
-.IR dir ]
-.RB [ \-\-slide\-base64 ]
-.RI [ file ]
 .SH DESCRIPTION
 .B dabctl
-provides three subcommands for DAB (Digital Audio Broadcasting) processing:
-.SS iq2pcm
-Receives DAB signals from an RTL-SDR dongle, demodulates the OFDM signal,
-decodes the FIC (Fast Information Channel) and the selected audio service,
-and writes PCM audio directly to stdout.
-This is a single\-process pipeline: no ETI serialisation takes place,
-reducing latency and memory usage compared to the
-.I iq2eti | eti2pcm
-pipeline.
-.SS iq2eti
-Receives DAB signals from an RTL-SDR dongle, demodulates the OFDM signal,
-decodes the FIC (Fast Information Channel), and outputs ETI-NI frames
-(6144 bytes each) on stdout or to a file.
-This is a faithful port of
-.I eti\-cmdline
-(C++) to Rust.
-.SS eti2pcm
-Reads ETI frames from stdin or a file, selects an audio service (DAB or DAB+),
-decodes it to PCM audio written to stdout. Optionally outputs DAB metadata
-(ensemble info, service info, Dynamic Label) as JSON on file descriptor 3.
-This is a port of
-.I dablin
-(C++) to Rust.
+receives a DAB+ (Digital Audio Broadcasting) signal from an RTL-SDR dongle,
+demodulates the OFDM signal, decodes the FIC (Fast Information Channel) to
+discover services, and decodes the selected DAB+ (HE-AAC) audio service,
+writing raw PCM audio to stdout.
+.PP
+This is a direct RTL-SDR \(-> PCM pipeline implemented in a single process:
+no intermediate ETI (Ensemble Transport Interface) serialisation takes place,
+reducing latency and memory usage.
+.PP
+Only DAB+ services (HE-AAC audio coding) are supported.
+Plain DAB services (MPEG-1 Layer II / MP2) are not decoded.
+.PP
+When file descriptor 3 is open, DAB metadata (ensemble name, service name,
+Dynamic Label, and optionally slideshow images) is written as JSON lines to
+that descriptor.
 .SH OPTIONS
-.SS iq2pcm options
-All options from both
-.B iq2eti
-and
-.B eti2pcm
-are available in a single invocation.
 .TP
 .BR \-C ", " \-\-channel " " \fIchannel\fR
 DAB channel to tune to (e.g., 5A, 6C, 11C).
-Default:
-.BR 11C .
+Band III channels (5A\-13F, 174\-240 MHz) are supported.
+This option is required.
+.TP
+.BR \-s ", " \-\-sid " " \fIsid\fR
+Service ID in hexadecimal. Selects the DAB+ audio service to decode.
+Both
+.B 0xF2F8
+and
+.B F2F8
+forms are accepted.
+This option is required.
 .TP
 .BR \-G ", " \-\-gain " " \fIpercent\fR
 Tuner gain as a percentage from 0 to 100.
-Default:
-.BR 50 .
+Mutually exclusive with
+.BR \-\-hardware\-agc .
+If neither
+.B \-G
+nor
+.B \-\-hardware\-agc
+is specified, software AGC (SAGC) is used.
+.TP
+.B \-\-hardware\-agc
+Enable the RTL-SDR chip's built-in hardware AGC.
+Mutually exclusive with
+.BR \-G .
+If neither option is given, software AGC (SAGC) is used by default.
 .TP
 .BR \-p ", " \-\-ppm " " \fIppm\fR
 Frequency correction in parts per million.
 Default:
 .BR 0 .
 .TP
-.BR \-Q ", " \-\-autogain
-Enable automatic gain control (AGC). Overrides
-.BR \-G .
-.TP
 .BR \-d ", " \-\-sync\-time " " \fIseconds\fR
-Timeout for time synchronization.
+Timeout in seconds for OFDM time synchronisation (null symbol detection).
+If no DAB signal is detected within this period, the process exits with
+status 1.
 Default:
 .BR 5 .
 .TP
 .BR \-D ", " \-\-detect\-time " " \fIseconds\fR
-Timeout for ensemble detection.
+Timeout in seconds for ensemble detection (FIC decoding).
 Default:
 .BR 10 .
 .TP
-.BR \-s ", " \-\-sid " " \fIsid\fR
-Service ID in hexadecimal (e.g., 0xF2F8). Selects the audio service to decode.
-.TP
-.BR \-l ", " \-\-label " " \fIlabel\fR
-Select service by label name.
-.TP
-.BR \-1 ", " \-\-first
-Play the first audio service found in the ensemble.
-.TP
 .BR \-F ", " \-\-disable\-dyn\-fic
-Disable dynamic FIC messages on stderr.
+Disable dynamic FIC status messages on stderr.
 .TP
 .BR \-S ", " \-\-slide\-dir " " \fIdir\fR
-Save slideshow images to the specified directory.
+Save MOT slideshow images (JPEG/PNG) to the specified directory.
+The directory is created automatically if it does not exist.
+Files are named using the MOT ContentName field, or a generated name if none
+is provided.
 .TP
-.BR \-\-slide\-base64
+.B \-\-slide\-base64
 Output slideshow images as base64\-encoded JSON on file descriptor 3.
+Each image is written when a complete MOT (Multimedia Object Transfer) object
+has been reassembled.
+Requires fd 3 to be open.
 .TP
-.BR \-\-silent
+.B \-\-silent
 Suppress all log output on stderr.
 .TP
 .BI \-\-device\-index " n"
-RTL-SDR device index.
-Default:
-.BR 0 .
-.SS iq2eti options
-.TP
-.BR \-C ", " \-\-channel " " \fIchannel\fR
-DAB channel to tune to. Examples: 5A, 6C, 11C, 12C.
-Band III channels (5A\-13F, 174\-240 MHz) and L-Band channels (LA\-LP, 1452\-1478 MHz) are supported.
-Default:
-.BR 11C .
-.TP
-.BR \-G ", " \-\-gain " " \fIpercent\fR
-Tuner gain as a percentage from 0 to 100.
-Default:
-.BR 50 .
-.TP
-.BR \-p ", " \-\-ppm " " \fIppm\fR
-Frequency correction in parts per million.
+RTL-SDR device index, for systems with more than one dongle.
 Default:
 .BR 0 .
 .TP
-.BR \-Q ", " \-\-autogain
-Enable automatic gain control (AGC). Overrides
-.BR \-G .
-.TP
-.BR \-d ", " \-\-sync\-time " " \fIseconds\fR
-Timeout for time synchronization (null symbol detection).
-Default:
-.BR 5 .
-.TP
-.BR \-D ", " \-\-detect\-time " " \fIseconds\fR
-Timeout for ensemble detection (FIC decoding).
-Default:
-.BR 10 .
-.TP
-.BR \-O ", " \-\-output " " \fIfile\fR
-Output file path. Use
-.B \-
-for stdout.
-Default: stdout.
-.TP
-.BR \-t ", " \-\-record\-time " " \fIseconds\fR
-Recording duration.
-.B \-1
-means indefinite.
-Default:
-.BR \-1 .
-.TP
-.BR \-S ", " \-\-silent
-Suppress status messages on stderr.
-.TP
-.BI \-\-device\-index " n"
-RTL-SDR device index.
-Default:
-.BR 0 .
-.SS eti2pcm options
-.TP
-.BR \-s ", " \-\-sid " " \fIsid\fR
-Service ID in hexadecimal (e.g., 0xF2F8 or F2F8). Selects the audio service to decode.
-.TP
-.BR \-l ", " \-\-label " " \fIlabel\fR
-Select service by label name (case-sensitive match).
-.TP
-.BR \-1 ", " \-\-first
-Play the first audio service found in the ensemble.
-.TP
-.BR \-p ", " \-\-pcm
-Enable PCM output on stdout. Signed 16-bit little-endian, stereo.
-Sample rate is typically 48000 Hz (or 32000 Hz for some DAB+ services).
-.TP
-.BR \-F ", " \-\-disable\-dyn\-fic
-Disable dynamic FIC messages on stderr.
-.TP
-.BR \-S ", " \-\-slide\-dir " " \fIdir\fR
-Save slideshow images (JPEG/PNG) to the specified directory.
-The directory is created automatically if it does not exist.
-Files are named using the MOT ContentName field or a default name.
-.TP
-.BR \-\-slide\-base64
-Output slideshow images as base64-encoded JSON on file descriptor 3.
-Each slide is written as a JSON object (see
-.B JSON METADATA
-below).
-.TP
-.I file
-ETI input file. If omitted, reads from stdin.
+.BI \-\-aac\-decoder " backend"
+AAC decoder backend to use.
+Accepted values:
+.B faad2
+(default) or
+.BR fdk\-aac .
+Only available when the binary is built with the
+.B fdk\-aac
+Cargo feature.
 .SH EXIT STATUS
 .TP
 .B 0
-Normal termination (Ctrl-C or record time reached).
+Normal termination (Ctrl-C).
 .TP
 .B 1
-No DAB signal found within sync timeout.
+No DAB signal found within the sync timeout.
 .TP
 .B 3
-RTL-SDR device initialization failed.
+RTL-SDR device initialisation failed.
 .TP
 .B 4
 Invalid channel name.
@@ -249,157 +141,95 @@ Invalid channel name.
 Failed to start RTL-SDR reader.
 .SH EXAMPLES
 .PP
-.B Direct RTL-SDR to PCM (single process):
+.B Decode service 0xF2F8 on channel 6C with manual gain:
 .RS
 .nf
-dabctl iq2pcm \-C 6C \-G 20 \-s 0xF2F8 \\
+dabctl \-C 6C \-G 20 \-s 0xF2F8 \\
   | ffplay \-f s16le \-ar 48000 \-ac 2 \-nodisp \-i \-
 .fi
 .RE
 .PP
-.B Direct with JSON metadata on fd 3:
+.B Software AGC (default, omit \-G and \-\-hardware\-agc):
 .RS
 .nf
-dabctl iq2pcm \-C 6C \-G 20 \-s 0xF2F8 \-\-slide\-base64 3>meta.json \\
+dabctl \-C 11C \-s 0xF2F8 \\
+  | aplay \-f S16_LE \-r 48000 \-c 2
+.fi
+.RE
+.PP
+.B Hardware AGC:
+.RS
+.nf
+dabctl \-C 6C \-\-hardware\-agc \-s 0xF2F8 \\
   | ffplay \-f s16le \-ar 48000 \-ac 2 \-nodisp \-i \-
 .fi
 .RE
 .PP
-.B Direct, play first service with AGC:
+.B With JSON metadata on fd 3:
 .RS
 .nf
-dabctl iq2pcm \-C 11C \-Q \-1 | aplay \-f S16_LE \-r 48000 \-c 2
-.fi
-.RE
-.PP
-.B Full pipeline \(em RTL-SDR to audio:
-.RS
-.nf
-dabctl iq2eti \-S \-C 6C \-G 20 \\
-  | dabctl eti2pcm \-F \-s 0xF2F8 \-p \\
+dabctl \-C 6C \-G 20 \-s 0xF2F8 \-\-slide\-base64 3>meta.json \\
   | ffplay \-f s16le \-ar 48000 \-ac 2 \-nodisp \-i \-
 .fi
 .RE
 .PP
-.B Pipeline with JSON metadata on fd 3:
+.B Save slideshow images while decoding audio:
 .RS
 .nf
-dabctl iq2eti \-S \-C 6C \-G 20 \\
-  | dabctl eti2pcm \-F \-s 0xF2F8 \-p 3>metadata.json \\
+dabctl \-C 6C \-G 20 \-s 0xF2F8 \-S /tmp/slides \\
   | ffplay \-f s16le \-ar 48000 \-ac 2 \-nodisp \-i \-
 .fi
 .RE
 .PP
-.B Save ETI to a file:
+.B Convert to WAV:
 .RS
 .nf
-dabctl iq2eti \-C 6C \-G 20 \-O capture.eti
-.fi
-.RE
-.PP
-.B Decode an ETI file to PCM:
-.RS
-.nf
-dabctl eti2pcm \-s 0xF2F8 \-p capture.eti > output.raw
-ffplay \-f s16le \-ar 48000 \-ac 2 output.raw
-.fi
-.RE
-.PP
-.B Convert to WAV (iq2pcm):
-.RS
-.nf
-dabctl iq2pcm \-C 6C \-G 20 \-s 0xF2F8 \\
+dabctl \-C 6C \-G 20 \-s 0xF2F8 \\
   | sox \-t raw \-r 48000 \-b 16 \-c 2 \-e signed\-integer \-L \- output.wav
 .fi
 .RE
+.SH JSON METADATA
+When file descriptor 3 is open,
+.B dabctl
+writes DAB metadata as JSON lines (one JSON object per line) to that descriptor.
 .PP
-.B Record 60 seconds of ETI:
+.B Ensemble information (written once, when the ensemble label is decoded):
 .RS
 .nf
-dabctl iq2eti \-C 5A \-G 70 \-t 60 \-O capture.eti
+{"ensemble":{"label":"My Ensemble","shortLabel":"MyEns","eid":"0x1001"}}
 .fi
 .RE
 .PP
-.B Play first service from stdin:
+.B Selected service (written once, when the service label is decoded):
 .RS
 .nf
-dabctl eti2pcm \-1 \-p < capture.eti | aplay \-f S16_LE \-r 48000 \-c 2
+{"service":{"label":"NRJ","shortLabel":"NRJ","sid":"0xF2F8"}}
 .fi
 .RE
 .PP
-.B Save slideshow images:
+.B Dynamic Label Segment — DLS (written each time the text changes):
 .RS
 .nf
-dabctl iq2pcm \-C 6C \-G 20 \-s 0xF2F8 \-S /tmp/slides \\
-  | ffplay \-f s16le \-ar 48000 \-ac 2 \-nodisp \-i \-
+{"dl":"Now playing: Song Title \- Artist"}
 .fi
 .RE
 .PP
-.B Pipe to dablin (compatibility):
-.RS
-.nf
-dabctl iq2eti \-S \-C 6C \-G 20 | dablin \-s 0xF2F8
-.fi
-.RE
-.SH ETI FORMAT
-Each ETI-NI frame is exactly 6144 bytes and contains:
-.TP
-.B SYNC (4 bytes)
-Frame synchronization word.
-.TP
-.B LIDATA
-FIC data (96 bytes of FIB) followed by MSC subchannel data.
-.TP
-.B EOF (4 bytes)
-CRC-16 and padding.
-.TP
-.B TIST (4 bytes)
-Timestamp (set to 0xFFFFFFFF).
-.TP
-.B Padding
-Remaining bytes filled with 0x55.
-.PP
-At 24 frames per second, the ETI bitrate is approximately 1.2 Mbit/s.
-.SH JSON METADATA (eti2pcm)
-When file descriptor 3 is open, the
-.B eti2pcm
-subcommand writes DAB metadata as JSON lines (one JSON object per line):
-.PP
-.B Ensemble information:
-.RS
-.nf
-{"ensemble":{"eid":"0x1234","label":"My Ensemble"}}
-.fi
-.RE
-.PP
-.B Selected service:
-.RS
-.nf
-{"service":{"sid":"0xF2F8","label":"NRJ"}}
-.fi
-.RE
-.PP
-.B Dynamic Label (DLS):
-.RS
-.nf
-{"dl":"Now playing: Song Title - Artist"}
-.fi
-.RE
-.PP
-.B Slideshow (with \-\-slide\-base64):
+.B Slideshow image (written when a complete MOT object is received):
 .RS
 .nf
 {"slide":{"contentName":"logo.jpg","contentType":"image/jpeg","data":"base64..."}}
 .fi
 .RE
 .PP
-Slideshow JSON is only emitted when
+Slideshow JSON lines are only emitted when
 .B \-\-slide\-base64
 is passed.
-.PP
-This format is compatible with
-.I dablin
-(gregoire fork) fd 3 output.
+Open fd 3 with a shell redirect:
+.RS
+.nf
+dabctl \-C 6C \-s 0xF2F8 3>/tmp/meta.json | ...
+.fi
+.RE
 .SH DAB CHANNELS (BAND III)
 .TS
 l l l l.
@@ -427,19 +257,25 @@ Must include the directory containing
 .I librtlsdr.so.0
 (built by cargo in
 .IR target/*/build/*/out/rtlsdr-build/src ).
-The helper script
-.B eti\-rtlsdr\-rust.sh
+The wrapper script
+.B dabctl.sh
 sets this automatically.
+.TP
+.B RUST_LOG
+Controls log verbosity (e.g.,
+.BR debug ", " info ", " warn ).
+The default level is
+.BR info .
 .SH FILES
 .TP
 .I dabctl.sh
-Shell wrapper that sets LD_LIBRARY_PATH and runs the binary.
+Shell wrapper that sets
+.B LD_LIBRARY_PATH
+and runs
+.BR dabctl .
 .TP
-.I live\-capture.sh
-Full live\-capture script (iq2eti | eti2pcm, saves WAV + metadata + slides).
-.TP
-.I test\-capture.sh
-Automated functional test script.
+.I live\-capture\-iq2pcm.sh
+Live capture script: decodes audio and saves WAV, JSON metadata, and slideshow images.
 .SH HARDWARE
 Requires an RTL-SDR dongle (RTL2832U chipset with R820T/R820T2 tuner)
 and a DAB antenna for Band III reception (174\-240 MHz).
