@@ -37,6 +37,16 @@ const DOC_C: f32 = 0.05;
 /// Prevents stale IQ data from before `reset_buffer()` contaminating the OFDM sync.
 /// Mirrors AbracaDABra's `RTLSDR_RESTART_COUNTER`.
 const SAGC_STARTUP_DISCARD: u32 = 2;
+/// Minimum number of SAGC evaluation ticks that must elapse after a gain change
+/// before the next change is allowed.  Each tick is `SAGC_CHECK_INTERVAL` read
+/// buffers, so the freeze lasts `SAGC_HOLD_BUFFERS × SAGC_CHECK_INTERVAL × 4096`
+/// IQ samples ≈ 8 × 4 × 4096 / 2_048_000 s ≈ 64 ms.
+///
+/// This prevents the control loop from oscillating between adjacent gain steps
+/// when the signal sits near a threshold — a pathological case observed at
+/// SNR ≈ 8–14 dB where the gain toggles 15-20 times per second and breaks
+/// DAB+ superframe synchronisation.
+const SAGC_HOLD_BUFFERS: u32 = 8;
 
 /// Select the closest gain value from `gains` (sorted list in tenths of dB)
 /// given a percentage `gain_pct` in `0..=100`.
@@ -280,6 +290,9 @@ impl RtlsdrHandler {
             let mut agc_level_min = level_min_factors[gain_idx] * SAGC_LEVEL_MAX;
             // Counter: gain is re-evaluated every SAGC_CHECK_INTERVAL read buffers.
             let mut agc_read_cntr: u32 = 0;
+            // Hold-off counter: decremented at each SAGC evaluation tick.
+            // When > 0, gain adjustments are suspended to prevent oscillation.
+            let mut agc_hold_cntr: u32 = 0;
 
             // ── DOC state ─────────────────────────────────────────────────────
             // DC Offset Correction: independent IIR estimators for I and Q.
@@ -296,58 +309,87 @@ impl RtlsdrHandler {
             // Mirrors AbracaDABra's `m_captureStartCntr`.
             let mut startup_discard = SAGC_STARTUP_DISCARD;
 
+            // Pre-allocated scratch buffer: holds the normalised f32 samples computed
+            // outside the FIFO lock so the OFDM consumer is never blocked during the
+            // SAGC + DOC arithmetic (one entry per raw byte).
+            let mut sample_buf = vec![0.0f32; READLEN_DEFAULT];
             let mut raw = [0u8; READLEN_DEFAULT];
+            // Accumulation cursor for partial reads.
+            //
+            // USB bulk transfers on native hardware always return exactly READLEN_DEFAULT
+            // bytes.  When the device is forwarded via usbipd (USB over TCP), read_sync
+            // may return fewer bytes per call due to TCP segmentation.  We accumulate
+            // chunks into `raw` until the full READLEN_DEFAULT bytes are available before
+            // processing — avoiding the silent data loss that occurred when short reads
+            // were discarded.
+            let mut fill_pos: usize = 0;
             loop {
                 if !running.load(Ordering::SeqCst) {
                     break;
                 }
-                match sdr.read_sync(&mut raw) {
-                    Ok(n) if n == READLEN_DEFAULT => {
+                match sdr.read_sync(&mut raw[fill_pos..]) {
+                    Ok(0) => {
+                        tracing::warn!("read_sync returned 0 bytes; retrying");
+                    }
+                    Ok(n) => {
+                        fill_pos += n;
+                        if fill_pos < READLEN_DEFAULT {
+                            // Partial read — accumulate further chunks before processing.
+                            continue;
+                        }
+                        // Full buffer ready; reset cursor for the next cycle.
+                        fill_pos = 0;
+
                         if startup_discard > 0 {
                             startup_discard -= 1;
                             continue;
                         }
 
-                        let n_pairs = n / 2;
+                        let n_pairs = READLEN_DEFAULT / 2;
 
-                        // ── Combined pass: SAGC + DOC accumulation + push ─────
-                        // Raw bytes are interleaved as I₀Q₀I₁Q₁…; each offset
-                        // by 128 (unsigned → signed).
+                        // ── Phase 1: SAGC + DOC accumulation, WITHOUT holding the FIFO lock ──
                         //
-                        // SAGC operates on |byte − 128| for ALL samples (I and Q
-                        // mixed), matching AbracaDABra's per-byte loop.
+                        // Raw bytes are interleaved as I₀Q₀I₁Q₁…; each offset by 128
+                        // (unsigned → signed). SAGC operates on |byte − 128| for all
+                        // samples (I and Q mixed), matching AbracaDABra's per-byte loop.
+                        // DOC applies the estimate from the PREVIOUS buffer (1-buffer lag).
                         //
-                        // DOC applies the DC estimate from the PREVIOUS buffer
-                        // (1-buffer lag), then updates the estimate from this
-                        // buffer's mean, matching AbracaDABra's end-of-block IIR.
+                        // Decoupling the arithmetic from the mutex eliminates the contention
+                        // window during which the OFDM consumer thread was blocked on
+                        // get_samples() waiting for the same lock.
                         let mut sum_i = 0.0f32;
                         let mut sum_q = 0.0f32;
+                        for k in 0..n_pairs {
+                            let i_raw = raw[2 * k] as f32 - 128.0;
+                            let q_raw = raw[2 * k + 1] as f32 - 128.0;
+
+                            // SAGC — absolute amplitude, operates before DOC
+                            if sagc_enabled {
+                                for &abs_val in &[i_raw.abs(), q_raw.abs()] {
+                                    let c = if abs_val > agc_level {
+                                        SAGC_CATT
+                                    } else {
+                                        SAGC_CREL
+                                    };
+                                    agc_level += c * (abs_val - agc_level);
+                                }
+                            }
+
+                            // DOC accumulation (±128 scale)
+                            sum_i += i_raw;
+                            sum_q += q_raw;
+
+                            // Store DC-corrected, normalised sample pair in local scratch
+                            sample_buf[2 * k] = (i_raw - dc_i) / 128.0;
+                            sample_buf[2 * k + 1] = (q_raw - dc_q) / 128.0;
+                        }
+
+                        // ── Phase 2: single lock acquisition for a bulk push ──────────────
+                        // The OFDM consumer is only blocked during this short extend(), not
+                        // during the heavier arithmetic above.
                         {
                             let mut guard = fifo.buf.lock().unwrap();
-                            for k in 0..n_pairs {
-                                let i_raw = raw[2 * k] as f32 - 128.0;
-                                let q_raw = raw[2 * k + 1] as f32 - 128.0;
-
-                                // SAGC — absolute amplitude, operates before DOC
-                                if sagc_enabled {
-                                    for &abs_val in &[i_raw.abs(), q_raw.abs()] {
-                                        let c = if abs_val > agc_level {
-                                            SAGC_CATT
-                                        } else {
-                                            SAGC_CREL
-                                        };
-                                        agc_level += c * (abs_val - agc_level);
-                                    }
-                                }
-
-                                // DOC accumulation (±128 scale)
-                                sum_i += i_raw;
-                                sum_q += q_raw;
-
-                                // Push DC-corrected, normalised sample pair
-                                guard.push_back((i_raw - dc_i) / 128.0);
-                                guard.push_back((q_raw - dc_q) / 128.0);
-                            }
+                            guard.extend(sample_buf[..2 * n_pairs].iter().copied());
                         }
                         fifo.data_ready.notify_all();
 
@@ -359,10 +401,15 @@ impl RtlsdrHandler {
                         // ── SAGC gain evaluation ──────────────────────────────
                         agc_read_cntr = agc_read_cntr.wrapping_add(1);
                         if sagc_enabled && agc_read_cntr.is_multiple_of(SAGC_CHECK_INTERVAL) {
-                            if agc_level < agc_level_min && gain_idx + 1 < gains.len() {
+                            if agc_hold_cntr > 0 {
+                                // Still in hold-off period after the last gain change.
+                                // Decrement and skip any adjustment this tick.
+                                agc_hold_cntr -= 1;
+                            } else if agc_level < agc_level_min && gain_idx + 1 < gains.len() {
                                 // Signal too weak — increase gain by one step.
                                 gain_idx += 1;
                                 agc_level_min = level_min_factors[gain_idx] * SAGC_LEVEL_MAX;
+                                agc_hold_cntr = SAGC_HOLD_BUFFERS;
                                 if let Err(e) =
                                     sdr.set_tuner_gain(TunerGain::Manual(gains[gain_idx]))
                                 {
@@ -378,6 +425,7 @@ impl RtlsdrHandler {
                                 // Signal too strong — decrease gain by one step.
                                 gain_idx -= 1;
                                 agc_level_min = level_min_factors[gain_idx] * SAGC_LEVEL_MAX;
+                                agc_hold_cntr = SAGC_HOLD_BUFFERS;
                                 if let Err(e) =
                                     sdr.set_tuner_gain(TunerGain::Manual(gains[gain_idx]))
                                 {
@@ -391,9 +439,6 @@ impl RtlsdrHandler {
                                 }
                             }
                         }
-                    }
-                    Ok(n) => {
-                        tracing::debug!("Short read: {} bytes (discarded)", n);
                     }
                     Err(e) => {
                         tracing::error!("read_sync error: {}", e);
@@ -652,5 +697,91 @@ mod tests {
         let expected = 100.0 * (1.0 - SAGC_CREL).powi(1_000);
         assert!((level - expected).abs() < 1e-2);
         assert!(level > 90.0, "expected slow release, got level {level:.2}");
+    }
+
+    // ── SAGC: hold-off counter behaviour ─────────────────────────────────────
+
+    #[test]
+    fn sagc_hold_off_blocks_adjustment_immediately_after_gain_change() {
+        // Simulate the hold-off logic: after a gain change, agc_hold_cntr is set
+        // to SAGC_HOLD_BUFFERS and the next SAGC_HOLD_BUFFERS ticks must not
+        // trigger another change.
+        let gains = vec![0i32, 90, 140, 270, 370];
+        let level_min_factors = compute_level_min_factors(&gains);
+        let mut gain_idx: usize = 2; // start in the middle
+        let mut agc_level_min = level_min_factors[gain_idx] * SAGC_LEVEL_MAX;
+        let mut agc_hold_cntr: u32 = 0;
+
+        // Trigger a gain-up: level below minimum
+        let weak_level = agc_level_min * 0.5;
+        if agc_hold_cntr > 0 {
+            agc_hold_cntr -= 1;
+        } else if weak_level < agc_level_min && gain_idx + 1 < gains.len() {
+            gain_idx += 1;
+            agc_level_min = level_min_factors[gain_idx] * SAGC_LEVEL_MAX;
+            agc_hold_cntr = SAGC_HOLD_BUFFERS;
+        }
+        assert_eq!(gain_idx, 3, "gain should have stepped up");
+        assert_eq!(agc_hold_cntr, SAGC_HOLD_BUFFERS);
+
+        // For the next SAGC_HOLD_BUFFERS ticks the gain must not change, even with
+        // a level that would normally trigger another step.
+        let initial_gain_idx = gain_idx;
+        for _ in 0..SAGC_HOLD_BUFFERS {
+            if agc_hold_cntr > 0 {
+                agc_hold_cntr -= 1;
+            } else if weak_level < agc_level_min && gain_idx + 1 < gains.len() {
+                gain_idx += 1;
+                agc_level_min = level_min_factors[gain_idx] * SAGC_LEVEL_MAX;
+                agc_hold_cntr = SAGC_HOLD_BUFFERS;
+            }
+        }
+        assert_eq!(
+            gain_idx, initial_gain_idx,
+            "gain must not change during hold-off"
+        );
+        assert_eq!(agc_hold_cntr, 0, "hold-off counter must reach zero");
+    }
+
+    #[test]
+    fn sagc_hold_off_allows_adjustment_after_expiry() {
+        // After the hold-off expires (counter reaches 0), a further weak-signal
+        // condition must be allowed to step the gain up again.
+        let gains = vec![0i32, 90, 140, 270, 370];
+        let level_min_factors = compute_level_min_factors(&gains);
+        let mut gain_idx: usize = 1;
+        let mut agc_level_min = level_min_factors[gain_idx] * SAGC_LEVEL_MAX;
+        let mut agc_hold_cntr: u32 = 0;
+
+        // First gain step + hold-off arm
+        let weak_level = agc_level_min * 0.5;
+        if agc_hold_cntr > 0 {
+            agc_hold_cntr -= 1;
+        } else if weak_level < agc_level_min && gain_idx + 1 < gains.len() {
+            gain_idx += 1;
+            agc_level_min = level_min_factors[gain_idx] * SAGC_LEVEL_MAX;
+            agc_hold_cntr = SAGC_HOLD_BUFFERS;
+        }
+        assert_eq!(gain_idx, 2);
+
+        // Drain hold-off
+        for _ in 0..SAGC_HOLD_BUFFERS {
+            if agc_hold_cntr > 0 {
+                agc_hold_cntr -= 1;
+            }
+        }
+        assert_eq!(agc_hold_cntr, 0);
+
+        // After expiry, another weak-signal tick must step the gain again
+        let weak_level2 = agc_level_min * 0.5;
+        if agc_hold_cntr > 0 {
+            agc_hold_cntr -= 1;
+        } else if weak_level2 < agc_level_min && gain_idx + 1 < gains.len() {
+            gain_idx += 1;
+            let _ = level_min_factors[gain_idx] * SAGC_LEVEL_MAX; // threshold updated in production code
+            agc_hold_cntr = SAGC_HOLD_BUFFERS;
+        }
+        assert_eq!(gain_idx, 3, "gain must step up again after hold-off expiry");
+        assert_eq!(agc_hold_cntr, SAGC_HOLD_BUFFERS);
     }
 }

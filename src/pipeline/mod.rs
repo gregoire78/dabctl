@@ -3,7 +3,7 @@ pub mod cif_interleaver;
 pub mod dab_constants;
 pub mod dab_frame;
 pub mod dab_params;
-pub mod eti_generator;
+pub mod dab_pipeline;
 pub mod fib_processor;
 pub mod fic_handler;
 pub mod ofdm;
