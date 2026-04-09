@@ -35,7 +35,6 @@ pub struct OfdmProcessor {
     coarse_corrector: i32,
     f2_correction: bool,
     s_level: f32,
-    buffer_content: i32,
     running: Arc<AtomicBool>,
     // Callbacks
     sync_signal: Option<Box<dyn Fn(bool) + Send>>,
@@ -91,7 +90,6 @@ impl OfdmProcessor {
             coarse_corrector: 0,
             f2_correction: true,
             s_level: 0.0,
-            buffer_content: 0,
             running,
             sync_signal: None,
             show_snr: None,
@@ -132,19 +130,10 @@ impl OfdmProcessor {
             return Err(ProcessorError::Stopped);
         }
 
-        while self.buffer_content == 0 {
-            if !self.running.load(Ordering::Relaxed) {
-                return Err(ProcessorError::Stopped);
-            }
-            self.buffer_content = device.samples() as i32;
-            if self.buffer_content == 0 {
-                std::thread::sleep(std::time::Duration::from_micros(1000));
-            }
-        }
-
         let mut temp = [Complex32::new(0.0, 0.0)];
-        device.get_samples(&mut temp);
-        self.buffer_content -= 1;
+        if device.get_samples(&mut temp) == 0 {
+            return Err(ProcessorError::Stopped);
+        }
 
         // Apply frequency correction via NCO
         let delta = -2.0 * std::f32::consts::PI * phase as f32 / INPUT_RATE as f32;
@@ -168,23 +157,13 @@ impl OfdmProcessor {
         v: &mut [Complex32],
         phase: i32,
     ) -> Result<(), ProcessorError> {
-        let n = v.len() as i32;
         if !self.running.load(Ordering::Relaxed) {
             return Err(ProcessorError::Stopped);
         }
 
-        while self.buffer_content < n {
-            if !self.running.load(Ordering::Relaxed) {
-                return Err(ProcessorError::Stopped);
-            }
-            self.buffer_content = device.samples() as i32;
-            if self.buffer_content < n {
-                std::thread::sleep(std::time::Duration::from_micros(1000));
-            }
+        if device.get_samples(v) < v.len() {
+            return Err(ProcessorError::Stopped);
         }
-
-        device.get_samples(v);
-        self.buffer_content -= n;
 
         let delta = -2.0 * std::f32::consts::PI * phase as f32 / INPUT_RATE as f32;
         for sample in v.iter_mut() {
