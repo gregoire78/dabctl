@@ -39,14 +39,19 @@ const DOC_C: f32 = 0.05;
 const SAGC_STARTUP_DISCARD: u32 = 2;
 /// Minimum number of SAGC evaluation ticks that must elapse after a gain change
 /// before the next change is allowed.  Each tick is `SAGC_CHECK_INTERVAL` read
-/// buffers, so the freeze lasts `SAGC_HOLD_BUFFERS × SAGC_CHECK_INTERVAL × 4096`
-/// IQ samples ≈ 8 × 4 × 4096 / 2_048_000 s ≈ 64 ms.
-///
-/// This prevents the control loop from oscillating between adjacent gain steps
-/// when the signal sits near a threshold — a pathological case observed at
-/// SNR ≈ 8–14 dB where the gain toggles 15-20 times per second and breaks
-/// DAB+ superframe synchronisation.
+/// buffers, so the freeze lasts `SAGC_HOLD_BUFFERS × SAGC_CHECK_INTERVAL × 8192`
+/// IQ samples ≈ 8 × 4 × 8192 / 2_048_000 s ≈ 128 ms.
 const SAGC_HOLD_BUFFERS: u32 = 8;
+/// Number of consecutive direction reversals (↑↓ or ↓↑ pairs) that trigger the
+/// hunting suppressor.  A value of 3 means the pattern ↑↓↑ or ↓↑↓ is enough.
+const SAGC_HUNT_THRESHOLD: u32 = 3;
+/// Base number of SAGC evaluation ticks to freeze after the first hunting episode.
+/// Each tick is `SAGC_CHECK_INTERVAL` buffers:
+/// 80 × 4 × 8192 / 2_048_000 s ≈ 1.3 s base freeze; doubles each episode.
+const SAGC_HUNT_FREEZE_BASE: u32 = 80;
+/// Maximum number of ticks the hunting freeze can reach after repeated doubling.
+/// 5120 × 4 × 8192 / 2_048_000 s ≈ 82 s — effectively permanent for a session.
+const SAGC_HUNT_FREEZE_MAX: u32 = 5120;
 
 /// Select the closest gain value from `gains` (sorted list in tenths of dB)
 /// given a percentage `gain_pct` in `0..=100`.
@@ -216,9 +221,9 @@ impl RtlsdrHandler {
             // Resolve the initial gain index and operating mode.
             let (initial_gain_idx, sagc_enabled, hardware_agc) = match config.gain_mode {
                 GainMode::Software => {
-                    let idx = gains.len() / 2;
+                    let idx = (gains.len() - 1) * 20 / 100;
                     info!(
-                        "Software AGC (SAGC) enabled, starting at {:.1} dB",
+                        "Software AGC (SAGC) enabled, starting at {:.1} dB (20%)",
                         gains[idx] as f32 / 10.0
                     );
                     (idx, true, false)
@@ -293,6 +298,16 @@ impl RtlsdrHandler {
             // Hold-off counter: decremented at each SAGC evaluation tick.
             // When > 0, gain adjustments are suspended to prevent oscillation.
             let mut agc_hold_cntr: u32 = 0;
+            // Hunting suppressor: tracks consecutive direction reversals and
+            // freezes the control loop when the gain bounces between two adjacent
+            // steps with no stable operating point.  Uses exponential backoff so
+            // that repeated episodes on the same pair converge to a stable lock
+            // on the lower (safer) gain step.
+            let mut last_gain_dir: i32 = 0; // +1 = last change was up, -1 = down
+            let mut hunt_count: u32 = 0;
+            let mut hunt_freeze: u32 = 0;
+            // Backoff multiplier: doubles with each hunting episode (capped at max).
+            let mut hunt_freeze_ticks: u32 = SAGC_HUNT_FREEZE_BASE;
 
             // ── DOC state ─────────────────────────────────────────────────────
             // DC Offset Correction: independent IIR estimators for I and Q.
@@ -401,41 +416,132 @@ impl RtlsdrHandler {
                         // ── SAGC gain evaluation ──────────────────────────────
                         agc_read_cntr = agc_read_cntr.wrapping_add(1);
                         if sagc_enabled && agc_read_cntr.is_multiple_of(SAGC_CHECK_INTERVAL) {
-                            if agc_hold_cntr > 0 {
+                            if hunt_freeze > 0 {
+                                // Hunting suppressor active: the gain was bouncing between
+                                // two adjacent steps.  Hold the current gain until the
+                                // freeze period expires and the level estimator settles.
+                                hunt_freeze -= 1;
+                            } else if agc_hold_cntr > 0 {
                                 // Still in hold-off period after the last gain change.
-                                // Decrement and skip any adjustment this tick.
                                 agc_hold_cntr -= 1;
                             } else if agc_level < agc_level_min && gain_idx + 1 < gains.len() {
                                 // Signal too weak — increase gain by one step.
                                 gain_idx += 1;
                                 agc_level_min = level_min_factors[gain_idx] * SAGC_LEVEL_MAX;
                                 agc_hold_cntr = SAGC_HOLD_BUFFERS;
-                                if let Err(e) =
-                                    sdr.set_tuner_gain(TunerGain::Manual(gains[gain_idx]))
-                                {
-                                    warn!("SAGC: set_tuner_gain failed: {}", e);
+                                // Hunting detection: consecutive direction reversals.
+                                if last_gain_dir == -1 {
+                                    hunt_count += 1;
+                                    if hunt_count >= SAGC_HUNT_THRESHOLD {
+                                        // Stay on the lower (safer) gain step and freeze.
+                                        gain_idx -= 1;
+                                        agc_level_min =
+                                            level_min_factors[gain_idx] * SAGC_LEVEL_MAX;
+                                        hunt_freeze = hunt_freeze_ticks;
+                                        hunt_freeze_ticks = hunt_freeze_ticks
+                                            .saturating_mul(2)
+                                            .min(SAGC_HUNT_FREEZE_MAX);
+                                        hunt_count = 0;
+                                        last_gain_dir = -1;
+                                        warn!(
+                                            "SAGC: hunting ↑↓↑ between {:.1} and {:.1} dB, \
+                                             locking {:.1} dB for {} ticks",
+                                            gains[gain_idx] as f32 / 10.0,
+                                            gains[gain_idx + 1] as f32 / 10.0,
+                                            gains[gain_idx] as f32 / 10.0,
+                                            hunt_freeze,
+                                        );
+                                        if let Err(e) =
+                                            sdr.set_tuner_gain(TunerGain::Manual(gains[gain_idx]))
+                                        {
+                                            warn!("SAGC: set_tuner_gain failed: {}", e);
+                                        }
+                                    } else {
+                                        last_gain_dir = 1;
+                                        if let Err(e) =
+                                            sdr.set_tuner_gain(TunerGain::Manual(gains[gain_idx]))
+                                        {
+                                            warn!("SAGC: set_tuner_gain failed: {}", e);
+                                        } else {
+                                            debug!(
+                                                "SAGC: gain ↑ {:.1} dB (level {:.1})",
+                                                gains[gain_idx] as f32 / 10.0,
+                                                agc_level,
+                                            );
+                                        }
+                                    }
                                 } else {
-                                    debug!(
-                                        "SAGC: gain ↑ {:.1} dB (level {:.1})",
-                                        gains[gain_idx] as f32 / 10.0,
-                                        agc_level,
-                                    );
+                                    hunt_count = 0;
+                                    last_gain_dir = 1;
+                                    if let Err(e) =
+                                        sdr.set_tuner_gain(TunerGain::Manual(gains[gain_idx]))
+                                    {
+                                        warn!("SAGC: set_tuner_gain failed: {}", e);
+                                    } else {
+                                        debug!(
+                                            "SAGC: gain ↑ {:.1} dB (level {:.1})",
+                                            gains[gain_idx] as f32 / 10.0,
+                                            agc_level,
+                                        );
+                                    }
                                 }
                             } else if agc_level > SAGC_LEVEL_MAX && gain_idx > 0 {
                                 // Signal too strong — decrease gain by one step.
                                 gain_idx -= 1;
                                 agc_level_min = level_min_factors[gain_idx] * SAGC_LEVEL_MAX;
                                 agc_hold_cntr = SAGC_HOLD_BUFFERS;
-                                if let Err(e) =
-                                    sdr.set_tuner_gain(TunerGain::Manual(gains[gain_idx]))
-                                {
-                                    warn!("SAGC: set_tuner_gain failed: {}", e);
+                                // Hunting detection: consecutive direction reversals.
+                                if last_gain_dir == 1 {
+                                    hunt_count += 1;
+                                    if hunt_count >= SAGC_HUNT_THRESHOLD {
+                                        // Already on the lower step; freeze here.
+                                        hunt_freeze = hunt_freeze_ticks;
+                                        hunt_freeze_ticks = hunt_freeze_ticks
+                                            .saturating_mul(2)
+                                            .min(SAGC_HUNT_FREEZE_MAX);
+                                        hunt_count = 0;
+                                        last_gain_dir = -1;
+                                        warn!(
+                                            "SAGC: hunting ↓↑↓ between {:.1} and {:.1} dB, \
+                                             locking {:.1} dB for {} ticks",
+                                            gains[gain_idx] as f32 / 10.0,
+                                            gains[gain_idx + 1] as f32 / 10.0,
+                                            gains[gain_idx] as f32 / 10.0,
+                                            hunt_freeze,
+                                        );
+                                        if let Err(e) =
+                                            sdr.set_tuner_gain(TunerGain::Manual(gains[gain_idx]))
+                                        {
+                                            warn!("SAGC: set_tuner_gain failed: {}", e);
+                                        }
+                                    } else {
+                                        last_gain_dir = -1;
+                                        if let Err(e) =
+                                            sdr.set_tuner_gain(TunerGain::Manual(gains[gain_idx]))
+                                        {
+                                            warn!("SAGC: set_tuner_gain failed: {}", e);
+                                        } else {
+                                            debug!(
+                                                "SAGC: gain ↓ {:.1} dB (level {:.1})",
+                                                gains[gain_idx] as f32 / 10.0,
+                                                agc_level,
+                                            );
+                                        }
+                                    }
                                 } else {
-                                    debug!(
-                                        "SAGC: gain ↓ {:.1} dB (level {:.1})",
-                                        gains[gain_idx] as f32 / 10.0,
-                                        agc_level,
-                                    );
+                                    hunt_count = 0;
+                                    last_gain_dir = -1;
+                                    if let Err(e) =
+                                        sdr.set_tuner_gain(TunerGain::Manual(gains[gain_idx]))
+                                    {
+                                        warn!("SAGC: set_tuner_gain failed: {}", e);
+                                    } else {
+                                        debug!(
+                                            "SAGC: gain ↓ {:.1} dB (level {:.1})",
+                                            gains[gain_idx] as f32 / 10.0,
+                                            agc_level,
+                                        );
+                                    }
                                 }
                             }
                         }
