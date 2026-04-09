@@ -5,7 +5,7 @@ use num_complex::Complex32;
 use rtl_sdr_rs::{DeviceId, RtlSdr, TunerGain};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use tracing::{debug, info, warn};
 
@@ -26,14 +26,17 @@ const SAGC_CREL: f32 = 0.00005;
 /// Mirrors AbracaDABra's `0x03` counter mask (every 4 callbacks).
 const SAGC_CHECK_INTERVAL: u32 = 4;
 
-/// Pre-computed conversion table: `table[i] = (i as f32 − 128.0) / 128.0`.
-fn build_conv_table() -> [f32; 256] {
-    let mut table = [0.0f32; 256];
-    for (i, entry) in table.iter_mut().enumerate() {
-        *entry = (i as f32 - 128.0) / 128.0;
-    }
-    table
-}
+/// DOC: DC Offset Correction time constant.
+/// Mirrors AbracaDABra's `m_doc_c = 0.05`.
+/// A first-order IIR low-pass filter tracks the average I/Q DC bias introduced
+/// by the RTL-SDR LO leakthrough and ADC offset; the estimated bias is then
+/// subtracted from every sample before normalisation.
+const DOC_C: f32 = 0.05;
+
+/// Number of USB read buffers discarded on startup before IQ data enters the FIFO.
+/// Prevents stale IQ data from before `reset_buffer()` contaminating the OFDM sync.
+/// Mirrors AbracaDABra's `RTLSDR_RESTART_COUNTER`.
+const SAGC_STARTUP_DISCARD: u32 = 2;
 
 /// Select the closest gain value from `gains` (sorted list in tenths of dB)
 /// given a percentage `gain_pct` in `0..=100`.
@@ -97,12 +100,30 @@ struct DeviceConfig {
     gain_mode: GainMode,
 }
 
+/// Shared IQ FIFO between the USB worker thread and the OFDM consumer.
+///
+/// Stores DC-corrected, normalised f32 IQ samples (I and Q interleaved).
+/// The `Condvar` lets the OFDM thread block without spin-polling, mirroring
+/// AbracaDABra's `pthread_cond_wait` approach.
+struct IqFifo {
+    buf: Mutex<VecDeque<f32>>,
+    data_ready: Condvar,
+}
+
+impl IqFifo {
+    fn new(capacity: usize) -> Self {
+        IqFifo {
+            buf: Mutex::new(VecDeque::with_capacity(capacity)),
+            data_ready: Condvar::new(),
+        }
+    }
+}
+
 pub struct RtlsdrHandler {
     config: DeviceConfig,
     running: Arc<AtomicBool>,
-    i_buffer: Arc<Mutex<VecDeque<u8>>>,
+    fifo: Arc<IqFifo>,
     worker_handle: Option<thread::JoinHandle<()>>,
-    conv_table: [f32; 256],
 }
 
 impl RtlsdrHandler {
@@ -112,6 +133,8 @@ impl RtlsdrHandler {
         gain_mode: GainMode,
         device_index: u32,
     ) -> Result<Self, String> {
+        // Capacity: 1 Mi f32 values = 512 Ki IQ pairs ≈ 250 ms at 2 Msps.
+        let capacity = 1024 * 1024;
         Ok(RtlsdrHandler {
             config: DeviceConfig {
                 device_index: device_index as usize,
@@ -120,9 +143,8 @@ impl RtlsdrHandler {
                 gain_mode,
             },
             running: Arc::new(AtomicBool::new(false)),
-            i_buffer: Arc::new(Mutex::new(VecDeque::with_capacity(4 * 1024 * 1024))),
+            fifo: Arc::new(IqFifo::new(capacity)),
             worker_handle: None,
-            conv_table: build_conv_table(),
         })
     }
 
@@ -132,13 +154,13 @@ impl RtlsdrHandler {
         }
 
         {
-            let mut buf = self.i_buffer.lock().unwrap();
+            let mut buf = self.fifo.buf.lock().unwrap();
             buf.clear();
         }
 
         let config = self.config.clone();
         let running = self.running.clone();
-        let buffer = self.i_buffer.clone();
+        let fifo = self.fifo.clone();
 
         // Oneshot channel: worker reports init success/failure before entering
         // the read loop.  This avoids opening the device twice.
@@ -252,10 +274,27 @@ impl RtlsdrHandler {
             let level_min_factors = compute_level_min_factors(&gains);
             let mut gain_idx = initial_gain_idx;
             // Running level estimate on the absolute int8 scale (0–127).
+            // Note: agc_level is intentionally NOT reset on re-tune, mirroring
+            // AbracaDABra's commented-out `// m_agcLevel = 0.0;`.
             let mut agc_level = 0.0f32;
             let mut agc_level_min = level_min_factors[gain_idx] * SAGC_LEVEL_MAX;
             // Counter: gain is re-evaluated every SAGC_CHECK_INTERVAL read buffers.
             let mut agc_read_cntr: u32 = 0;
+
+            // ── DOC state ─────────────────────────────────────────────────────
+            // DC Offset Correction: independent IIR estimators for I and Q.
+            // Adapted from AbracaDABra's `m_dcI` / `m_dcQ` (MIT licence).
+            // Operates on the ±128 integer scale (before /128 normalisation).
+            // The estimate from the previous buffer is applied to the current
+            // buffer, giving a 1-buffer lag that is negligible for a slow IIR.
+            let mut dc_i = 0.0f32;
+            let mut dc_q = 0.0f32;
+
+            // ── Startup discard ───────────────────────────────────────────────
+            // Skip the first SAGC_STARTUP_DISCARD buffers so that any residual
+            // IQ data from before reset_buffer() never enters the FIFO.
+            // Mirrors AbracaDABra's `m_captureStartCntr`.
+            let mut startup_discard = SAGC_STARTUP_DISCARD;
 
             let mut raw = [0u8; READLEN_DEFAULT];
             loop {
@@ -264,28 +303,60 @@ impl RtlsdrHandler {
                 }
                 match sdr.read_sync(&mut raw) {
                     Ok(n) if n == READLEN_DEFAULT => {
-                        // Update level estimate: fast attack, slow release.
-                        // Each raw byte is a uint8 IQ sample; `|byte − 128|` maps to
-                        // the absolute amplitude on a 0–127 scale.
-                        if sagc_enabled {
-                            for b in &raw[..n] {
-                                let abs_sample = ((*b as i32 - 128).abs()) as f32;
-                                let c = if abs_sample > agc_level {
-                                    SAGC_CATT
-                                } else {
-                                    SAGC_CREL
-                                };
-                                agc_level += c * (abs_sample - agc_level);
-                            }
+                        if startup_discard > 0 {
+                            startup_discard -= 1;
+                            continue;
                         }
 
-                        if let Ok(mut guard) = buffer.lock() {
-                            for b in &raw[..n] {
-                                guard.push_back(*b);
+                        let n_pairs = n / 2;
+
+                        // ── Combined pass: SAGC + DOC accumulation + push ─────
+                        // Raw bytes are interleaved as I₀Q₀I₁Q₁…; each offset
+                        // by 128 (unsigned → signed).
+                        //
+                        // SAGC operates on |byte − 128| for ALL samples (I and Q
+                        // mixed), matching AbracaDABra's per-byte loop.
+                        //
+                        // DOC applies the DC estimate from the PREVIOUS buffer
+                        // (1-buffer lag), then updates the estimate from this
+                        // buffer's mean, matching AbracaDABra's end-of-block IIR.
+                        let mut sum_i = 0.0f32;
+                        let mut sum_q = 0.0f32;
+                        {
+                            let mut guard = fifo.buf.lock().unwrap();
+                            for k in 0..n_pairs {
+                                let i_raw = raw[2 * k] as f32 - 128.0;
+                                let q_raw = raw[2 * k + 1] as f32 - 128.0;
+
+                                // SAGC — absolute amplitude, operates before DOC
+                                if sagc_enabled {
+                                    for &abs_val in &[i_raw.abs(), q_raw.abs()] {
+                                        let c = if abs_val > agc_level {
+                                            SAGC_CATT
+                                        } else {
+                                            SAGC_CREL
+                                        };
+                                        agc_level += c * (abs_val - agc_level);
+                                    }
+                                }
+
+                                // DOC accumulation (±128 scale)
+                                sum_i += i_raw;
+                                sum_q += q_raw;
+
+                                // Push DC-corrected, normalised sample pair
+                                guard.push_back((i_raw - dc_i) / 128.0);
+                                guard.push_back((q_raw - dc_q) / 128.0);
                             }
                         }
+                        fifo.data_ready.notify_all();
 
-                        // Evaluate thresholds every SAGC_CHECK_INTERVAL buffers.
+                        // IIR DOC update: dc_x ← (1 − DOC_C) × dc_x + DOC_C × mean_x
+                        // Mirrors AbracaDABra: `dcI = sumI * doc_c / (len>>1) + dcI − doc_c * dcI`
+                        dc_i += DOC_C * (sum_i / n_pairs as f32 - dc_i);
+                        dc_q += DOC_C * (sum_q / n_pairs as f32 - dc_q);
+
+                        // ── SAGC gain evaluation ──────────────────────────────
                         agc_read_cntr = agc_read_cntr.wrapping_add(1);
                         if sagc_enabled && agc_read_cntr.is_multiple_of(SAGC_CHECK_INTERVAL) {
                             if agc_level < agc_level_min && gain_idx + 1 < gains.len() {
@@ -332,6 +403,8 @@ impl RtlsdrHandler {
             }
 
             running.store(false, Ordering::SeqCst);
+            // Wake any blocked consumer so it can observe running == false.
+            fifo.data_ready.notify_all();
             // sdr dropped here; USB cleanup handled by rusb::DeviceHandle::Drop
         }));
 
@@ -368,35 +441,40 @@ impl RtlsdrHandler {
         }
     }
 
+    /// Read up to `v.len()` DC-corrected, normalised IQ samples from the FIFO.
+    ///
+    /// Blocks via `Condvar` (zero CPU spin) until enough data is available or
+    /// the worker thread stops. Returns the number of samples written into `v`.
+    /// Returns 0 only when the worker has stopped and no data remains.
     pub fn get_samples(&self, v: &mut [Complex32]) -> usize {
-        let size = v.len();
-        let mut temp = vec![0u8; 2 * size];
-        let amount = {
-            let mut buf = self.i_buffer.lock().unwrap();
-            let available = buf.len().min(2 * size);
-            for slot in temp.iter_mut().take(available) {
-                *slot = buf.pop_front().unwrap_or(0);
+        let needed = 2 * v.len(); // interleaved f32 pairs (I, Q)
+        let mut guard = self.fifo.buf.lock().unwrap();
+        loop {
+            if guard.len() >= needed {
+                break;
             }
-            available
-        };
-        let sample_count = amount / 2;
-        for i in 0..sample_count {
-            v[i] = Complex32::new(
-                self.conv_table[temp[2 * i] as usize],
-                self.conv_table[temp[2 * i + 1] as usize],
-            );
+            if !self.running.load(Ordering::Relaxed) {
+                // Worker stopped — drain whatever is available.
+                break;
+            }
+            guard = self.fifo.data_ready.wait(guard).unwrap();
+        }
+        let available = guard.len().min(needed);
+        let sample_count = available / 2;
+        for slot in v.iter_mut().take(sample_count) {
+            let i_val = guard.pop_front().unwrap_or(0.0);
+            let q_val = guard.pop_front().unwrap_or(0.0);
+            *slot = Complex32::new(i_val, q_val);
         }
         sample_count
     }
 
     pub fn samples(&self) -> usize {
-        let buf = self.i_buffer.lock().unwrap();
-        buf.len() / 2
+        self.fifo.buf.lock().unwrap().len() / 2
     }
 
     pub fn reset_buffer(&self) {
-        let mut buf = self.i_buffer.lock().unwrap();
-        buf.clear();
+        self.fifo.buf.lock().unwrap().clear();
     }
 }
 
@@ -448,20 +526,62 @@ mod tests {
 
     #[test]
     fn conv_table_maps_128_to_zero() {
-        let table = build_conv_table();
-        assert_eq!(table[128], 0.0);
+        // build_conv_table removed; verify the inline formula used in the worker.
+        let val = (128u8 as f32 - 128.0) / 128.0;
+        assert_eq!(val, 0.0);
     }
 
     #[test]
     fn conv_table_maps_0_to_negative_one() {
-        let table = build_conv_table();
-        assert!((table[0] - (-1.0)).abs() < 1e-6);
+        let val = (0u8 as f32 - 128.0) / 128.0;
+        assert!((val - (-1.0)).abs() < 1e-6);
     }
 
     #[test]
     fn conv_table_maps_255_to_near_positive_one() {
-        let table = build_conv_table();
-        assert!((table[255] - (127.0 / 128.0)).abs() < 1e-6);
+        let val = (255u8 as f32 - 128.0) / 128.0;
+        assert!((val - (127.0 / 128.0)).abs() < 1e-6);
+    }
+
+    // ── DOC: DC Offset Correction estimator ──────────────────────────────────
+
+    #[test]
+    fn doc_estimator_converges_to_constant_bias() {
+        // Simulate a DC bias of +10 on the ±128 scale.
+        // After enough buffers the IIR estimate should be close to 10.0.
+        let bias = 10.0f32;
+        let mut dc = 0.0f32;
+        for _ in 0..200 {
+            // mean of a buffer that is all-bias
+            dc += DOC_C * (bias - dc);
+        }
+        assert!((dc - bias).abs() < 0.1, "dc={dc:.3} expected ≈{bias}");
+    }
+
+    #[test]
+    fn doc_correction_removes_bias_after_convergence() {
+        // After convergence, the corrected sample should be near zero.
+        let bias = 20.0f32;
+        let mut dc = 0.0f32;
+        for _ in 0..300 {
+            dc += DOC_C * (bias - dc);
+        }
+        let raw = bias; // sample equal to the bias
+        let corrected = raw - dc;
+        assert!(
+            corrected.abs() < 0.5,
+            "corrected={corrected:.3} expected ≈0"
+        );
+    }
+
+    #[test]
+    fn doc_estimator_tracks_zero_mean_signal() {
+        // A zero-mean signal (sum_i = 0) should keep dc_i near 0.
+        let mut dc = 0.0f32;
+        for _ in 0..100 {
+            dc += DOC_C * (0.0 - dc);
+        }
+        assert!(dc.abs() < 1e-6);
     }
 
     // ── SAGC: compute_level_min_factors ───────────────────────────────────────

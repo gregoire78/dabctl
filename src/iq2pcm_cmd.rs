@@ -414,7 +414,16 @@ pub fn run(args: Iq2pcmArgs) {
 
                     match init {
                         Ok(dec) => {
-                            info!("AAC decoder: {}Hz {}ch", dec.sample_rate, dec.channels);
+                            // Sample rate and channels are not yet populated from the
+                            // bitstream at decoder-open time for all backends (fdk-aac
+                            // defers this to the first DecodeFrame call). Use the values
+                            // parsed from the DAB+ superframe header instead, which are
+                            // already available and authoritative at this point.
+                            info!(
+                                "AAC decoder ready: {}Hz {}ch",
+                                fmt.sample_rate(),
+                                fmt.channels()
+                            );
                             aac_decoder = Some(dec);
                         }
                         Err(e) => error!("AAC decoder init failed: {}", e),

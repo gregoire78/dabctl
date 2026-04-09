@@ -1,0 +1,69 @@
+name: Build & Release
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    tags:
+      - 'v*'  # Ex: v1.0.0
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ${{ fromJSON(matrix.info).runner }}
+    strategy:
+      matrix:
+        info:
+          - '{ "name": "linux_amd64",     "runner": "ubuntu-latest",    "cargo_args": "--target x86_64-unknown-linux-gnu",                    "artifact": "target/x86_64-unknown-linux-gnu/release/dabctl", "fdk": false }'
+          - '{ "name": "linux_arm64",     "runner": "ubuntu-24.04-arm", "cargo_args": "",                                                     "artifact": "target/release/dabctl",                          "fdk": false }'
+          - '{ "name": "linux_amd64_fdk", "runner": "ubuntu-latest",    "cargo_args": "--target x86_64-unknown-linux-gnu --features fdk-aac", "artifact": "target/x86_64-unknown-linux-gnu/release/dabctl", "fdk": true  }'
+          - '{ "name": "linux_arm64_fdk", "runner": "ubuntu-24.04-arm", "cargo_args": "--features fdk-aac",                                    "artifact": "target/release/dabctl",                          "fdk": true  }'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo add-apt-repository universe -y
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config libusb-1.0-0-dev \
+            libfaad-dev libmpg123-dev \
+            clang libclang-dev
+
+      - name: Install libfdk-aac-dev
+        if: fromJSON(matrix.info).fdk
+        run: sudo apt-get install -y libfdk-aac-dev
+
+      - name: Set up Rust
+        run: rustup update stable
+
+      - name: Build
+        run: cargo build --release ${{ fromJSON(matrix.info).cargo_args }}
+
+      - name: Prepare artifact
+        run: cp ${{ fromJSON(matrix.info).artifact }} dabctl_${{ fromJSON(matrix.info).name }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ fromJSON(matrix.info).name }}
+          path: dabctl_${{ fromJSON(matrix.info).name }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
