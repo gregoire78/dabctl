@@ -152,7 +152,7 @@ impl DgliDecoder {
             let crc_calced = crc.calc(&self.data[..2]);
             if crc_stored == crc_calced {
                 let len = ((self.data[0] as usize) << 8 | self.data[1] as usize) & 0x3FFF;
-                tracing::debug!("DGLI received: len={}", len);
+                tracing::trace!("DGLI received: len={}", len);
                 self.len = Some(len);
             } else {
                 tracing::debug!("DGLI CRC invalid");
@@ -524,13 +524,20 @@ impl PadDecoder {
                             // DGLI len is only valid for the immediate next DG
                             if start {
                                 let dgli_len = self.dgli_decoder.take_len();
-                                tracing::debug!("MOT start subfield (ci_type={}, dgli_len={})", ci.ci_type, dgli_len);
+                                tracing::trace!(
+                                    "MOT start subfield (ci_type={}, dgli_len={})",
+                                    ci.ci_type,
+                                    dgli_len
+                                );
                                 self.mot_decoder.set_len(dgli_len);
                             }
 
                             if self.mot_decoder.process_subfield(start, subfield) {
                                 let dg = self.mot_decoder.get_data_group();
-                                tracing::debug!("MOT DG complete, forwarding to mot_manager (dg_len={})", dg.len());
+                                tracing::trace!(
+                                    "MOT DG complete, forwarding to mot_manager (dg_len={})",
+                                    dg.len()
+                                );
                                 let (file, _fraction) = self.mot_manager.handle_data_group(&dg);
                                 if let Some(f) = file {
                                     if f.is_image() {

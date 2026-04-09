@@ -48,12 +48,7 @@ pub enum ProcessorError {
 }
 
 impl OfdmProcessor {
-    pub fn new(
-        dab_mode: u8,
-        threshold_1: i16,
-        threshold_2: i16,
-        running: Arc<AtomicBool>,
-    ) -> Self {
+    pub fn new(dab_mode: u8, threshold_1: i16, threshold_2: i16, running: Arc<AtomicBool>) -> Self {
         let params = DabParams::new(dab_mode);
         let t_u = params.t_u as usize;
         let t_s = params.t_s as usize;
@@ -462,7 +457,9 @@ impl OfdmProcessor {
                 }
 
                 start_index = {
-                    let idx = self.phase_synchronizer.find_index(&check_buf, self.threshold_2);
+                    let idx = self
+                        .phase_synchronizer
+                        .find_index(&check_buf, self.threshold_2);
                     if idx < 0 {
                         break; // Lost sync, go back to notSynced
                     }

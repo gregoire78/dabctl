@@ -271,8 +271,7 @@ impl RsDecoder {
             let mut omega_val: u8 = 0;
             for (i, &om_i) in omega.iter().enumerate().take(NROOTS) {
                 if om_i != 0 {
-                    let idx =
-                        (gf.index_of[om_i as usize] as u16 + (i as u16 * root) % 255) % 255;
+                    let idx = (gf.index_of[om_i as usize] as u16 + (i as u16 * root) % 255) % 255;
                     omega_val ^= gf.alpha_to[idx as usize];
                 }
             }

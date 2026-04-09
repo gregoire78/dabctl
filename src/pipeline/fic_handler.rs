@@ -206,5 +206,4 @@ mod tests {
         let mut valid = vec![false; 4];
         fh.process_fic_block(&data, &mut out, &mut valid);
     }
-
 }
