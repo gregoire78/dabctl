@@ -43,15 +43,18 @@ jobs:
         run: rustup update stable
 
       - name: Build
-        run: cargo build --release ${{ fromJSON(matrix.info).cargo_args }}
-
-      - name: Prepare artifact
-        run: cp ${{ fromJSON(matrix.info).artifact }} dabctl_${{ fromJSON(matrix.info).name }}
+        run: |
+          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          cargo build --release ${{ fromJSON(matrix.info).cargo_args }}
+          BIN="dabctl-$VERSION-${{ fromJSON(matrix.info).name }}"
+          cp ${{ fromJSON(matrix.info).artifact }} "$BIN"
+          tar -czf "$BIN.tar.gz" "$BIN"
 
       - uses: actions/upload-artifact@v4
         with:
           name: binary-${{ fromJSON(matrix.info).name }}
-          path: dabctl_${{ fromJSON(matrix.info).name }}
+          path: dabctl-*-${{ fromJSON(matrix.info).name }}.tar.gz
 
   release:
     needs: build
