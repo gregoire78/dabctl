@@ -121,6 +121,6 @@ When documenting DAB behavior, refer to the relevant ETSI standards at **every s
 | [**ETSI TS 101 499**](https://www.etsi.org/deliver/etsi_ts/101400_101499/101499/03.01.01_60/ts_101499v030101p.pdf) | MOT Slideshow | Slideshow application over MOT |
 
 ## Boundaries
-- ✅ **Always do:** Write new files to `src/`, follow the style of `README.md`, run `cargo fmt` and `cargo clippy`, run markdownlint
+- ✅ **Always do:** Write new files to `src/`, follow the style of `README.md`, run `cargo fmt` and `cargo clippy`, run markdownlint. Use `rtk` when you use terminal commands.
 - ⚠️ **Ask first:** Before modifying `README.md`, `Cargo.toml`, `build.rs`, or existing modules in a major way
 - 🚫 **Never do:** Touch `rtl-sdr/` internals, make commits, commit secrets
