@@ -10,7 +10,7 @@
 // Back-pressure: the bounded channel (capacity 4 ≈ 100 ms) ensures the OFDM thread
 // never allocates an unbounded queue of unprocessed frames when the audio decoder is slow.
 
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, AtomicI16, AtomicI32, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -292,8 +292,11 @@ pub fn run(args: Iq2pcmArgs) {
     let mut ensemble_announced = false;
     let mut service_announced = false;
 
-    let stdout = std::io::stdout();
-    let mut stdout_lock = stdout.lock();
+    // Spawn the PCM writer thread so that stdout writes never block the drain loop.
+    // The drain loop pushes owned Vec<i16> frames non-blocking; the writer thread
+    // absorbs transient pipe stalls without propagating backpressure up to the
+    // OFDM ring buffer (ETSI TS 102 563 §5.2).
+    let pcm_out = pcm_writer::spawn_pcm_writer(std::io::stdout());
 
     // Audio pipeline diagnostic counters
     let frames_in = Arc::new(AtomicI32::new(0));
@@ -472,8 +475,9 @@ pub fn run(args: Iq2pcmArgs) {
             // the total PCM duration stays equal to wall-clock time (speed = 1.0×).
             if result.sync_ok {
                 for sil_frame in silence_buffer.flush() {
-                    write_pcm(&mut stdout_lock, &sil_frame);
-                    silence_aus.fetch_add(1, Ordering::Relaxed);
+                    if pcm_out.push(sil_frame) {
+                        silence_aus.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
 
@@ -485,7 +489,7 @@ pub fn run(args: Iq2pcmArgs) {
                         if au_silence.is_none() {
                             au_silence = Some(vec![0i16; pcm.len()]);
                         }
-                        write_pcm(&mut stdout_lock, &pcm);
+                        pcm_out.push(pcm);
                         silence_next = silence_deadline_after_good_au(std::time::Instant::now());
                     }
                 }
@@ -511,8 +515,9 @@ pub fn run(args: Iq2pcmArgs) {
             // Flush deferred silence frames that have waited a full hold-off
             // (2 CIF ticks ≈ 48 ms) without a sync_ok cancelling them.
             for sil_frame in silence_buffer.tick() {
-                write_pcm(&mut stdout_lock, &sil_frame);
-                silence_aus.fetch_add(1, Ordering::Relaxed);
+                if pcm_out.push(sil_frame) {
+                    silence_aus.fetch_add(1, Ordering::Relaxed);
+                }
             }
 
             for pad in &result.pad_data {
@@ -550,16 +555,7 @@ pub fn run(args: Iq2pcmArgs) {
     }
 }
 
-fn write_pcm(out: &mut impl Write, samples: &[i16]) {
-    // Encode each sample as little-endian bytes (PCM S16LE, ETSI TS 102 563 §5.2).
-    let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
-    if let Err(e) = out.write_all(&bytes) {
-        tracing::warn!("PCM write failed: {e}");
-    }
-    if let Err(e) = out.flush() {
-        tracing::warn!("PCM flush failed: {e}");
-    }
-}
+use crate::pcm_writer;
 
 /// Parse a SID string (supports "0xF201" and "F201" hex formats).
 pub fn parse_sid(s: &str) -> u16 {
@@ -697,25 +693,5 @@ mod tests {
             result.is_err(),
             "clap must reject -G and --hardware-agc together"
         );
-    }
-
-    // ── write_pcm encoding ────────────────────────────────────────────────────
-
-    /// PCM samples must be serialised as little-endian i16 (S16LE).
-    #[test]
-    fn write_pcm_encodes_samples_as_s16le() {
-        let samples: &[i16] = &[0x0102i16, -1i16, i16::MIN, i16::MAX];
-        let mut buf = Vec::new();
-        write_pcm(&mut buf, samples);
-        let expected: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
-        assert_eq!(buf, expected);
-    }
-
-    /// An empty sample slice must produce no bytes.
-    #[test]
-    fn write_pcm_empty_slice_produces_no_bytes() {
-        let mut buf = Vec::new();
-        write_pcm(&mut buf, &[]);
-        assert!(buf.is_empty());
     }
 }

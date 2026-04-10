@@ -2,6 +2,7 @@
 // RTL-SDR → PCM audio pipeline for DAB/DAB+ radio
 
 mod iq2pcm_cmd;
+mod pcm_writer;
 
 use clap::Parser;
 
