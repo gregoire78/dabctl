@@ -72,6 +72,10 @@ pub struct Iq2pcmArgs {
     #[arg(short = 'F', long = "disable-dyn-fic")]
     disable_dyn_fic: bool,
 
+    /// Disable silence fill during radio fades (emit nothing instead of silence)
+    #[arg(long = "no-silence-fill")]
+    no_silence_fill: bool,
+
     /// Save slideshow images to this directory
     #[arg(short = 'S', long = "slide-dir")]
     slide_dir: Option<String>,
@@ -166,21 +170,22 @@ pub fn run(args: Iq2pcmArgs) {
     let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel::<DabFrame>(CHANNEL_CAPACITY);
 
     let er = ensemble_recognized.clone();
-    let ensemble_cb: Option<Box<dyn Fn(&str, u32) + Send>> =
-        Some(Box::new(move |name: &str, _eid: u32| {
+    let ensemble_cb: Option<std::sync::Arc<dyn Fn(&str, u32) + Send + Sync>> =
+        Some(std::sync::Arc::new(move |name: &str, _eid: u32| {
             if !er.load(Ordering::SeqCst) {
                 info!("ensemble {} detected", name);
                 er.store(true, Ordering::SeqCst);
             }
         }));
-    let program_cb: Option<Box<dyn Fn(&str, i32) + Send>> =
-        Some(Box::new(move |name: &str, sid: i32| {
+    let program_cb: Option<std::sync::Arc<dyn Fn(&str, i32) + Send + Sync>> =
+        Some(std::sync::Arc::new(move |name: &str, sid: i32| {
             debug!("program {} (0x{:X}) is in the list", name.trim(), sid);
         }));
     let fs = fic_success.clone();
-    let fic_quality_cb: Option<Box<dyn Fn(i16) + Send>> = Some(Box::new(move |quality: i16| {
-        fs.store(quality, Ordering::SeqCst);
-    }));
+    let fic_quality_cb: Option<std::sync::Arc<dyn Fn(i16) + Send + Sync>> =
+        Some(std::sync::Arc::new(move |quality: i16| {
+            fs.store(quality, Ordering::SeqCst);
+        }));
 
     let pipeline = DabPipeline::new(1, frame_tx, ensemble_cb, program_cb, fic_quality_cb);
     let pipeline_processing_flag = pipeline.processing_flag();
@@ -258,6 +263,16 @@ pub fn run(args: Iq2pcmArgs) {
     let mut pad_output = PadOutput::new(slide_dir, args.slide_base64);
     let mut superframe = SuperframeFilter::new();
     let mut aac_decoder: Option<dabctl::audio::aac_decoder::AacDecoder> = None;
+    // Silence fill: once we have decoded at least one AU, store a zero-filled
+    // frame of the same size so we can substitute silence during radio fades
+    // instead of emitting nothing (which causes buffer underruns downstream).
+    // Rate-limited to one superframe period (~120 ms) so we never emit faster
+    // than real-time even when sync_fail fires on every CIF frame.
+    let mut au_silence: Option<Vec<i16>> = None;
+    let mut au_count: usize = 0;
+    // Tracks the deadline for the next silence superframe.
+    // Initialised lazily on the first real AU output.
+    let mut silence_next = std::time::Instant::now();
 
     let mut current_subchid: Option<u8> = None;
     let mut ensemble_announced = false;
@@ -368,7 +383,7 @@ pub fn run(args: Iq2pcmArgs) {
             None => continue,
         };
 
-        frames_in.fetch_add(1, Ordering::SeqCst);
+        frames_in.fetch_add(1, Ordering::Relaxed);
 
         let subchannel_arc = match frame.subchannel_data(subchid) {
             Some(arc) => arc,
@@ -383,13 +398,14 @@ pub fn run(args: Iq2pcmArgs) {
         {
             let result = superframe.feed(subchannel_data);
             if result.sync_ok {
-                sync_ok.fetch_add(1, Ordering::SeqCst);
+                sync_ok.fetch_add(1, Ordering::Relaxed);
             }
             if result.sync_fail {
-                sync_fail.fetch_add(1, Ordering::SeqCst);
+                sync_fail.fetch_add(1, Ordering::Relaxed);
             }
 
             if let Some(ref fmt) = result.format {
+                au_count = fmt.number_of_access_units();
                 let asc = fmt.build_asc();
                 info!(
                     "Format: {} {}kHz {}ch",
@@ -434,8 +450,34 @@ pub fn run(args: Iq2pcmArgs) {
             if let Some(ref mut dec) = aac_decoder {
                 for au in &result.access_units {
                     if let Some(pcm) = dec.decode_frame(&au.data) {
-                        aus_decoded.fetch_add(1, Ordering::SeqCst);
+                        aus_decoded.fetch_add(1, Ordering::Relaxed);
+                        // Capture the silence frame shape from the first successful decode.
+                        if au_silence.is_none() {
+                            au_silence = Some(vec![0i16; pcm.len()]);
+                        }
                         write_pcm(&mut stdout_lock, &pcm);
+                        // Reset the silence deadline to now: if the signal drops on
+                        // the very next frame, the first silence substitution is
+                        // allowed immediately rather than waiting for a stale deadline.
+                        silence_next = std::time::Instant::now();
+                    }
+                }
+                // Fill gaps with silence when a complete superframe was
+                // assembled but failed the fire-code CRC (ETSI TS 102 563 §5.1).
+                // Rate-limited: only emit once per ~120 ms superframe period so
+                // we do not overflow the consumer when sync_fail fires on every
+                // CIF frame (~44/s) instead of every superframe (~9/s).
+                if result.sync_fail && !args.no_silence_fill {
+                    let now = std::time::Instant::now();
+                    if now >= silence_next {
+                        if let Some(ref silence) = au_silence {
+                            for _ in 0..au_count.max(1) {
+                                write_pcm(&mut stdout_lock, silence);
+                            }
+                        }
+                        // Schedule the next silence superframe one period ahead.
+                        // One DAB+ superframe = 5 CIF × 24 ms = 120 ms.
+                        silence_next = now + std::time::Duration::from_millis(120);
                     }
                 }
             }
@@ -567,5 +609,60 @@ mod tests {
     #[test]
     fn channel_capacity_constant_is_four() {
         assert_eq!(CHANNEL_CAPACITY, 4);
+    }
+
+    // ── Silence fill flag ─────────────────────────────────────────────────────
+
+    /// Silence fill is enabled by default; `--no-silence-fill` must not be set
+    /// unless explicitly passed on the command line.
+    #[test]
+    fn no_silence_fill_defaults_to_false() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Wrapper {
+            #[command(flatten)]
+            inner: Iq2pcmArgs,
+        }
+        let args = Wrapper::parse_from(["test", "-C", "6C", "-s", "0xF2F8"]);
+        assert!(!args.inner.no_silence_fill);
+    }
+
+    /// Passing `--no-silence-fill` must set the flag so the main loop emits
+    /// no audio during radio fades instead of synthetic silence.
+    #[test]
+    fn no_silence_fill_can_be_enabled() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Wrapper {
+            #[command(flatten)]
+            inner: Iq2pcmArgs,
+        }
+        let args = Wrapper::parse_from(["test", "-C", "6C", "-s", "0xF2F8", "--no-silence-fill"]);
+        assert!(args.inner.no_silence_fill);
+    }
+
+    /// `-G` (manual gain) and `--hardware-agc` must be mutually exclusive.
+    #[test]
+    fn gain_and_hardware_agc_are_mutually_exclusive() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Wrapper {
+            #[command(flatten)]
+            inner: Iq2pcmArgs,
+        }
+        let result = Wrapper::try_parse_from([
+            "test",
+            "-C",
+            "6C",
+            "-s",
+            "0xF2F8",
+            "-G",
+            "50",
+            "--hardware-agc",
+        ]);
+        assert!(
+            result.is_err(),
+            "clap must reject -G and --hardware-agc together"
+        );
     }
 }

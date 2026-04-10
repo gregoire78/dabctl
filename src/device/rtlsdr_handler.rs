@@ -14,8 +14,9 @@ const INPUT_RATE: u32 = 2_048_000;
 
 /// SAGC: upper signal level threshold (int8 absolute-value scale, 0–127).
 /// Gain is reduced when the running estimate exceeds this value.
-/// Mirrors AbracaDABra's `RTLSDR_AGC_LEVEL_MAX_DEFAULT` (≈ 82 % of full scale).
-const SAGC_LEVEL_MAX: f32 = 105.0;
+/// Lowered from the AbracaDABra default (105 ≈ 82 %) to 95 (≈ 75 %) to shift
+/// the operating window away from gain-step boundaries and reduce hunting.
+const SAGC_LEVEL_MAX: f32 = 95.0;
 /// SAGC: fast attack time constant — reacts quickly to overload.
 /// Mirrors AbracaDABra's `m_agcLevel_catt`.
 const SAGC_CATT: f32 = 0.1;
@@ -40,8 +41,15 @@ const SAGC_STARTUP_DISCARD: u32 = 2;
 /// Minimum number of SAGC evaluation ticks that must elapse after a gain change
 /// before the next change is allowed.  Each tick is `SAGC_CHECK_INTERVAL` read
 /// buffers, so the freeze lasts `SAGC_HOLD_BUFFERS × SAGC_CHECK_INTERVAL × 8192`
-/// IQ samples ≈ 8 × 4 × 8192 / 2_048_000 s ≈ 128 ms.
-const SAGC_HOLD_BUFFERS: u32 = 8;
+/// IQ samples ≈ 32 × 4 × 8192 / 2_048_000 s ≈ 512 ms.
+/// This gives the R820T tuner and the IIR level estimator enough time to settle
+/// before the next gain decision, preventing rapid toggling at borderline levels.
+const SAGC_HOLD_BUFFERS: u32 = 32;
+/// Number of consecutive SAGC evaluation ticks where the level must stay above
+/// or below a threshold before a gain change is applied.  Each tick is
+/// `SAGC_CHECK_INTERVAL` buffers (≈ 16 ms), so 3 ticks ≈ 48 ms of confirmation.
+/// Prevents a single noisy measurement from triggering an unnecessary gain step.
+const SAGC_CONFIRM_COUNT: u32 = 3;
 /// Number of consecutive direction reversals (↑↓ or ↓↑ pairs) that trigger the
 /// hunting suppressor.  A value of 3 means the pattern ↑↓↑ or ↓↑↓ is enough.
 const SAGC_HUNT_THRESHOLD: u32 = 3;
@@ -66,13 +74,18 @@ fn select_gain_from_percent(gain_pct: i16, gains: &[i32]) -> i32 {
 ///
 /// When the running SAGC level estimate falls below `factors[i] × SAGC_LEVEL_MAX`, the
 /// controller bumps the gain up from index `i` to `i + 1`. The factor accounts for the size
-/// of that gain step plus 0.5 dB of hysteresis, keeping the control loop stable:
+/// of that gain step plus an adaptive hysteresis that scales with the actual step size
+/// reported by the device:
 ///
 /// ```text
-/// factors[i] = 10 ^ ((gains[i] − gains[i+1] − 5) / 200)
+/// hysteresis = max(step, 20)          // at least 2 dB, more for larger steps
+/// factors[i] = 10 ^ ((gains[i] − gains[i+1] − hysteresis) / 200)
 /// ```
 ///
 /// where `gains` is sorted ascending in tenths of dB (as returned by the RTL-SDR driver).
+/// Using the step itself as a floor ensures the dead-band between the up-threshold and
+/// `SAGC_LEVEL_MAX` is always wide enough to prevent hunting, regardless of how closely
+/// the tuner's gain steps are spaced (e.g. 36.4/37.2 dB = only 8 tenths apart).
 /// For the highest gain index a fixed −5 dB factor is used (it is never triggered in
 /// practice because the gain cannot be raised further).
 /// Adapted from AbracaDABra by KejPi (MIT licence).
@@ -82,8 +95,11 @@ fn compute_level_min_factors(gains: &[i32]) -> Vec<f32> {
     (0..n)
         .map(|i| {
             if i + 1 < n {
-                // lower threshold: accounts for the step to gains[i+1] plus 0.5 dB headroom
-                f32::powf(10.0, (gains[i] - gains[i + 1] - 5) as f32 / 200.0)
+                let step = gains[i + 1] - gains[i]; // tenths of dB
+                                                    // Adaptive hysteresis: at least 2 dB, or the full gain step for
+                                                    // larger steps. Scales automatically with the device's gain table.
+                let hysteresis = step.max(20);
+                f32::powf(10.0, (gains[i] - gains[i + 1] - hysteresis) as f32 / 200.0)
             } else {
                 // at maximum gain: fixed −5 dB (does not trigger in practice)
                 f32::powf(10.0, -5.0_f32 / 20.0)
@@ -221,9 +237,9 @@ impl RtlsdrHandler {
             // Resolve the initial gain index and operating mode.
             let (initial_gain_idx, sagc_enabled, hardware_agc) = match config.gain_mode {
                 GainMode::Software => {
-                    let idx = (gains.len() - 1) * 20 / 100;
+                    let idx = (gains.len() - 1) * 50 / 100;
                     info!(
-                        "Software AGC (SAGC) enabled, starting at {:.1} dB (20%)",
+                        "Software AGC (SAGC) enabled, starting at {:.1} dB (50%)",
                         gains[idx] as f32 / 10.0
                     );
                     (idx, true, false)
@@ -298,11 +314,16 @@ impl RtlsdrHandler {
             // Hold-off counter: decremented at each SAGC evaluation tick.
             // When > 0, gain adjustments are suspended to prevent oscillation.
             let mut agc_hold_cntr: u32 = 0;
-            // Hunting suppressor: tracks consecutive direction reversals and
-            // freezes the control loop when the gain bounces between two adjacent
-            // steps with no stable operating point.  Uses exponential backoff so
-            // that repeated episodes on the same pair converge to a stable lock
-            // on the lower (safer) gain step.
+            // Confirmation counters: a gain change only fires after SAGC_CONFIRM_COUNT
+            // consecutive evaluation ticks all agree on the same direction.
+            // Prevents a single noisy measurement from triggering a gain step.
+            let mut agc_up_confirm: u32 = 0; // ticks where level < level_min
+            let mut agc_down_confirm: u32 = 0; // ticks where level > SAGC_LEVEL_MAX
+                                               // Hunting suppressor: tracks consecutive direction reversals and
+                                               // freezes the control loop when the gain bounces between two adjacent
+                                               // steps with no stable operating point.  Uses exponential backoff so
+                                               // that repeated episodes on the same pair converge to a stable lock
+                                               // on the lower (safer) gain step.
             let mut last_gain_dir: i32 = 0; // +1 = last change was up, -1 = down
             let mut hunt_count: u32 = 0;
             let mut hunt_freeze: u32 = 0;
@@ -417,46 +438,73 @@ impl RtlsdrHandler {
                         agc_read_cntr = agc_read_cntr.wrapping_add(1);
                         if sagc_enabled && agc_read_cntr.is_multiple_of(SAGC_CHECK_INTERVAL) {
                             if hunt_freeze > 0 {
-                                // Hunting suppressor active: the gain was bouncing between
-                                // two adjacent steps.  Hold the current gain until the
-                                // freeze period expires and the level estimator settles.
+                                // Hunting suppressor active: hold current gain, reset
+                                // confirmation counters so we start fresh after the freeze.
                                 hunt_freeze -= 1;
+                                agc_up_confirm = 0;
+                                agc_down_confirm = 0;
                             } else if agc_hold_cntr > 0 {
                                 // Still in hold-off period after the last gain change.
                                 agc_hold_cntr -= 1;
+                                agc_up_confirm = 0;
+                                agc_down_confirm = 0;
                             } else if agc_level < agc_level_min && gain_idx + 1 < gains.len() {
-                                // Signal too weak — increase gain by one step.
-                                gain_idx += 1;
-                                agc_level_min = level_min_factors[gain_idx] * SAGC_LEVEL_MAX;
-                                agc_hold_cntr = SAGC_HOLD_BUFFERS;
-                                // Hunting detection: consecutive direction reversals.
-                                if last_gain_dir == -1 {
-                                    hunt_count += 1;
-                                    if hunt_count >= SAGC_HUNT_THRESHOLD {
-                                        // Stay on the lower (safer) gain step and freeze.
-                                        gain_idx -= 1;
-                                        agc_level_min =
-                                            level_min_factors[gain_idx] * SAGC_LEVEL_MAX;
-                                        hunt_freeze = hunt_freeze_ticks;
-                                        hunt_freeze_ticks = hunt_freeze_ticks
-                                            .saturating_mul(2)
-                                            .min(SAGC_HUNT_FREEZE_MAX);
-                                        hunt_count = 0;
-                                        last_gain_dir = -1;
-                                        warn!(
-                                            "SAGC: hunting ↑↓↑ between {:.1} and {:.1} dB, \
-                                             locking {:.1} dB for {} ticks",
-                                            gains[gain_idx] as f32 / 10.0,
-                                            gains[gain_idx + 1] as f32 / 10.0,
-                                            gains[gain_idx] as f32 / 10.0,
-                                            hunt_freeze,
-                                        );
-                                        if let Err(e) =
-                                            sdr.set_tuner_gain(TunerGain::Manual(gains[gain_idx]))
-                                        {
-                                            warn!("SAGC: set_tuner_gain failed: {}", e);
+                                // Level below threshold: accumulate confirmation ticks.
+                                agc_down_confirm = 0;
+                                agc_up_confirm += 1;
+                                if agc_up_confirm >= SAGC_CONFIRM_COUNT {
+                                    agc_up_confirm = 0;
+                                    // Signal too weak — increase gain by one step.
+                                    gain_idx += 1;
+                                    agc_level_min = level_min_factors[gain_idx] * SAGC_LEVEL_MAX;
+                                    agc_hold_cntr = SAGC_HOLD_BUFFERS;
+                                    // Hunting detection: consecutive direction reversals.
+                                    if last_gain_dir == -1 {
+                                        hunt_count += 1;
+                                        if hunt_count >= SAGC_HUNT_THRESHOLD {
+                                            // Stay on the lower (safer) gain step and freeze.
+                                            // The gain was incremented then immediately reverted
+                                            // (net zero hardware change), so clear agc_hold_cntr
+                                            // — no hardware settling time is needed.
+                                            gain_idx -= 1;
+                                            agc_level_min =
+                                                level_min_factors[gain_idx] * SAGC_LEVEL_MAX;
+                                            agc_hold_cntr = 0;
+                                            hunt_freeze = hunt_freeze_ticks;
+                                            hunt_freeze_ticks = hunt_freeze_ticks
+                                                .saturating_mul(2)
+                                                .min(SAGC_HUNT_FREEZE_MAX);
+                                            hunt_count = 0;
+                                            last_gain_dir = -1;
+                                            warn!(
+                                                "SAGC: hunting ↑↓↑ between {:.1} and {:.1} dB, \
+                                                 locking {:.1} dB for {} ticks",
+                                                gains[gain_idx] as f32 / 10.0,
+                                                gains[gain_idx + 1] as f32 / 10.0,
+                                                gains[gain_idx] as f32 / 10.0,
+                                                hunt_freeze,
+                                            );
+                                            if let Err(e) = sdr
+                                                .set_tuner_gain(TunerGain::Manual(gains[gain_idx]))
+                                            {
+                                                warn!("SAGC: set_tuner_gain failed: {}", e);
+                                            }
+                                        } else {
+                                            last_gain_dir = 1;
+                                            if let Err(e) = sdr
+                                                .set_tuner_gain(TunerGain::Manual(gains[gain_idx]))
+                                            {
+                                                warn!("SAGC: set_tuner_gain failed: {}", e);
+                                            } else {
+                                                debug!(
+                                                    "SAGC: gain ↑ {:.1} dB (level {:.1})",
+                                                    gains[gain_idx] as f32 / 10.0,
+                                                    agc_level,
+                                                );
+                                            }
                                         }
                                     } else {
+                                        hunt_count = 0;
                                         last_gain_dir = 1;
                                         if let Err(e) =
                                             sdr.set_tuner_gain(TunerGain::Manual(gains[gain_idx]))
@@ -470,51 +518,62 @@ impl RtlsdrHandler {
                                             );
                                         }
                                     }
-                                } else {
-                                    hunt_count = 0;
-                                    last_gain_dir = 1;
-                                    if let Err(e) =
-                                        sdr.set_tuner_gain(TunerGain::Manual(gains[gain_idx]))
-                                    {
-                                        warn!("SAGC: set_tuner_gain failed: {}", e);
-                                    } else {
-                                        debug!(
-                                            "SAGC: gain ↑ {:.1} dB (level {:.1})",
-                                            gains[gain_idx] as f32 / 10.0,
-                                            agc_level,
-                                        );
-                                    }
                                 }
                             } else if agc_level > SAGC_LEVEL_MAX && gain_idx > 0 {
-                                // Signal too strong — decrease gain by one step.
-                                gain_idx -= 1;
-                                agc_level_min = level_min_factors[gain_idx] * SAGC_LEVEL_MAX;
-                                agc_hold_cntr = SAGC_HOLD_BUFFERS;
-                                // Hunting detection: consecutive direction reversals.
-                                if last_gain_dir == 1 {
-                                    hunt_count += 1;
-                                    if hunt_count >= SAGC_HUNT_THRESHOLD {
-                                        // Already on the lower step; freeze here.
-                                        hunt_freeze = hunt_freeze_ticks;
-                                        hunt_freeze_ticks = hunt_freeze_ticks
-                                            .saturating_mul(2)
-                                            .min(SAGC_HUNT_FREEZE_MAX);
-                                        hunt_count = 0;
-                                        last_gain_dir = -1;
-                                        warn!(
-                                            "SAGC: hunting ↓↑↓ between {:.1} and {:.1} dB, \
-                                             locking {:.1} dB for {} ticks",
-                                            gains[gain_idx] as f32 / 10.0,
-                                            gains[gain_idx + 1] as f32 / 10.0,
-                                            gains[gain_idx] as f32 / 10.0,
-                                            hunt_freeze,
-                                        );
-                                        if let Err(e) =
-                                            sdr.set_tuner_gain(TunerGain::Manual(gains[gain_idx]))
-                                        {
-                                            warn!("SAGC: set_tuner_gain failed: {}", e);
+                                // Level above threshold: accumulate confirmation ticks.
+                                agc_up_confirm = 0;
+                                agc_down_confirm += 1;
+                                if agc_down_confirm >= SAGC_CONFIRM_COUNT {
+                                    agc_down_confirm = 0;
+                                    // Signal too strong — decrease gain by one step.
+                                    gain_idx -= 1;
+                                    agc_level_min = level_min_factors[gain_idx] * SAGC_LEVEL_MAX;
+                                    agc_hold_cntr = SAGC_HOLD_BUFFERS;
+                                    // Hunting detection: consecutive direction reversals.
+                                    if last_gain_dir == 1 {
+                                        hunt_count += 1;
+                                        if hunt_count >= SAGC_HUNT_THRESHOLD {
+                                            // Already on the lower step; freeze here.
+                                            // agc_hold_cntr retains SAGC_HOLD_BUFFERS from the
+                                            // gain step above: the hardware gain DID change, so
+                                            // the hold-off is valid.  After hunt_freeze expires,
+                                            // the SAGC stays held for SAGC_HOLD_BUFFERS more
+                                            // ticks to let the hardware settle.
+                                            hunt_freeze = hunt_freeze_ticks;
+                                            hunt_freeze_ticks = hunt_freeze_ticks
+                                                .saturating_mul(2)
+                                                .min(SAGC_HUNT_FREEZE_MAX);
+                                            hunt_count = 0;
+                                            last_gain_dir = -1;
+                                            warn!(
+                                                "SAGC: hunting ↓↑↓ between {:.1} and {:.1} dB, \
+                                                 locking {:.1} dB for {} ticks",
+                                                gains[gain_idx] as f32 / 10.0,
+                                                gains[gain_idx + 1] as f32 / 10.0,
+                                                gains[gain_idx] as f32 / 10.0,
+                                                hunt_freeze,
+                                            );
+                                            if let Err(e) = sdr
+                                                .set_tuner_gain(TunerGain::Manual(gains[gain_idx]))
+                                            {
+                                                warn!("SAGC: set_tuner_gain failed: {}", e);
+                                            }
+                                        } else {
+                                            last_gain_dir = -1;
+                                            if let Err(e) = sdr
+                                                .set_tuner_gain(TunerGain::Manual(gains[gain_idx]))
+                                            {
+                                                warn!("SAGC: set_tuner_gain failed: {}", e);
+                                            } else {
+                                                debug!(
+                                                    "SAGC: gain ↓ {:.1} dB (level {:.1})",
+                                                    gains[gain_idx] as f32 / 10.0,
+                                                    agc_level,
+                                                );
+                                            }
                                         }
                                     } else {
+                                        hunt_count = 0;
                                         last_gain_dir = -1;
                                         if let Err(e) =
                                             sdr.set_tuner_gain(TunerGain::Manual(gains[gain_idx]))
@@ -528,21 +587,11 @@ impl RtlsdrHandler {
                                             );
                                         }
                                     }
-                                } else {
-                                    hunt_count = 0;
-                                    last_gain_dir = -1;
-                                    if let Err(e) =
-                                        sdr.set_tuner_gain(TunerGain::Manual(gains[gain_idx]))
-                                    {
-                                        warn!("SAGC: set_tuner_gain failed: {}", e);
-                                    } else {
-                                        debug!(
-                                            "SAGC: gain ↓ {:.1} dB (level {:.1})",
-                                            gains[gain_idx] as f32 / 10.0,
-                                            agc_level,
-                                        );
-                                    }
                                 }
+                            } else {
+                                // Signal in the stable zone — reset confirmation counters.
+                                agc_up_confirm = 0;
+                                agc_down_confirm = 0;
                             }
                         }
                     }
@@ -748,21 +797,41 @@ mod tests {
     #[test]
     fn level_min_factors_known_values() {
         // Gains in tenths of dB: 0, 9, 14.
+        // steps: 9 and 5 — both < 20, so hysteresis = 20 for both.
         let gains = vec![0i32, 9, 14];
         let factors = compute_level_min_factors(&gains);
         assert_eq!(factors.len(), 3);
 
-        // factors[0] = 10^((0 − 9 − 5) / 200)
-        let f0 = f32::powf(10.0, (0 - 9 - 5) as f32 / 200.0);
+        // factors[0]: step=9, hysteresis=max(9,20)=20 → 10^((0 − 9 − 20) / 200)
+        let f0 = f32::powf(10.0, (0 - 9 - 20) as f32 / 200.0);
         assert!((factors[0] - f0).abs() < 1e-6, "factor[0] mismatch");
 
-        // factors[1] = 10^((9 − 14 − 5) / 200)
-        let f1 = f32::powf(10.0, (9 - 14 - 5) as f32 / 200.0);
+        // factors[1]: step=5, hysteresis=max(5,20)=20 → 10^((9 − 14 − 20) / 200)
+        let f1 = f32::powf(10.0, (9 - 14 - 20) as f32 / 200.0);
         assert!((factors[1] - f1).abs() < 1e-6, "factor[1] mismatch");
 
         // factors[2] = 10^(−5 / 20)  (last index)
         let f2 = f32::powf(10.0, -5.0_f32 / 20.0);
         assert!((factors[2] - f2).abs() < 1e-6, "factor[2] mismatch");
+    }
+
+    #[test]
+    fn level_min_factors_adaptive_hysteresis_for_large_step() {
+        // Step of 40 tenths (4 dB) > 20 → hysteresis = 40 (step itself).
+        let gains = vec![0i32, 400];
+        let factors = compute_level_min_factors(&gains);
+        // hysteresis = max(400, 20) = 400
+        let expected = f32::powf(10.0, (0 - 400 - 400) as f32 / 200.0);
+        assert!(
+            (factors[0] - expected).abs() < 1e-6,
+            "adaptive factor mismatch"
+        );
+        // Must be smaller than the fixed-20 factor (larger dead-band).
+        let fixed_20 = f32::powf(10.0, (0 - 400 - 20) as f32 / 200.0);
+        assert!(
+            factors[0] < fixed_20,
+            "adaptive factor should be lower than fixed-20"
+        );
     }
 
     #[test]

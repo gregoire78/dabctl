@@ -1,3 +1,9 @@
+/// Time-domain interleaving delays for each byte lane (lane = byte_index mod 16).
+///
+/// Each value is the number of frames the byte in that lane must be delayed.
+/// ETSI EN 300 401 §12.3, Table 21.
+const INTERLEAVE_DELAYS: [usize; 16] = [0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15];
+
 pub struct CifInterleaver {
     history: [Vec<u8>; 16],
     write_index: usize,
@@ -19,7 +25,11 @@ impl CifInterleaver {
         }
     }
 
-    /// Push current CIF-like payload and return interleaved payload once history is primed.
+    /// Push the current CIF payload and return the interleaved output once the
+    /// history is fully primed (first 16 calls return `None`).
+    ///
+    /// Each byte at position `i` in the output is taken from the frame that was
+    /// pushed `INTERLEAVE_DELAYS[i & 0x0F]` calls ago (ETSI EN 300 401 §12.3).
     pub fn push_and_interleave(&mut self, payload: &[u8]) -> Option<Vec<u8>> {
         self.history[self.write_index].clear();
         self.history[self.write_index].extend_from_slice(payload);
@@ -28,14 +38,16 @@ impl CifInterleaver {
             self.filled += 1;
         }
 
-        let interleave_map: [usize; 16] = [0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15];
         let out = if self.filled == 16 {
             let len = payload.len();
             let mut tmp = vec![0u8; len];
             for i in 0..len {
                 let lane = i & 0x0F;
-                let src = interleave_map[lane];
-                let src_idx = (self.write_index + src) & 0x0F;
+                let delay = INTERLEAVE_DELAYS[lane];
+                // history[write_index] is the most recent frame (delay 0).
+                // To reach the frame `delay` steps back we subtract from write_index
+                // in the circular buffer: (write_index + 16 - delay) & 0x0F.
+                let src_idx = (self.write_index + 16 - delay) & 0x0F;
                 let src_vec = &self.history[src_idx];
                 if i < src_vec.len() {
                     tmp[i] = src_vec[i];
@@ -56,11 +68,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn new() {
-        let _ci = CifInterleaver::new();
-    }
-
-    #[test]
     fn returns_none_before_primed() {
         let mut ci = CifInterleaver::new();
         for _ in 0..15 {
@@ -71,13 +78,13 @@ mod tests {
     #[test]
     fn returns_some_after_primed() {
         let mut ci = CifInterleaver::new();
-        for i in 0..16 {
-            let result = ci.push_and_interleave(&[i as u8; 8]);
+        for i in 0..16u8 {
+            let result = ci.push_and_interleave(&[i; 8]);
             if i < 15 {
                 assert!(result.is_none());
             } else {
-                assert!(result.is_some());
-                assert_eq!(result.unwrap().len(), 8);
+                let out = result.expect("must produce output on 16th push");
+                assert_eq!(out.len(), 8);
             }
         }
     }
@@ -85,10 +92,39 @@ mod tests {
     #[test]
     fn output_length_matches_input() {
         let mut ci = CifInterleaver::new();
-        for i in 0..20 {
-            let payload = vec![i as u8; 32];
+        for i in 0..20u8 {
+            let payload = vec![i; 32];
             if let Some(out) = ci.push_and_interleave(&payload) {
                 assert_eq!(out.len(), 32);
+            }
+        }
+    }
+
+    /// Verify that byte lane `l` in the output carries the value pushed
+    /// `INTERLEAVE_DELAYS[l]` frames ago, not `l` frames ago (regression
+    /// against the wrong `(write_index + delay)` formula).
+    #[test]
+    fn correct_delay_per_lane() {
+        let mut ci = CifInterleaver::new();
+        // Push 20 frames of 16 bytes each where every byte equals the frame number.
+        let mut results = Vec::new();
+        for frame in 0u8..20 {
+            let payload = [frame; 16];
+            if let Some(out) = ci.push_and_interleave(&payload) {
+                results.push((frame, out));
+            }
+        }
+        // For each output frame, byte at lane `l` must equal the value pushed
+        // INTERLEAVE_DELAYS[l] frames before the current frame.
+        for (frame, out) in &results {
+            for lane in 0..16usize {
+                let delay = INTERLEAVE_DELAYS[lane] as u8;
+                let expected = frame.saturating_sub(delay);
+                assert_eq!(
+                    out[lane], expected,
+                    "lane {lane}: expected frame {expected}, got {}",
+                    out[lane]
+                );
             }
         }
     }

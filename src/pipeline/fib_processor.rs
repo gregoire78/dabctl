@@ -141,8 +141,8 @@ pub struct FibProcessor {
     cif_count_lo: i16,
     is_synced: bool,
     // Callbacks
-    pub ensemble_name_cb: Option<Box<dyn Fn(&str, u32) + Send>>,
-    pub program_name_cb: Option<Box<dyn Fn(&str, i32) + Send>>,
+    pub ensemble_name_cb: Option<std::sync::Arc<dyn Fn(&str, u32) + Send + Sync>>,
+    pub program_name_cb: Option<std::sync::Arc<dyn Fn(&str, i32) + Send + Sync>>,
 }
 
 impl Default for FibProcessor {
@@ -168,14 +168,25 @@ impl FibProcessor {
         let mut processed_bytes: i32 = 0;
         while processed_bytes < 30 {
             let offset = processed_bytes as usize * 8;
+            // Need at least 8 bits for the FIG header (type + length).
+            if offset + 8 > p.len() {
+                break;
+            }
             let fig_type = get_bits_3(p, offset);
+            // Read the FIG length field before dispatching so we can verify
+            // the full FIG body fits within the FIB (ETSI EN 300 401 §5.2.1).
+            let length = get_bits_5(p, offset + 3) as i32;
+            let fig_end_bit = offset + (length as usize + 1) * 8;
+            if fig_end_bit > p.len() {
+                // Truncated or corrupted FIG — discard the rest of this FIB.
+                break;
+            }
             match fig_type {
                 0 => self.process_fig0(p, offset),
                 1 => self.process_fig1(p, offset),
                 7 => return,
                 _ => {}
             }
-            let length = get_bits_5(p, offset + 3) as i32;
             processed_bytes += length + 1;
         }
     }
@@ -380,6 +391,9 @@ impl FibProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+
+    // ── EBU Latin ─────────────────────────────────────────────────────────────
 
     #[test]
     fn test_ebu_to_char_ascii() {
@@ -407,5 +421,153 @@ mod tests {
     #[test]
     fn test_ebu_to_char_euro() {
         assert_eq!(ebu_to_char(0xA9), '€');
+    }
+
+    // ── process_fib helpers ───────────────────────────────────────────────────
+
+    /// Convert a byte slice into a 256-element bit array (`u8` per bit, MSB first)
+    /// as expected by `process_fib` and the `get_bits_*` family.
+    fn bytes_to_fib(bytes: &[u8]) -> [u8; 256] {
+        let mut fib = [0u8; 256];
+        for (byte_idx, &byte) in bytes.iter().enumerate() {
+            for bit in 0..8usize {
+                fib[byte_idx * 8 + bit] = (byte >> (7 - bit)) & 1;
+            }
+        }
+        fib
+    }
+
+    // ── process_fib — FIG end marker (type 7) ─────────────────────────────────
+
+    /// A FIG with type = 7 (ETSI EN 300 401 §8.1.1) signals the end of the FIG
+    /// list.  process_fib must return immediately and never invoke any callback.
+    #[test]
+    fn process_fib_type7_end_marker_returns_early() {
+        // Header byte: type=7 (0b111), length=0 → 0b111_00000 = 0xE0
+        let fib = bytes_to_fib(&[0xE0]);
+        let called = Arc::new(Mutex::new(false));
+        let called2 = called.clone();
+        let mut p = FibProcessor::new();
+        p.ensemble_name_cb = Some(Arc::new(move |_, _| *called2.lock().unwrap() = true));
+        p.process_fib(&fib, 0);
+        assert!(
+            !*called.lock().unwrap(),
+            "callback must not fire for FIG type 7"
+        );
+    }
+
+    // ── process_fib — bounds check (regression for index-out-of-bounds panic) ─
+
+    /// A FIG whose length field claims more bytes than remain in the FIB must
+    /// be silently discarded.  Before the fix, this caused an index-out-of-bounds
+    /// panic inside `get_bits_*` (ETSI EN 300 401 §5.2.1).
+    ///
+    /// Layout:
+    ///   FIG 0 at offset 0  – type=0, length=0  (8 bits, valid)
+    ///   FIG 0 at offset 8  – type=0, length=31 → fig_end_bit = 8+32×8 = 264 > 256 → break
+    #[test]
+    fn process_fib_oversized_length_does_not_panic() {
+        let mut fib = [0u8; 256];
+        // Second FIG header starts at bit offset 8.
+        // Bits 11-15 are the length field; set all five to 1 → length = 31.
+        fib[11] = 1;
+        fib[12] = 1;
+        fib[13] = 1;
+        fib[14] = 1;
+        fib[15] = 1;
+        // Must not panic.
+        FibProcessor::new().process_fib(&fib, 0);
+    }
+
+    // ── process_fib — FIG 1/0: ensemble label ────────────────────────────────
+
+    /// A well-formed FIG 1/0 (ensemble label, ETSI EN 300 401 §8.1.13) must
+    /// invoke `ensemble_name_cb` with the decoded label and SId.
+    #[test]
+    fn process_fib_ensemble_label_callback_invoked() {
+        // Build FIG 1/0 as real bytes, then convert to bit array.
+        //
+        // Byte layout (ETSI EN 300 401 §8.1.13):
+        //  [0]      header  : type=1 (001), length=21 (10101) → 0x35
+        //  [1]      ext hdr : charset=0 (0000), OE=0, extension=0 (000) → 0x00
+        //  [2..3]   SId     : 0xF043
+        //  [4..19]  label   : "NRJ             " (16 bytes, space-padded, ASCII)
+        //  [20..21] char flag: not read by process_fig1 → 0x00, 0x00
+        let label_bytes: [u8; 16] = {
+            let mut b = [0u8; 16]; // null-pad so get_bits_8 ch==0 check skips them
+            b[0] = b'N';
+            b[1] = b'R';
+            b[2] = b'J';
+            b
+        };
+        let mut raw = [0u8; 22];
+        raw[0] = 0x35; // type=1, length=21
+        raw[1] = 0x00; // charset=0, OE=0, ext=0
+        raw[2] = 0xF0; // SId high byte
+        raw[3] = 0x43; // SId low  byte
+        raw[4..20].copy_from_slice(&label_bytes);
+        // raw[20..21] = 0x00 (flag, padding)
+
+        // Append a FIG end marker (type=7) so the loop stops cleanly.
+        let mut fig_bytes = raw.to_vec();
+        fig_bytes.push(0xE0); // FIG end marker
+        let fib = bytes_to_fib(&fig_bytes);
+
+        let received: Arc<Mutex<Option<(String, u32)>>> = Arc::new(Mutex::new(None));
+        let received2 = received.clone();
+        let mut p = FibProcessor::new();
+        p.ensemble_name_cb = Some(Arc::new(move |name, sid| {
+            *received2.lock().unwrap() = Some((name.to_owned(), sid));
+        }));
+        p.process_fib(&fib, 0);
+
+        let r = received.lock().unwrap();
+        let (name, sid) = r.as_ref().expect("ensemble_name_cb was not invoked");
+        assert_eq!(name, "NRJ", "decoded label mismatch");
+        assert_eq!(*sid, 0xF043, "decoded SId mismatch");
+    }
+
+    // ── process_fib — FIG 1/1: service label ─────────────────────────────────
+
+    /// A well-formed FIG 1/1 (service label, ETSI EN 300 401 §8.1.14.1) must
+    /// invoke `program_name_cb` with the decoded service name and SId.
+    #[test]
+    fn process_fib_service_label_callback_invoked() {
+        // Byte layout (ETSI EN 300 401 §8.1.14.1):
+        //  [0]      header  : type=1 (001), length=21 (10101) → 0x35
+        //  [1]      ext hdr : charset=0, OE=0, extension=1 (001) → 0x01
+        //  [2..3]   SId     : 0xF2F8  (NRJ)
+        //  [4..19]  label   : "NRJ             "
+        //  [20..21] char flag: 0x00, 0x00
+        let label_bytes: [u8; 16] = {
+            let mut b = [0u8; 16]; // null-pad so get_bits_8 ch==0 check skips them
+            b[0] = b'N';
+            b[1] = b'R';
+            b[2] = b'J';
+            b
+        };
+        let mut raw = [0u8; 22];
+        raw[0] = 0x35; // type=1, length=21
+        raw[1] = 0x01; // charset=0, OE=0, ext=1
+        raw[2] = 0xF2; // SId high byte
+        raw[3] = 0xF8; // SId low  byte
+        raw[4..20].copy_from_slice(&label_bytes);
+
+        let mut fig_bytes = raw.to_vec();
+        fig_bytes.push(0xE0); // FIG end marker
+        let fib = bytes_to_fib(&fig_bytes);
+
+        let received: Arc<Mutex<Option<(String, i32)>>> = Arc::new(Mutex::new(None));
+        let received2 = received.clone();
+        let mut p = FibProcessor::new();
+        p.program_name_cb = Some(Arc::new(move |name, sid| {
+            *received2.lock().unwrap() = Some((name.to_owned(), sid));
+        }));
+        p.process_fib(&fib, 0);
+
+        let r = received.lock().unwrap();
+        let (name, sid) = r.as_ref().expect("program_name_cb was not invoked");
+        assert_eq!(name, "NRJ", "decoded service name mismatch");
+        assert_eq!(*sid, 0xF2F8_u32 as i32, "decoded SId mismatch");
     }
 }

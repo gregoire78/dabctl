@@ -18,9 +18,11 @@ use rayon::prelude::*;
 use smallvec::SmallVec;
 
 /// Callback invoked with ensemble name and EId when FIC is decoded.
-type EnsembleCb = Option<Box<dyn Fn(&str, u32) + Send>>;
+type EnsembleCb = Option<Arc<dyn Fn(&str, u32) + Send + Sync>>;
 /// Callback invoked with programme name and SId when FIC is decoded.
-type ProgramCb = Option<Box<dyn Fn(&str, i32) + Send>>;
+type ProgramCb = Option<Arc<dyn Fn(&str, i32) + Send + Sync>>;
+/// Callback invoked with FIC quality percentage after each FIC frame.
+type FicQualityCb = Option<Arc<dyn Fn(i16) + Send + Sync>>;
 
 const RING_CAPACITY: usize = 512;
 const INLINE_SUBCH: usize = 8;
@@ -143,6 +145,9 @@ pub struct DabPipeline {
     running: Arc<AtomicBool>,
     processing: Arc<AtomicBool>,
     bits_per_block: usize,
+    ensemble_cb: EnsembleCb,
+    program_cb: ProgramCb,
+    fic_quality_cb: FicQualityCb,
 }
 
 impl DabPipeline {
@@ -151,7 +156,7 @@ impl DabPipeline {
         sender: mpsc::SyncSender<DabFrame>,
         ensemble_cb: EnsembleCb,
         program_cb: ProgramCb,
-        fic_quality_cb: Option<Box<dyn Fn(i16) + Send>>,
+        fic_quality_cb: FicQualityCb,
     ) -> Self {
         let params = DabParams::new(dab_mode);
         let bits_per_block = 2 * params.get_carriers();
@@ -163,17 +168,11 @@ impl DabPipeline {
         let p = processing.clone();
         let ring_rx = ring.clone();
 
+        let ecb = ensemble_cb.clone();
+        let pcb = program_cb.clone();
+        let fqcb = fic_quality_cb.clone();
         let thread_handle = thread::spawn(move || {
-            Self::run_loop(
-                ring_rx,
-                r,
-                p,
-                params,
-                sender,
-                ensemble_cb,
-                program_cb,
-                fic_quality_cb,
-            );
+            Self::run_loop(ring_rx, r, p, params, sender, ecb, pcb, fqcb);
         });
 
         DabPipeline {
@@ -182,6 +181,9 @@ impl DabPipeline {
             running,
             processing,
             bits_per_block,
+            ensemble_cb,
+            program_cb,
+            fic_quality_cb,
         }
     }
 
@@ -217,8 +219,11 @@ impl DabPipeline {
         let r = self.running.clone();
         let p = self.processing.clone();
         let params = DabParams::new(1);
+        let ecb = self.ensemble_cb.clone();
+        let pcb = self.program_cb.clone();
+        let fqcb = self.fic_quality_cb.clone();
         self.thread_handle = Some(thread::spawn(move || {
-            Self::run_loop(ring, r, p, params, sender, None, None, None);
+            Self::run_loop(ring, r, p, params, sender, ecb, pcb, fqcb);
         }));
     }
 
@@ -231,7 +236,7 @@ impl DabPipeline {
         sender: mpsc::SyncSender<DabFrame>,
         ensemble_cb: EnsembleCb,
         program_cb: ProgramCb,
-        fic_quality_cb: Option<Box<dyn Fn(i16) + Send>>,
+        fic_quality_cb: FicQualityCb,
     ) {
         let bits_per_block = 2 * params.get_carriers();
         // Mode I: 18 MSC blocks per CIF — ETSI EN 300 401 §14.1
@@ -251,7 +256,7 @@ impl DabPipeline {
         let mut index_out: usize = 0;
         let mut expected_block: i16 = 2;
         let mut amount: usize = 0;
-        let mut minor: i16 = 0;
+        let mut minor: u32 = 0;
         let mut cif_count_hi: i16 = -1;
         let mut cif_count_lo: i16 = -1;
         let mut temp = vec![0i16; 55296];
@@ -292,6 +297,12 @@ impl DabPipeline {
 
             // FIC blocks 2..4 — ETSI EN 300 401 §3.2.1
             if (2..=4).contains(&blkno) {
+                // Reset quality counters at the start of each FIC frame so
+                // get_fic_quality() reflects only the current frame, not a
+                // cumulative average that masks recent degradation.
+                if blkno == 2 {
+                    my_fic_handler.reset_quality_counters();
+                }
                 let offset = (blkno - 2) as usize * bits_per_block;
                 let copy_len = bits_per_block.min(bdata.len());
                 fib_input[offset..offset + copy_len].copy_from_slice(&bdata[..copy_len]);
@@ -351,8 +362,8 @@ impl DabPipeline {
 
                 // Adjusted CIF counter — ETSI EN 300 401 §14.1
                 let (adj_hi, adj_lo) = {
-                    let mut lo = cif_count_lo + minor;
-                    let mut hi = cif_count_hi;
+                    let mut lo = cif_count_lo as i32 + minor as i32;
+                    let mut hi = cif_count_hi as i32;
                     if lo >= 250 {
                         lo %= 250;
                         hi += 1;
