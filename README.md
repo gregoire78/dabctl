@@ -4,12 +4,13 @@
 
 **RTL-SDR → PCM audio pipeline for DAB+ radio, written in Rust**
 
-Rust port of [eti-cmdline](https://github.com/JvanKatwijk/eti-stuff/tree/master/eti-cmdline) (IQ → ETI)
-and [dablin](https://github.com/Opendigitalradio/dablin) (ETI → audio),
-unified into a single RTL-SDR → PCM direct pipeline.
+Adapted from [eti-cmdline](https://github.com/JvanKatwijk/eti-stuff/tree/master/eti-cmdline),
+[dablin](https://github.com/Opendigitalradio/dablin),
+and [AbracaDABra](https://github.com/KejPi/AbracaDABra) —
+unified into a single **direct** RTL-SDR → PCM pipeline.
 
 [![Rust](https://img.shields.io/badge/Rust-2021-orange)](https://www.rust-lang.org/)
-[![License: GPL-2.0](https://img.shields.io/badge/License-GPL%202.0-blue.svg)](COPYING)
+[![License: GPL-2.0](https://img.shields.io/badge/License-GPL%202.0-blue.svg)](LICENSE)
 
 </div>
 
@@ -106,7 +107,8 @@ dabctl -C <channel> -s <sid> [options]
 |---|---|---|---|
 | `--channel` | `-C` | DAB channel (e.g. `5A`, `6C`, `11C`) | **required** |
 | `--sid` | `-s` | Service ID in hex (e.g. `0xF2F8`) | **required** |
-| `--gain` | `-G` | Tuner gain in % (0–100) | software AGC |
+| `--gain` | `-G` | Tuner gain in % (0–100), mutually exclusive with `--hardware-agc` | software AGC |
+| `--hardware-agc` | | Use the RTL-SDR chip's built-in hardware AGC, mutually exclusive with `-G` | off |
 | `--ppm` | `-p` | Frequency correction in PPM | `0` |
 | `--sync-time` | `-d` | Sync timeout in seconds | `5` |
 | `--detect-time` | `-D` | Ensemble detection timeout in seconds | `10` |
@@ -114,9 +116,10 @@ dabctl -C <channel> -s <sid> [options]
 | `--disable-dyn-fic` | `-F` | Suppress FIC log messages on stderr | off |
 | `--slide-dir` | `-S` | Save slideshow images to this directory | — |
 | `--slide-base64` | | Include slideshow images as base64 in JSON output | off |
+| `--no-silence-fill` | | Emit nothing instead of silence during radio fades | off |
 | `--silent` | | No log output on stderr | off |
 | `--device-index` | | RTL-SDR dongle index | `0` |
-| `--aac-decoder` | | AAC backend: `faad2` or `fdk-aac` (requires `fdk-aac` feature) | `faad2` |
+| `--aac-decoder` | | AAC backend: `faad2` or `fdk-aac` (requires `fdk-aac` feature). When the feature is enabled, defaults to `fdk-aac`. | `faad2` |
 
 Band III channels span **5A–13F** (174.928–239.200 MHz).
 L-Band channels (LA–LP, 1452–1478 MHz) are also supported.
@@ -185,7 +188,7 @@ src/
     band_handler.rs             Channel name → centre frequency
     ringbuffer.rs               Thread-safe IQ ring buffer (SPSC)
     subchannel_pool.rs          Pre-allocated subchannel buffer pool
-    eti_generator.rs            DabPipeline: OFDM blocks → DabFrame via mpsc
+    dab_pipeline.rs             DabPipeline: OFDM blocks → DabFrame via mpsc
     fib_processor.rs            FIG 0/0, 0/1, FIG 1 parsing
     fic_handler.rs              FIC depuncturing and Viterbi decoding
     viterbi_handler.rs          Viterbi decoder {0155,0117,0123,0155}
@@ -340,3 +343,22 @@ man dabctl
 | [ETSI EN 301 234](https://www.etsi.org/deliver/etsi_en/301200_301299/301234/02.01.01_60/en_301234v020101p.pdf) | Multimedia Object Transfer (MOT) protocol |
 | [ETSI TS 101 499](https://www.etsi.org/deliver/etsi_ts/101400_101499/101499/03.01.01_60/ts_101499v030101p.pdf) | MOT Slideshow application |
 | [ETSI TS 102 980](https://www.etsi.org/deliver/etsi_ts/102900_102999/102980/02.01.02_60/ts_102980v020102p.pdf) | Dynamic Label Plus (DL+) |
+
+---
+
+## Licence
+
+`dabctl` is released under the **GNU General Public License v2.0** (GPL-2.0).
+See the [LICENSE](LICENSE) file for the full licence text.
+
+### Dependency licences
+
+| Component | Licence |
+|---|---|
+| [eti-cmdline](https://github.com/JvanKatwijk/eti-stuff/tree/master/eti-cmdline) | GPL-2.0 |
+| [dablin](https://github.com/Opendigitalradio/dablin) | GPL-2.0 |
+| [AbracaDABra](https://github.com/KejPi/AbracaDABra) (software AGC) | MIT |
+| [rtl-sdr-rs](https://github.com/ccostes/rtl-sdr-rs) | MIT |
+| [osmocom/rtl-sdr](https://github.com/osmocom/rtl-sdr) | GPL-2.0 |
+| libfaad2 | GPL-2.0 |
+| libfdk-aac *(optional)* | Fraunhofer FDK AAC Codec Library Licence (non-free) |

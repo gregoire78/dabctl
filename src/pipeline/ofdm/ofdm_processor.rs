@@ -30,7 +30,7 @@ pub struct OfdmProcessor {
     fft_buffer: Vec<Complex32>,
     reference_phase: Vec<Complex32>,
     ofdm_buffer: Vec<Complex32>,
-    nco_phase: f32,
+    nco_phasor: Complex32,
     fine_corrector: f32,
     coarse_corrector: i32,
     f2_correction: bool,
@@ -85,7 +85,7 @@ impl OfdmProcessor {
             fft_buffer: vec![Complex32::new(0.0, 0.0); t_u],
             reference_phase: vec![Complex32::new(0.0, 0.0); t_u],
             ofdm_buffer: vec![Complex32::new(0.0, 0.0); 2 * t_s],
-            nco_phase: 0.0,
+            nco_phasor: Complex32::new(1.0, 0.0),
             fine_corrector: 0.0,
             coarse_corrector: 0,
             f2_correction: true,
@@ -135,17 +135,18 @@ impl OfdmProcessor {
             return Err(ProcessorError::Stopped);
         }
 
-        // Apply frequency correction via NCO
+        // Apply frequency correction via NCO.
+        // Precompute the per-sample rotation phasor once (one cos+sin call)
+        // and multiply the phasor state directly — avoids trig per sample.
         let delta = -2.0 * std::f32::consts::PI * phase as f32 / INPUT_RATE as f32;
-        self.nco_phase += delta;
-        // Keep phase in [-PI, PI] to avoid precision loss
-        if self.nco_phase > std::f32::consts::PI {
-            self.nco_phase -= 2.0 * std::f32::consts::PI;
+        let step = Complex32::from_polar(1.0, delta);
+        self.nco_phasor *= step;
+        // Renormalise to prevent floating-point magnitude drift over time.
+        let norm = self.nco_phasor.norm();
+        if norm > 0.0 {
+            self.nco_phasor /= norm;
         }
-        if self.nco_phase < -std::f32::consts::PI {
-            self.nco_phase += 2.0 * std::f32::consts::PI;
-        }
-        let corrected = temp[0] * Complex32::new(self.nco_phase.cos(), self.nco_phase.sin());
+        let corrected = temp[0] * self.nco_phasor;
         self.s_level = 0.00001 * jan_abs(corrected) + (1.0 - 0.00001) * self.s_level;
         Ok(corrected)
     }
@@ -165,17 +166,20 @@ impl OfdmProcessor {
             return Err(ProcessorError::Stopped);
         }
 
+        // Precompute the per-sample rotation phasor once (one cos+sin call
+        // for the whole batch) then use complex multiply per sample.
+        // This replaces O(N) trig calls with O(1) trig + O(N) multiplies.
         let delta = -2.0 * std::f32::consts::PI * phase as f32 / INPUT_RATE as f32;
+        let step = Complex32::from_polar(1.0, delta);
         for sample in v.iter_mut() {
-            self.nco_phase += delta;
-            if self.nco_phase > std::f32::consts::PI {
-                self.nco_phase -= 2.0 * std::f32::consts::PI;
-            }
-            if self.nco_phase < -std::f32::consts::PI {
-                self.nco_phase += 2.0 * std::f32::consts::PI;
-            }
-            *sample *= Complex32::new(self.nco_phase.cos(), self.nco_phase.sin());
+            self.nco_phasor *= step;
+            *sample *= self.nco_phasor;
             self.s_level = 0.00001 * jan_abs(*sample) + (1.0 - 0.00001) * self.s_level;
+        }
+        // Renormalise once per batch to prevent magnitude drift.
+        let norm = self.nco_phasor.norm();
+        if norm > 0.0 {
+            self.nco_phasor /= norm;
         }
         Ok(())
     }
@@ -344,7 +348,13 @@ impl OfdmProcessor {
             // Synchronized - enter the main frame processing loop
             let mut start_index = start_index as usize;
 
+            // Re-enable coarse AFC for the initial frames of each new sync
+            // acquisition. sync_reached() will disable it once the first
+            // frame has been decoded correctly.
+            self.f2_correction = true;
+
             // First sync
+            let mut first_frame = true;
             loop {
                 // SyncOnPhase: copy remaining data from sync
                 let remaining = self.t_u - start_index;
@@ -447,6 +457,13 @@ impl OfdmProcessor {
                 // Copy for next frame
                 self.ofdm_buffer[..self.t_u].copy_from_slice(&check_buf);
                 self.emit_sync_signal(true);
+                // Disable coarse AFC after the first successfully decoded
+                // frame — fine_corrector handles residual drift from here on.
+                // (ETSI EN 300 401 §8.4.3)
+                if first_frame {
+                    self.sync_reached();
+                    first_frame = false;
+                }
             }
         }
     }

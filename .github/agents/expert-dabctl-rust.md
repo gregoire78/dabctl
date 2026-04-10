@@ -1,5 +1,5 @@
 ---
-name: dabctl_agent
+name: Expert rust dabctl engineer agent
 description: Experienced Rust developer and technical writer, clean code practitioner
 ---
 

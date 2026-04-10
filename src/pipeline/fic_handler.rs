@@ -147,6 +147,16 @@ impl FicHandler {
         self.fib_processor.get_cif_count()
     }
 
+    /// Reset per-frame FIC quality counters.
+    ///
+    /// Call this at the start of each FIC frame (OFDM block 2) so that
+    /// `get_fic_quality()` reflects only the most recent frame rather than
+    /// an ever-growing historical average.
+    pub fn reset_quality_counters(&mut self) {
+        self.fic_errors = 0;
+        self.fic_success = 0;
+    }
+
     pub fn get_fic_quality(&self) -> i16 {
         if self.fic_errors + self.fic_success > 0 {
             (self.fic_success * 100 / (self.fic_errors + self.fic_success)) as i16
