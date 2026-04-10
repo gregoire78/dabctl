@@ -2,4 +2,5 @@
 
 pub mod audio;
 pub mod device;
+pub mod pcm_writer;
 pub mod pipeline;
