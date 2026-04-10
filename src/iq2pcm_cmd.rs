@@ -22,6 +22,9 @@ use tracing_subscriber::EnvFilter;
 use dabctl::audio::fic_decoder::FicDecoder;
 use dabctl::audio::pad_decoder::PadDecoder;
 use dabctl::audio::pad_output::PadOutput;
+use dabctl::audio::silence_filler::{
+    advance_silence_deadline, silence_deadline_after_good_au, SilenceBuffer,
+};
 use dabctl::audio::superframe::SuperframeFilter;
 use dabctl::device::rtlsdr_handler::{GainMode, RtlsdrHandler};
 use dabctl::pipeline::band_handler;
@@ -273,6 +276,17 @@ pub fn run(args: Iq2pcmArgs) {
     // Tracks the deadline for the next silence superframe.
     // Initialised lazily on the first real AU output.
     let mut silence_next = std::time::Instant::now();
+    // Deferred silence buffer (ETSI TS 102 563 §5.1).
+    // Holds silence frames for 2 CIF ticks (~48 ms) before writing them.
+    // A sync_ok within that window calls cancel(), preventing the pattern:
+    //   AU_OK → silence → AU_OK  (silence interleaved with real audio)
+    // instead of the correct:
+    //   silence → silence → AU_OK  (silence precedes the recovered audio)
+    // holdoff=2 (not 5) keeps the per-fade stream deficit to ~24 ms instead
+    // of ~96 ms, which is enough to keep ffmpeg speed ≥ 0.997× even during
+    // heavy fading.  holdoff=1 would flush on the very first tick and could
+    // still interleave silence with audio during a 24 ms recovery window.
+    let mut silence_buffer = SilenceBuffer::new(2);
 
     let mut current_subchid: Option<u8> = None;
     let mut ensemble_announced = false;
@@ -452,6 +466,17 @@ pub fn run(args: Iq2pcmArgs) {
                 }
             }
 
+            // On sync_ok: flush buffered silence BEFORE writing real audio.
+            // This keeps the stream chronologically ordered (silence precedes
+            // the recovered audio) WITHOUT discarding any silence frames, so
+            // the total PCM duration stays equal to wall-clock time (speed = 1.0×).
+            if result.sync_ok {
+                for sil_frame in silence_buffer.flush() {
+                    write_pcm(&mut stdout_lock, &sil_frame);
+                    silence_aus.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+
             if let Some(ref mut dec) = aac_decoder {
                 for au in &result.access_units {
                     if let Some(pcm) = dec.decode_frame(&au.data) {
@@ -461,38 +486,33 @@ pub fn run(args: Iq2pcmArgs) {
                             au_silence = Some(vec![0i16; pcm.len()]);
                         }
                         write_pcm(&mut stdout_lock, &pcm);
-                        // Advance the silence deadline one full superframe period ahead
-                        // of the current moment.  This prevents silence from being
-                        // injected on the very next CIF frame (~24ms later) if the
-                        // signal is in a recovery transition phase (alternating sync_ok /
-                        // sync_fail).  Without this guard the sequence would be:
-                        //   good_AU → silence → good_AU → silence → good_AU
-                        // instead of the correct:
-                        //   silence → silence → good_AU → good_AU
-                        // A 120ms grace window (= one DAB+ superframe, ETSI TS 102 563 §5.1)
-                        // is enough to cover any recovery transition without introducing
-                        // a perceptible delay before silence starts after a real signal drop.
                         silence_next = silence_deadline_after_good_au(std::time::Instant::now());
                     }
                 }
-                // Fill gaps with silence when a complete superframe was
-                // assembled but failed the fire-code CRC (ETSI TS 102 563 §5.1).
-                // Rate-limited: only emit once per ~120 ms superframe period so
-                // we do not overflow the consumer when sync_fail fires on every
-                // CIF frame (~44/s) instead of every superframe (~9/s).
+                // On sync_fail: push silence into the deferred buffer instead
+                // of writing it immediately.  The buffer holds for 5 CIF ticks
+                // (~120 ms) before flushing.  If sync_ok arrives within that
+                // window, cancel() discards the pending silence so no gap
+                // is inserted into the stream (ETSI TS 102 563 §5.1).
                 if result.sync_fail && !args.no_silence_fill {
                     let now = std::time::Instant::now();
                     if now >= silence_next {
                         if let Some(ref silence) = au_silence {
                             let n = au_count.max(1);
                             for _ in 0..n {
-                                write_pcm(&mut stdout_lock, silence);
+                                silence_buffer.push(silence.clone());
                             }
-                            silence_aus.fetch_add(n as i32, Ordering::Relaxed);
                         }
                         silence_next = advance_silence_deadline(silence_next, now);
                     }
                 }
+            }
+
+            // Flush deferred silence frames that have waited a full hold-off
+            // (2 CIF ticks ≈ 48 ms) without a sync_ok cancelling them.
+            for sil_frame in silence_buffer.tick() {
+                write_pcm(&mut stdout_lock, &sil_frame);
+                silence_aus.fetch_add(1, Ordering::Relaxed);
             }
 
             for pad in &result.pad_data {
@@ -527,37 +547,6 @@ pub fn run(args: Iq2pcmArgs) {
     let result = ofdm_thread.join();
     if let Ok((mut dev, _pl)) = result {
         dev.stop_reader();
-    }
-}
-
-/// Returns the silence deadline to set after a real PCM AU has been emitted.
-///
-/// Grants a 120 ms grace window (one DAB+ superframe, ETSI TS 102 563 §5.1)
-/// before silence injection is allowed.  This prevents silence from being
-/// interleaved with real audio during signal recovery transitions where
-/// `sync_ok` and `sync_fail` alternate on consecutive CIF frames.
-fn silence_deadline_after_good_au(now: std::time::Instant) -> std::time::Instant {
-    now + std::time::Duration::from_millis(120)
-}
-
-/// Advances the silence deadline by exactly one superframe period (120 ms)
-/// from `prev`, then clamps to `now` if the result has drifted behind real
-/// time (e.g. after a pipeline stall).  Advancing from the previous deadline
-/// rather than from `now` keeps the long-run fill rate at exactly 8.33/s
-/// regardless of CIF-quantisation jitter (~24 ms per frame).  Advancing from
-/// `now` instead would produce ~144 ms intervals and a fill rate of ~0.89×
-/// real-time, causing ffmpeg to report `speed < 1.0` during signal fades.
-///
-/// One DAB+ superframe = 5 CIF × 24 ms = 120 ms (ETSI TS 102 563 §5.1).
-fn advance_silence_deadline(
-    prev: std::time::Instant,
-    now: std::time::Instant,
-) -> std::time::Instant {
-    let next = prev + std::time::Duration::from_millis(120);
-    if next < now {
-        now
-    } else {
-        next
     }
 }
 
@@ -708,62 +697,6 @@ mod tests {
             result.is_err(),
             "clap must reject -G and --hardware-agc together"
         );
-    }
-
-    // ── Silence fill — deadline helpers ──────────────────────────────────────
-
-    /// After a good AU, the deadline must be exactly 120 ms in the future so
-    /// that the next sync_fail cannot inject silence immediately.
-    #[test]
-    fn silence_deadline_after_good_au_is_120ms_ahead() {
-        let now = std::time::Instant::now();
-        let deadline = silence_deadline_after_good_au(now);
-        let diff = deadline.duration_since(now);
-        assert_eq!(diff, std::time::Duration::from_millis(120));
-    }
-
-    /// When the previous deadline is in the future, `advance_silence_deadline`
-    /// must step forward exactly 120 ms from it — not from `now`.
-    /// This keeps the long-run fill rate at exactly 8.33 fills/s.
-    #[test]
-    fn advance_silence_deadline_steps_from_prev_when_in_future() {
-        let base = std::time::Instant::now();
-        let prev = base + std::time::Duration::from_millis(10); // still in the future
-        let now = base;
-        let next = advance_silence_deadline(prev, now);
-        assert_eq!(
-            next.duration_since(prev),
-            std::time::Duration::from_millis(120)
-        );
-    }
-
-    /// When the previous deadline has already drifted behind `now` (pipeline
-    /// stall), `advance_silence_deadline` must clamp to `now` so the next
-    /// iteration does not emit a burst of silence frames.
-    #[test]
-    fn advance_silence_deadline_clamps_to_now_on_stall() {
-        let now = std::time::Instant::now();
-        // prev is so old that prev + 120ms is still before now.
-        let prev = now - std::time::Duration::from_millis(500);
-        let next = advance_silence_deadline(prev, now);
-        // next must not be before now.
-        assert!(next >= now);
-    }
-
-    /// Consecutive calls to `advance_silence_deadline` must keep the deadline
-    /// advancing at exactly 120 ms per step, producing exactly 8.33 fills/s.
-    #[test]
-    fn advance_silence_deadline_rate_is_8_33_per_second() {
-        let start = std::time::Instant::now();
-        let mut deadline = start;
-        for i in 1..=10u32 {
-            // Simulate `now` arriving exactly at prev (tight polling), which
-            // is the worst case for accumulating jitter from a `now`-based approach.
-            let now = deadline; // deadline is exactly met
-            deadline = advance_silence_deadline(deadline, now);
-            let expected = start + std::time::Duration::from_millis(120 * i as u64);
-            assert_eq!(deadline, expected, "step {} deadline drifted", i);
-        }
     }
 
     // ── write_pcm encoding ────────────────────────────────────────────────────

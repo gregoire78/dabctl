@@ -218,8 +218,10 @@ impl RsDecoder {
             }
         }
 
-        // Find error locations by Chien search
-        let mut error_locs = Vec::new();
+        // Find error locations by Chien search.
+        // At most NROOTS errors can be corrected, so a stack array suffices.
+        let mut error_locs = [0usize; NROOTS];
+        let mut n_errors = 0usize;
         for i in 0..NN {
             let mut sum: u8 = 0;
             for (j, &lam_j) in lambda.iter().enumerate().take(NROOTS + 1) {
@@ -237,11 +239,14 @@ impl RsDecoder {
                     // Error in padding (shortened zeros) — correctable but outside data
                     continue;
                 }
-                error_locs.push(pos);
+                if n_errors < NROOTS {
+                    error_locs[n_errors] = pos;
+                    n_errors += 1;
+                }
             }
         }
 
-        if error_locs.len() != l {
+        if n_errors != l {
             return None; // Uncorrectable
         }
 
@@ -263,7 +268,7 @@ impl RsDecoder {
         // For each error location, compute the error magnitude.
         // Forney formula for FCR=0: e = X_j · Ω(X_j^{-1}) / Λ'(X_j^{-1})
         // where X_j = α^{254-p} for block position p.  ETSI TS 102 563 §6.
-        for &loc in &error_locs {
+        for &loc in &error_locs[..n_errors] {
             // Evaluation point: X_j^{-1} = α^{root} where root = (p+1) % 255
             let root = (loc as u16 + 1) % 255;
 
@@ -306,7 +311,7 @@ impl RsDecoder {
 
         // Copy corrected data back
         data.copy_from_slice(&block[PAD..PAD + BLOCK_SIZE]);
-        Some(error_locs.len())
+        Some(n_errors)
     }
 }
 
