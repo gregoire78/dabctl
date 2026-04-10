@@ -536,4 +536,26 @@ mod tests {
         assert_eq!(audio.subchid, 5);
         assert!(audio.dab_plus);
     }
+
+    /// ETSI EN 300 401 §6.2.1: SubChId is a 6-bit field → valid range 0..=63.
+    /// subchid is decoded as data[offset+1] >> 2 which yields 0..=63 from a u8,
+    /// so 63 is the maximum legitimate value and must be accepted.
+    #[test]
+    fn test_fig0_2_subchid_63_maximum_valid_is_accepted() {
+        let mut dec = FicDecoder::new();
+        let data = [
+            0xF2,
+            0x01,             // SId = 0xF201
+            0x01,             // 1 component
+            0x3F,             // tmid=0b00, ascty=63 (DAB+)
+            (63 << 2) | 0x02, // subchid=63, ps=1, ca=0
+        ];
+        dec.process_fig0_2(&data);
+        let svc = dec.services.get(&0xF201).expect("service must be inserted");
+        assert!(
+            svc.audio_components.contains_key(&63),
+            "subchid 63 must be accepted"
+        );
+        assert_eq!(svc.primary_subchid, Some(63));
+    }
 }

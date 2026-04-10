@@ -7,4 +7,5 @@ pub mod mot_manager;
 pub mod pad_decoder;
 pub mod pad_output;
 pub mod rs_decoder;
+pub mod silence_filler;
 pub mod superframe;

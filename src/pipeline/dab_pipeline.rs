@@ -27,6 +27,12 @@ type FicQualityCb = Option<Arc<dyn Fn(i16) + Send + Sync>>;
 const RING_CAPACITY: usize = 512;
 const INLINE_SUBCH: usize = 8;
 
+/// Wraps a value in its own 64-byte cache line so two adjacent hot
+/// atomics (e.g. write_pos / read_pos) don't share a line and cause
+/// mutual invalidation between the producer and consumer threads.
+#[repr(align(64))]
+struct CachePadded<T>(T);
+
 struct RingSlot {
     blkno: i16,
     data: Vec<i16>,
@@ -34,8 +40,10 @@ struct RingSlot {
 
 struct SpscRing {
     slots: Vec<std::cell::UnsafeCell<RingSlot>>,
-    write_pos: AtomicUsize,
-    read_pos: AtomicUsize,
+    /// Written only by the producer thread.
+    write_pos: CachePadded<AtomicUsize>,
+    /// Written only by the consumer thread.
+    read_pos: CachePadded<AtomicUsize>,
     slot_size: usize,
     /// Paired with `wait_condvar` so the consumer can block instead of
     /// spinning with `sleep(100 µs)` when the ring is empty.
@@ -60,8 +68,8 @@ impl SpscRing {
         }
         SpscRing {
             slots,
-            write_pos: AtomicUsize::new(0),
-            read_pos: AtomicUsize::new(0),
+            write_pos: CachePadded(AtomicUsize::new(0)),
+            read_pos: CachePadded(AtomicUsize::new(0)),
             slot_size,
             wait_mutex: Mutex::new(()),
             wait_condvar: Condvar::new(),
@@ -70,8 +78,8 @@ impl SpscRing {
     }
 
     fn try_push(&self, blkno: i16, src: &[i16]) -> bool {
-        let wp = self.write_pos.load(Ordering::Relaxed);
-        let rp = self.read_pos.load(Ordering::Acquire);
+        let wp = self.write_pos.0.load(Ordering::Relaxed);
+        let rp = self.read_pos.0.load(Ordering::Acquire);
         let next = (wp + 1) % RING_CAPACITY;
         if next == rp {
             return false;
@@ -80,7 +88,7 @@ impl SpscRing {
         slot.blkno = blkno;
         let len = src.len().min(self.slot_size);
         slot.data[..len].copy_from_slice(&src[..len]);
-        self.write_pos.store(next, Ordering::Release);
+        self.write_pos.0.store(next, Ordering::Release);
         // Wake the consumer if it is waiting in wait_non_empty().
         // Calling notify_one() without holding wait_mutex is intentional:
         // wait_non_empty() re-checks write_pos under Acquire ordering AFTER
@@ -101,7 +109,8 @@ impl SpscRing {
                     // Re-check under the mutex so we never miss a wakeup that
                     // arrived between try_pop() returning None and this call.
                     // Also exit when wake_requested is set (shutdown path).
-                    self.write_pos.load(Ordering::Acquire) == self.read_pos.load(Ordering::Relaxed)
+                    self.write_pos.0.load(Ordering::Acquire)
+                        == self.read_pos.0.load(Ordering::Relaxed)
                         && !self.wake_requested.load(Ordering::Acquire)
                 })
                 .unwrap(),
@@ -116,8 +125,8 @@ impl SpscRing {
     }
 
     fn try_pop(&self) -> Option<(i16, &[i16])> {
-        let rp = self.read_pos.load(Ordering::Relaxed);
-        let wp = self.write_pos.load(Ordering::Acquire);
+        let rp = self.read_pos.0.load(Ordering::Relaxed);
+        let wp = self.write_pos.0.load(Ordering::Acquire);
         if rp == wp {
             return None;
         }
@@ -126,13 +135,75 @@ impl SpscRing {
     }
 
     fn pop_commit(&self) {
-        let rp = self.read_pos.load(Ordering::Relaxed);
+        let rp = self.read_pos.0.load(Ordering::Relaxed);
         self.read_pos
+            .0
             .store((rp + 1) % RING_CAPACITY, Ordering::Release);
     }
 }
 
 const CU_SIZE: usize = 4 * 16;
+
+/// Outcome returned by [`OfdmFrameSync::advance`].
+#[derive(Debug, PartialEq, Eq)]
+enum SyncAction {
+    /// Block is in sequence — proceed with normal processing.
+    Process,
+    /// First mismatch detected: caller must log a WARN and discard the block.
+    SyncLost,
+    /// Still hunting for block 2 after a previous sync loss: discard silently.
+    Discard,
+    /// Block 2 received while in resync mode: sync is restored, process it.
+    SyncRestored,
+}
+
+/// Tracks OFDM frame block sequencing state (blocks 2..L per DAB frame).
+///
+/// Encapsulates `expected_block` and `resyncing` so the logic is independently
+/// testable without spinning up the full pipeline thread.
+struct OfdmFrameSync {
+    expected_block: i16,
+    resyncing: bool,
+    l: i16,
+}
+
+impl OfdmFrameSync {
+    fn new(l: i16) -> Self {
+        OfdmFrameSync {
+            expected_block: 2,
+            resyncing: false,
+            l,
+        }
+    }
+
+    /// Advance the state machine for the received `blkno`.
+    ///
+    /// Returns a [`SyncAction`] that tells the caller how to handle the block.
+    /// On [`SyncAction::SyncLost`] the caller is responsible for logging the
+    /// WARN (so the log message can include the block numbers).
+    fn advance(&mut self, blkno: i16) -> SyncAction {
+        if blkno != self.expected_block {
+            self.expected_block = 2;
+            if self.resyncing {
+                return SyncAction::Discard;
+            }
+            self.resyncing = true;
+            return SyncAction::SyncLost;
+        }
+
+        self.expected_block += 1;
+        if self.expected_block > self.l {
+            self.expected_block = 2;
+        }
+
+        if self.resyncing {
+            self.resyncing = false;
+            return SyncAction::SyncRestored;
+        }
+
+        SyncAction::Process
+    }
+}
 
 /// OFDM → FIC + CIF processing pipeline.
 ///
@@ -144,6 +215,7 @@ pub struct DabPipeline {
     thread_handle: Option<thread::JoinHandle<()>>,
     running: Arc<AtomicBool>,
     processing: Arc<AtomicBool>,
+    dab_mode: u8,
     bits_per_block: usize,
     ensemble_cb: EnsembleCb,
     program_cb: ProgramCb,
@@ -180,6 +252,7 @@ impl DabPipeline {
             thread_handle: Some(thread_handle),
             running,
             processing,
+            dab_mode,
             bits_per_block,
             ensemble_cb,
             program_cb,
@@ -187,6 +260,8 @@ impl DabPipeline {
         }
     }
 
+    /// Called at the start of each OFDM null symbol / new DAB frame.
+    /// Retained as a hook for future per-frame bookkeeping (e.g. AGC reset).
     pub fn new_frame(&self) {}
 
     pub fn process_block(&self, softbits: &[i16], blkno: i16) {
@@ -197,7 +272,7 @@ impl DabPipeline {
     }
 
     pub fn start_processing(&self) {
-        self.processing.store(true, Ordering::SeqCst);
+        self.processing.store(true, Ordering::Release);
     }
 
     pub fn processing_flag(&self) -> Arc<AtomicBool> {
@@ -205,7 +280,7 @@ impl DabPipeline {
     }
 
     pub fn reset(&mut self, sender: mpsc::SyncSender<DabFrame>) {
-        self.running.store(false, Ordering::SeqCst);
+        self.running.store(false, Ordering::Release);
         self.ring.notify(); // unblock the consumer so it exits cleanly
         if let Some(handle) = self.thread_handle.take() {
             let _ = handle.join();
@@ -213,12 +288,12 @@ impl DabPipeline {
 
         let ring = Arc::new(SpscRing::new(self.bits_per_block));
         self.ring = ring.clone();
-        self.running.store(true, Ordering::SeqCst);
-        self.processing.store(false, Ordering::SeqCst);
+        self.running.store(true, Ordering::Release);
+        self.processing.store(false, Ordering::Release);
 
         let r = self.running.clone();
         let p = self.processing.clone();
-        let params = DabParams::new(1);
+        let params = DabParams::new(self.dab_mode);
         let ecb = self.ensemble_cb.clone();
         let pcb = self.program_cb.clone();
         let fqcb = self.fic_quality_cb.clone();
@@ -244,8 +319,9 @@ impl DabPipeline {
         // CIF time-interleaving map — ETSI EN 300 401 §14.6
         let interleave_map: [usize; 16] = [0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15];
 
-        let mut cif_in = vec![0i16; 55296];
-        let mut cif_vector = vec![vec![0i16; 55296]; 16];
+        let cif_buf_size = number_of_blocks_per_cif * bits_per_block;
+        let mut cif_in = vec![0i16; cif_buf_size];
+        let mut cif_vector = vec![vec![0i16; cif_buf_size]; 16];
         let mut fib_vector = vec![[0u8; 96]; 16];
         let mut fib_valid = [false; 16];
         let mut fib_input = vec![0i16; 3 * bits_per_block];
@@ -254,12 +330,12 @@ impl DabPipeline {
         let mut descrambler: Vec<Option<Vec<u8>>> = (0..64).map(|_| None).collect();
 
         let mut index_out: usize = 0;
-        let mut expected_block: i16 = 2;
+        let mut frame_sync = OfdmFrameSync::new(params.get_l() as i16);
         let mut amount: usize = 0;
         let mut minor: u32 = 0;
         let mut cif_count_hi: i16 = -1;
         let mut cif_count_lo: i16 = -1;
-        let mut temp = vec![0i16; 55296];
+        let mut temp = vec![0i16; cif_buf_size];
 
         let mut my_fic_handler = FicHandler::new(&params);
         my_fic_handler.fib_processor.ensemble_name_cb = ensemble_cb;
@@ -267,7 +343,7 @@ impl DabPipeline {
 
         let mut fibs_bytes = vec![0u8; 4 * 768];
 
-        while running.load(Ordering::SeqCst) {
+        while running.load(Ordering::Acquire) {
             let (blkno, bdata) = match ring.try_pop() {
                 Some(v) => v,
                 None => {
@@ -278,21 +354,25 @@ impl DabPipeline {
                 }
             };
 
-            if blkno != expected_block {
-                warn!("got {}, expected {}", blkno, expected_block);
-                // Reset only the within-frame position; the CIF interleaver
-                // history (index_out, amount) is NOT reset: the 16-CIF sliding
-                // window survives a single dropped block, and resetting it would
-                // cause ~360 ms of unnecessary warm-up latency (15 × 24 ms).
-                expected_block = 2;
-                minor = 0;
-                ring.pop_commit();
-                continue;
-            }
-
-            expected_block += 1;
-            if expected_block > params.get_l() as i16 {
-                expected_block = 2;
+            match frame_sync.advance(blkno) {
+                SyncAction::Process => {}
+                SyncAction::SyncRestored => {
+                    tracing::debug!(blkno, "OFDM frame sync restored");
+                }
+                SyncAction::SyncLost => {
+                    // CIF interleaver history (index_out, amount) is NOT reset:
+                    // the 16-CIF sliding window survives a single dropped block.
+                    // Resetting it would cause ~360 ms of unnecessary warm-up
+                    // latency (15 × 24 ms).
+                    warn!(blkno, "OFDM frame sync lost, resyncing");
+                    minor = 0;
+                    ring.pop_commit();
+                    continue;
+                }
+                SyncAction::Discard => {
+                    ring.pop_commit();
+                    continue;
+                }
             }
 
             // FIC blocks 2..4 — ETSI EN 300 401 §3.2.1
@@ -361,22 +441,15 @@ impl DabPipeline {
                 }
 
                 // Adjusted CIF counter — ETSI EN 300 401 §14.1
-                let (adj_hi, adj_lo) = {
-                    let mut lo = cif_count_lo as i32 + minor as i32;
-                    let mut hi = cif_count_hi as i32;
-                    if lo >= 250 {
-                        lo %= 250;
-                        hi += 1;
-                    }
-                    if hi >= 20 {
-                        hi = 20;
-                    }
-                    (hi as u8, lo as u8)
-                };
+                // CIFCountHigh ∈ [0, 19], CIFCountLow ∈ [0, 249]; both wrap modulo.
+                let (adj_hi, adj_lo) = adjust_cif_counter(cif_count_hi, cif_count_lo, minor);
 
                 let mut frame = DabFrame::new(fib_vector[index_out], adj_hi, adj_lo);
 
-                if processing.load(Ordering::SeqCst) {
+                // Snapshot `processing` once so the subchannel fill and the
+                // send-mode decision are always consistent for the same frame.
+                let is_processing = processing.load(Ordering::Acquire);
+                if is_processing {
                     frame.subchannels = process_cif_to_frames(
                         &temp,
                         &my_fic_handler,
@@ -389,7 +462,7 @@ impl DabPipeline {
                 // avoid stalling this thread while frame_rx is not yet drained.
                 // Once processing starts (processing = true), use a blocking send so
                 // the pipeline applies natural back-pressure on the downstream consumer.
-                let send_err = if processing.load(Ordering::SeqCst) {
+                let send_err = if is_processing {
                     sender.send(frame).is_err()
                 } else {
                     matches!(sender.try_send(frame), Err(TrySendError::Disconnected(_)))
@@ -407,7 +480,7 @@ impl DabPipeline {
 
 impl Drop for DabPipeline {
     fn drop(&mut self) {
-        self.running.store(false, Ordering::SeqCst);
+        self.running.store(false, Ordering::Release);
         // Wake the consumer so it can observe running == false and exit.
         self.ring.notify();
         if let Some(handle) = self.thread_handle.take() {
@@ -430,10 +503,27 @@ fn process_cif_to_frames(
     prot_table: &mut [Option<Protection>],
     descrambler: &mut [Option<Vec<u8>>],
 ) -> SmallVec<[SubchannelFrame; INLINE_SUBCH]> {
-    // Phase 1: sequential init of new sub-channels — ETSI EN 300 401 §11
+    // Single pass: initialise new sub-channels and collect active jobs.
+    // Merging the previous two 0..64 loops halves the get_channel_info() calls.
+    // ETSI EN 300 401 §11
+    struct SubchJob {
+        idx: usize,
+        subchid: u8,
+        start: usize,
+        size: usize,
+        out_size: usize,
+        byte_size: usize,
+    }
+
+    let mut jobs: SmallVec<[SubchJob; INLINE_SUBCH]> = SmallVec::new();
     for i in 0..64 {
         let data = fic_handler.get_channel_info(i);
-        if data.in_use && prot_table[i].is_none() {
+        if !data.in_use {
+            continue;
+        }
+
+        // Lazily initialise protection and descrambler tables on first use.
+        if prot_table[i].is_none() {
             let bit_rate = data.bitrate as usize;
             let out_size = bit_rate * 24;
 
@@ -455,35 +545,18 @@ fn process_cif_to_frames(
             }
             descrambler[i] = Some(desc);
         }
-    }
 
-    // Phase 2: collect jobs
-    struct SubchJob {
-        idx: usize,
-        subchid: u8,
-        start: usize,
-        size: usize,
-        out_size: usize,
-        byte_size: usize,
-    }
-
-    let mut jobs: SmallVec<[SubchJob; INLINE_SUBCH]> = SmallVec::new();
-    for i in 0..64 {
-        let data = fic_handler.get_channel_info(i);
-        if data.in_use {
-            let start = data.start_cu as usize * CU_SIZE;
-            let size = data.size as usize * CU_SIZE;
-            let bit_rate = data.bitrate as usize;
-            let out_size = bit_rate * 24;
-            jobs.push(SubchJob {
-                idx: i,
-                subchid: data.id as u8,
-                start,
-                size,
-                out_size,
-                byte_size: out_size / 8,
-            });
-        }
+        let start = data.start_cu as usize * CU_SIZE;
+        let size = data.size as usize * CU_SIZE;
+        let out_size = data.bitrate as usize * 24;
+        jobs.push(SubchJob {
+            idx: i,
+            subchid: data.id as u8,
+            start,
+            size,
+            out_size,
+            byte_size: out_size / 8,
+        });
     }
 
     if jobs.is_empty() {
@@ -530,6 +603,23 @@ fn process_cif_to_frames(
         .collect();
 
     SmallVec::from_vec(frames)
+}
+
+/// Compute the adjusted CIF counter for an ETI frame.
+///
+/// Applies the offset `minor` to the decoded FIC counter `(hi, lo)` and wraps
+/// both fields within their legal ranges per ETSI EN 300 401 §14.1:
+/// - `CIFCountLow`  ∈ [0, 249]
+/// - `CIFCountHigh` ∈ [0,  19]
+fn adjust_cif_counter(cif_count_hi: i16, cif_count_lo: i16, minor: u32) -> (u8, u8) {
+    let mut lo = cif_count_lo as i32 + minor as i32;
+    let mut hi = cif_count_hi as i32;
+    if lo >= 250 {
+        lo %= 250;
+        hi += 1;
+    }
+    hi %= 20;
+    (hi as u8, lo as u8)
 }
 
 /// Pack a bit array (0/1 bytes) into packed bytes.
@@ -657,5 +747,174 @@ mod tests {
         ring.notify(); // wake without data (shutdown signal)
 
         assert!(consumer.join().unwrap()); // is_none() returned true
+    }
+
+    // ── adjust_cif_counter ───────────────────────────────────────────────────
+    // ETSI EN 300 401 §14.1: CIFCountLow ∈ [0,249], CIFCountHigh ∈ [0,19].
+
+    #[test]
+    fn cif_counter_no_overflow() {
+        // No carry: lo stays below 250, hi unchanged.
+        assert_eq!(adjust_cif_counter(0, 0, 0), (0, 0));
+        assert_eq!(adjust_cif_counter(5, 100, 10), (5, 110));
+    }
+
+    #[test]
+    fn cif_counter_lo_overflow_increments_hi() {
+        // lo = 249 + 1 = 250 → lo wraps to 0, hi increments by 1.
+        assert_eq!(adjust_cif_counter(0, 249, 1), (1, 0));
+    }
+
+    #[test]
+    fn cif_counter_lo_overflow_large_minor() {
+        // lo = 0 + 500 = 500 → 500 % 250 = 0, hi += 1.
+        assert_eq!(adjust_cif_counter(3, 0, 500), (4, 0));
+    }
+
+    #[test]
+    fn cif_counter_hi_wraps_at_20() {
+        // hi = 19, lo carries → hi becomes 20 → wraps to 0.
+        assert_eq!(adjust_cif_counter(19, 249, 1), (0, 0));
+    }
+
+    #[test]
+    fn cif_counter_hi_wraps_correctly_across_20() {
+        // hi = 19, lo = 0, minor = 0 — no carry, hi stays at 19.
+        assert_eq!(adjust_cif_counter(19, 0, 0), (19, 0));
+        // hi = 19, carry from lo pushes hi to 20 → wraps to 0.
+        assert_eq!(adjust_cif_counter(19, 249, 1), (0, 0));
+    }
+
+    #[test]
+    fn cif_counter_max_values_stay_in_range() {
+        // Verify output is always within [0,19] × [0,249] for boundary inputs.
+        let (hi, lo) = adjust_cif_counter(19, 249, 249);
+        assert!(hi < 20, "hi={hi} out of range");
+        assert!(lo < 250, "lo={lo} out of range");
+    }
+
+    // ── pack_bits edge cases ─────────────────────────────────────────────────
+
+    #[test]
+    fn pack_bits_partial_tail_is_ignored() {
+        // 9 bits → only the first byte (8 bits) is packed; the 9th bit is ignored
+        // because chunks_exact(8) drops the remainder.
+        let bits: Vec<u8> = vec![1, 0, 0, 0, 0, 0, 0, 0, /*tail:*/ 1];
+        let mut out = [0u8; 1];
+        pack_bits(&bits, &mut out);
+        assert_eq!(out[0], 0b10000000);
+    }
+
+    #[test]
+    fn pack_bits_empty_input_produces_no_output() {
+        let bits: Vec<u8> = vec![];
+        let mut out = [0u8; 0];
+        pack_bits(&bits, &mut out); // must not panic
+    }
+
+    // ── SpscRing capacity boundary ───────────────────────────────────────────
+
+    #[test]
+    fn spsc_ring_capacity_is_ring_capacity_minus_one() {
+        // A ring of RING_CAPACITY slots holds RING_CAPACITY−1 items before
+        // try_push returns false (one slot is always kept empty as sentinel).
+        let ring = SpscRing::new(1);
+        let mut pushed = 0usize;
+        for i in 0..RING_CAPACITY + 2 {
+            if ring.try_push(i as i16, &[0]) {
+                pushed += 1;
+            } else {
+                break;
+            }
+        }
+        assert_eq!(pushed, RING_CAPACITY - 1);
+    }
+
+    // ── OfdmFrameSync ────────────────────────────────────────────────────────
+
+    /// L for DAB Mode I is 76 (blocks 2..=76).
+    const L: i16 = 76;
+
+    #[test]
+    fn sync_normal_sequence_produces_process() {
+        let mut s = OfdmFrameSync::new(L);
+        // Blocks 2..=76 should all be Process on a clean start.
+        for blkno in 2..=L {
+            assert_eq!(s.advance(blkno), SyncAction::Process, "blkno={blkno}");
+        }
+        // After L the counter wraps back to 2; verify block 2 is again Process.
+        assert_eq!(s.advance(2), SyncAction::Process);
+    }
+
+    #[test]
+    fn sync_first_mismatch_emits_sync_lost() {
+        let mut s = OfdmFrameSync::new(L);
+        // Block 2 is fine.
+        assert_eq!(s.advance(2), SyncAction::Process);
+        // Block 99 is unexpected (expected 3) → SyncLost.
+        assert_eq!(s.advance(99), SyncAction::SyncLost);
+    }
+
+    #[test]
+    fn sync_second_mismatch_while_resyncing_emits_discard() {
+        let mut s = OfdmFrameSync::new(L);
+        s.advance(2); // normal
+        s.advance(99); // SyncLost — now resyncing, expected_block reset to 2
+                       // Any block that is not 2 while resyncing must be silently discarded.
+        assert_eq!(s.advance(3), SyncAction::Discard);
+        assert_eq!(s.advance(50), SyncAction::Discard);
+    }
+
+    #[test]
+    fn sync_block_2_while_resyncing_emits_sync_restored() {
+        let mut s = OfdmFrameSync::new(L);
+        s.advance(2); // normal
+        s.advance(99); // SyncLost
+        s.advance(5); // Discard
+                      // Receiving block 2 after sync loss must restore synchronisation.
+        assert_eq!(s.advance(2), SyncAction::SyncRestored);
+    }
+
+    #[test]
+    fn sync_resumes_normal_after_restored() {
+        let mut s = OfdmFrameSync::new(L);
+        s.advance(2); // Process
+        s.advance(99); // SyncLost
+        s.advance(2); // SyncRestored — expected_block is now 3
+                      // Subsequent blocks must behave normally again.
+        assert_eq!(s.advance(3), SyncAction::Process);
+        assert_eq!(s.advance(4), SyncAction::Process);
+    }
+
+    #[test]
+    fn sync_only_one_sync_lost_per_loss_event() {
+        // Push a long run of wrong blocks and verify SyncLost appears exactly
+        // once, then every subsequent mismatch is Discard.
+        let mut s = OfdmFrameSync::new(L);
+        s.advance(2); // Process
+        let first = s.advance(99); // SyncLost
+        assert_eq!(first, SyncAction::SyncLost);
+
+        let mut lost_count = 0u32;
+        for blkno in [10, 20, 30, 40, 50, 60, 70] {
+            match s.advance(blkno) {
+                SyncAction::SyncLost => lost_count += 1,
+                SyncAction::Discard => {}
+                other => panic!("unexpected action {other:?}"),
+            }
+        }
+        assert_eq!(lost_count, 0, "SyncLost must fire only once per loss event");
+    }
+
+    #[test]
+    fn sync_counter_wraps_at_l() {
+        let mut s = OfdmFrameSync::new(L);
+        // Advance to the last block.
+        for blkno in 2..=L {
+            assert_eq!(s.advance(blkno), SyncAction::Process);
+        }
+        // After wrapping, expected_block is 2 again.
+        assert_eq!(s.advance(2), SyncAction::Process);
+        assert_eq!(s.advance(3), SyncAction::Process);
     }
 }

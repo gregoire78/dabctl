@@ -6,12 +6,18 @@ use crate::pipeline::fib_processor::FibProcessor;
 use crate::pipeline::prot_tables::get_pcodes;
 use crate::pipeline::viterbi_handler::ViterbiSpiral;
 
+/// Size of the depunctured Viterbi input buffer for FIC decoding.
+/// = 24 puncture groups × 128 bits/group + 24 tail bits (ETSI EN 300 401 §11.1)
+const FIC_VITERBI_BUF_SIZE: usize = 3072 + 24;
+
 pub struct FicHandler {
     bits_per_block: usize,
     ofdm_input: Vec<i16>,
     puncture_table: Vec<bool>,
     prbs: [u8; 768],
     viterbi: ViterbiSpiral,
+    /// Pre-allocated depuncturing buffer reused across FIC blocks.
+    viterbi_block: Vec<i16>,
     bit_buffer_out: Vec<u8>,
     pub fib_processor: FibProcessor,
     fic_errors: i32,
@@ -72,6 +78,7 @@ impl FicHandler {
             puncture_table,
             prbs,
             viterbi: ViterbiSpiral::new(768),
+            viterbi_block: vec![0i16; FIC_VITERBI_BUF_SIZE],
             bit_buffer_out: vec![0u8; 768],
             fib_processor: FibProcessor::new(),
             fic_errors: 0,
@@ -99,10 +106,15 @@ impl FicHandler {
     }
 
     fn process_fic_input(&mut self, ficno: usize, fib_bytes: &mut [u8], valid: &mut bool) {
-        // Depuncture
-        let mut viterbi_block = vec![0i16; 3072 + 24];
+        // Depuncture into the pre-allocated buffer (avoids a 6 KB allocation per call).
+        self.viterbi_block.fill(0);
         let mut input_count = 0;
-        for (i, vb) in viterbi_block.iter_mut().enumerate().take(3072 + 24) {
+        for (i, vb) in self
+            .viterbi_block
+            .iter_mut()
+            .enumerate()
+            .take(FIC_VITERBI_BUF_SIZE)
+        {
             if self.puncture_table[i] {
                 *vb = self.ofdm_input[input_count];
                 input_count += 1;
@@ -111,7 +123,7 @@ impl FicHandler {
 
         // Viterbi decode
         self.viterbi
-            .deconvolve(&viterbi_block, &mut self.bit_buffer_out);
+            .deconvolve(&self.viterbi_block, &mut self.bit_buffer_out);
 
         // Energy dispersal (PRBS descramble)
         for i in 0..768 {
@@ -215,5 +227,35 @@ mod tests {
         let mut out = vec![0u8; 768];
         let mut valid = vec![false; 4];
         fh.process_fic_block(&data, &mut out, &mut valid);
+    }
+
+    /// Pre-allocating `viterbi_block` as a struct field must not change the
+    /// output: two consecutive calls with identical input must produce
+    /// identical `out` and `valid` results.
+    #[test]
+    fn viterbi_block_prealloc_output_is_deterministic() {
+        let params = DabParams::new(1);
+        let bits_per_block = 2 * params.k as usize;
+        // Populate with a non-trivial pattern so PRBS and Viterbi actually run.
+        let data: Vec<i16> = (0..bits_per_block * 3)
+            .map(|i| if i % 2 == 0 { 127 } else { -127 })
+            .collect();
+
+        let mut fh = FicHandler::new(&params);
+
+        let mut out1 = vec![0u8; 768 * 4];
+        let mut valid1 = vec![false; 4];
+        fh.process_fic_block(&data, &mut out1, &mut valid1);
+
+        // Second call on the same handler reuses the pre-allocated buffer.
+        let mut out2 = vec![0u8; 768 * 4];
+        let mut valid2 = vec![false; 4];
+        fh.process_fic_block(&data, &mut out2, &mut valid2);
+
+        assert_eq!(
+            out1, out2,
+            "Pre-allocated buffer must be zeroed before each use"
+        );
+        assert_eq!(valid1, valid2);
     }
 }

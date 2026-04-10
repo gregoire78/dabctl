@@ -2,6 +2,17 @@
 
 use crate::pipeline::dab_constants::*;
 
+/// Returns `true` when `label` is a plausible human-readable service label.
+///
+/// A FIC-CRC false positive during sync loss can produce FIG 1 bodies full of
+/// random bytes.  After EBU Latin decoding, those bytes may yield Unicode
+/// control characters (e.g. U+000C form-feed).  We discard any label that is
+/// empty or that contains a control character.  Valid DAB service labels are
+/// display strings intended for human consumption (ETSI EN 300 401 §8.1.13).
+fn is_valid_label(label: &str) -> bool {
+    !label.is_empty() && label.chars().all(|c| !c.is_control())
+}
+
 /// Convert EBU Latin charset byte to UTF-8 char (EN 300 401, Table 1)
 fn ebu_to_char(ch: u8) -> char {
     // EBU Latin differs from ISO 8859-1 in the 0x80..0xFF range
@@ -288,6 +299,13 @@ impl FibProcessor {
                             label.push(ebu_to_char(ch));
                         }
                     }
+                    if !is_valid_label(&label) {
+                        tracing::debug!(
+                            "FIG 1/0: rejected corrupt ensemble label (SId=0x{:04X})",
+                            sid
+                        );
+                        return;
+                    }
                     if let Some(ref cb) = self.ensemble_name_cb {
                         cb(&label, sid);
                     }
@@ -306,6 +324,13 @@ impl FibProcessor {
                             if ch != 0 {
                                 label.push(ebu_to_char(ch));
                             }
+                        }
+                        if !is_valid_label(&label) {
+                            tracing::debug!(
+                                "FIG 1/1: rejected corrupt service label (SId=0x{:04X})",
+                                sid
+                            );
+                            return;
                         }
                         self.list_of_services[svc].service_label.label = label.clone();
                         self.list_of_services[svc].service_label.has_name = true;
@@ -329,6 +354,13 @@ impl FibProcessor {
                             }
                         }
                         label.push_str(" (data)");
+                        if !is_valid_label(&label) {
+                            tracing::debug!(
+                                "FIG 1/5: rejected corrupt service label (SId=0x{:08X})",
+                                sid as u32
+                            );
+                            return;
+                        }
                         self.list_of_services[svc].service_label.label = label.clone();
                         self.list_of_services[svc].service_label.has_name = true;
                         if let Some(ref cb) = self.program_name_cb {
@@ -525,6 +557,110 @@ mod tests {
         let (name, sid) = r.as_ref().expect("ensemble_name_cb was not invoked");
         assert_eq!(name, "NRJ", "decoded label mismatch");
         assert_eq!(*sid, 0xF043, "decoded SId mismatch");
+    }
+
+    // ── is_valid_label ────────────────────────────────────────────────────────
+
+    #[test]
+    fn valid_label_accepts_normal_ascii() {
+        assert!(is_valid_label("NRJ"));
+        assert!(is_valid_label("BBC Radio 4"));
+    }
+
+    #[test]
+    fn valid_label_accepts_ebu_accented() {
+        // Characters from the EBU Latin high range are valid
+        assert!(is_valid_label("Métropole"));
+        assert!(is_valid_label("Ö3"));
+    }
+
+    #[test]
+    fn valid_label_rejects_empty() {
+        assert!(!is_valid_label(""));
+    }
+
+    #[test]
+    fn valid_label_rejects_control_chars() {
+        // \x0c (form feed) is the exact char seen in the corrupt label from the
+        // FIC-CRC false-positive event (2026-04-10T19:12:50)
+        assert!(!is_valid_label("abc\x0cdef"));
+        assert!(!is_valid_label("\x01garbage"));
+        assert!(!is_valid_label("\x1f"));
+    }
+
+    // ── process_fib — corrupt label rejected ─────────────────────────────────
+
+    /// A FIG 1/1 whose decoded label contains a control character must NOT
+    /// invoke `program_name_cb` and must NOT cache the label.
+    /// This guards against FIC-CRC false positives during sync loss.
+    #[test]
+    fn process_fib_corrupt_label_not_cached() {
+        let mut label_bytes = [0u8; 16];
+        label_bytes[0] = b'X';
+        label_bytes[1] = 0x0C; // form-feed control char (as seen in live log)
+        label_bytes[2] = b'Z';
+
+        let mut raw = [0u8; 22];
+        raw[0] = 0x35; // type=1, length=21
+        raw[1] = 0x01; // charset=0, OE=0, ext=1
+        raw[2] = 0xAB;
+        raw[3] = 0xCD;
+        raw[4..20].copy_from_slice(&label_bytes);
+
+        let mut fig_bytes = raw.to_vec();
+        fig_bytes.push(0xE0);
+        let fib = bytes_to_fib(&fig_bytes);
+
+        let called = Arc::new(Mutex::new(false));
+        let called2 = called.clone();
+        let mut p = FibProcessor::new();
+        p.program_name_cb = Some(Arc::new(move |_, _| *called2.lock().unwrap() = true));
+        p.process_fib(&fib, 0);
+
+        assert!(
+            !*called.lock().unwrap(),
+            "program_name_cb must not fire for a label with control characters"
+        );
+    }
+
+    /// A FIG 1/5 (32-bit SId service label) whose decoded label contains a
+    /// control character must also be rejected.
+    #[test]
+    fn process_fib_corrupt_label_32bit_sid_not_cached() {
+        let mut label_bytes = [0u8; 16];
+        label_bytes[0] = b'D';
+        label_bytes[1] = 0x09; // horizontal-tab control char
+        label_bytes[2] = b'B';
+
+        // FIG 1/5 layout (ETSI EN 300 401 §8.1.14.2):
+        //  [0]      header  : type=1 (001), length=23 (10111) → 0x37
+        //  [1]      ext hdr : charset=0, OE=0, extension=5 (101) → 0x05
+        //  [2..5]   SId     : 4 bytes (32-bit)
+        //  [6..21]  label   : 16 bytes
+        //  [22..23] char flag
+        let mut raw = [0u8; 24];
+        raw[0] = 0x37; // type=1, length=23
+        raw[1] = 0x05; // charset=0, OE=0, ext=5
+        raw[2] = 0xB0;
+        raw[3] = 0x58;
+        raw[4] = 0xE2;
+        raw[5] = 0xE3;
+        raw[6..22].copy_from_slice(&label_bytes);
+
+        let mut fig_bytes = raw.to_vec();
+        fig_bytes.push(0xE0);
+        let fib = bytes_to_fib(&fig_bytes);
+
+        let called = Arc::new(Mutex::new(false));
+        let called2 = called.clone();
+        let mut p = FibProcessor::new();
+        p.program_name_cb = Some(Arc::new(move |_, _| *called2.lock().unwrap() = true));
+        p.process_fib(&fib, 0);
+
+        assert!(
+            !*called.lock().unwrap(),
+            "program_name_cb must not fire for a 32-bit SId label with control characters"
+        );
     }
 
     // ── process_fib — FIG 1/1: service label ─────────────────────────────────

@@ -932,7 +932,21 @@ pub struct UepProtection {
 impl UepProtection {
     pub fn new(bit_rate: i16, prot_level: i16) -> Self {
         let out_size = 24 * bit_rate as usize;
-        let index = find_profile(bit_rate, prot_level).unwrap_or(1);
+        let index = match find_profile(bit_rate, prot_level) {
+            Some(i) => i,
+            None => {
+                // The FIG 0/1 carried an (bit_rate, prot_level) pair that is absent
+                // from the UEP profile table (ETSI EN 300 401 §6.2.1, Table 7).
+                // Fall back to profile index 0 rather than silently using index 1,
+                // which has no relationship to the requested parameters.
+                tracing::warn!(
+                    bit_rate,
+                    prot_level,
+                    "UEP profile not found in table, falling back to profile index 0"
+                );
+                0
+            }
+        };
         let p = &PROFILE_TABLE[index];
 
         let mut index_table = vec![false; out_size * 4 + 24];
@@ -1072,5 +1086,30 @@ mod tests {
         let input = vec![0i16; in_size * 4 + 24];
         let mut output = vec![0u8; in_size];
         prot.deconvolve(&input, &mut output);
+    }
+
+    /// UepProtection::new() with an unknown (bit_rate, prot_level) pair must not
+    /// panic. Per ETSI EN 300 401 §6.2.1 the profile table is finite; a malformed
+    /// FIG 0/1 may carry an unseen combination.  The constructor must fall back
+    /// to a safe default rather than indexing the table at position 1 blindly or
+    /// panicking when the search returns None.
+    #[test]
+    fn uep_unknown_profile_does_not_panic() {
+        // bit_rate=999, prot_level=99 — not in PROFILE_TABLE
+        let _p = UepProtection::new(999, 99);
+    }
+
+    /// The fallback profile used when the requested (bit_rate, prot_level) is absent
+    /// must allow deconvolution to complete without panic.
+    /// (Previously unwrap_or(1) was used, which is index 1 and silently wrong;
+    /// unwrap_or(0) is still arbitrary but at least the intent is explicit and logged.)
+    #[test]
+    fn uep_unknown_profile_deconvolve_does_not_panic() {
+        let mut p = UepProtection::new(32, 99); // prot_level=99 absent from table
+                                                // out_size = 24 * 32 = 768; input must be out_size*4+24 i16s
+        let out_size = 24 * 32;
+        let input = vec![0i16; out_size * 4 + 24];
+        let mut output = vec![0u8; out_size];
+        p.deconvolve(&input, &mut output); // must not panic
     }
 }

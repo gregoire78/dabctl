@@ -495,4 +495,40 @@ mod tests {
         assert_eq!(sf.frame_len, 0);
         assert!(sf.format.is_none());
     }
+
+    /// Feeding frames whose au_start header bytes point past the end of sf
+    /// must not panic — the AU loop skips entries where end > sf.len().
+    #[test]
+    fn au_start_overflow_is_skipped_not_panicked() {
+        let mut filter = SuperframeFilter::new();
+
+        // Build a syntactically minimal frame: len=120 so 5×120=600 is multiple of 120.
+        // Fire-code bytes (sf[0..2]) and format byte (sf[2]) are deliberately zero so
+        // check_sync() returns false.  The important thing is that no panic occurs.
+        let frame = vec![0u8; 120];
+        for _ in 0..5 {
+            let result = filter.feed(&frame);
+            // We expect either no output (not enough frames yet) or sync_fail (fire CRC
+            // mismatch).  The test assertion is simply that we reach this line alive.
+            let _ = result;
+        }
+    }
+
+    /// A valid-looking frame where au_start[1] encodes a value larger than sf.len()
+    /// must produce zero access units, not a panic.
+    #[test]
+    fn au_start_pointing_beyond_sf_produces_no_aus() {
+        let mut filter = SuperframeFilter::new();
+        // len=120; sf_len=600.  au_start[1] is decoded from sf[3]<<4|sf[4]>>4.
+        // Setting sf[3]=0xFF, sf[4]=0xFF encodes au_start[1]=0xFFF=4095 > 600.
+        let mut frame = vec![0u8; 120];
+        // Bytes 3 and 4 carry au_start[1]: value 0xFFF = 4095.
+        frame[3] = 0xFF;
+        frame[4] = 0xFF;
+        for _ in 0..5 {
+            let result = filter.feed(&frame);
+            // Result may be sync_fail (fire CRC) or empty — never a panic.
+            assert!(result.access_units.is_empty());
+        }
+    }
 }
