@@ -332,7 +332,6 @@ pub fn run(args: Iq2pcmArgs) {
     let fs2_ok = fic_ok.clone();
     let fs2_total = fic_total.clone();
     let c_fo = freq_offset_hz.clone();
-    let running2 = running.clone();
     let c_fi = frames_in.clone();
     let c_fns = frames_no_subch.clone();
     let c_sok = sync_ok.clone();
@@ -433,7 +432,6 @@ pub fn run(args: Iq2pcmArgs) {
 
             thread::sleep(std::time::Duration::from_secs(1));
         }
-        running2.store(false, Ordering::SeqCst);
     });
 
     // Main audio drain loop: receives DabFrame, decodes to PCM.
