@@ -4,14 +4,50 @@ use crate::pipeline::prot_tables::get_pcodes;
 use crate::pipeline::viterbi_handler::ViterbiSpiral;
 
 pub struct EepProtection {
-    out_size: usize,
     index_table: Vec<bool>,
     viterbi_block: Vec<i16>,
     viterbi: ViterbiSpiral,
 }
 
+#[inline]
+fn is_valid_protection_bit_rate(bit_rate: i16) -> bool {
+    bit_rate > 0
+}
+
+#[inline]
+fn depuncture_soft_bits(index_table: &[bool], input: &[i16], block: &mut [i16]) -> usize {
+    block.fill(0);
+    let mut input_counter = 0usize;
+    for (i, dst) in block.iter_mut().enumerate() {
+        if i < index_table.len() && index_table[i] && input_counter < input.len() {
+            *dst = input[input_counter];
+            input_counter += 1;
+        }
+    }
+    input_counter
+}
+
+#[cfg(test)]
+#[inline]
+fn count_marked_positions(index_table: &[bool]) -> usize {
+    index_table.iter().filter(|&&b| b).count()
+}
+
 impl EepProtection {
     pub fn new(bit_rate: i16, prot_level: i16) -> Self {
+        if !is_valid_protection_bit_rate(bit_rate) {
+            tracing::warn!(
+                bit_rate,
+                prot_level,
+                "EEP invalid bit_rate, creating empty protection profile"
+            );
+            return EepProtection {
+                index_table: vec![false; 24],
+                viterbi_block: vec![0i16; 24],
+                viterbi: ViterbiSpiral::new(0),
+            };
+        }
+
         let out_size = 24 * bit_rate as usize;
         let mut index_table = vec![false; out_size * 4 + 24];
         let mut viterbi_counter = 0usize;
@@ -111,7 +147,6 @@ impl EepProtection {
         }
 
         EepProtection {
-            out_size,
             index_table,
             viterbi_block: vec![0i16; out_size * 4 + 24],
             viterbi: ViterbiSpiral::new(out_size),
@@ -119,14 +154,7 @@ impl EepProtection {
     }
 
     pub fn deconvolve(&mut self, v: &[i16], out_buffer: &mut [u8]) {
-        self.viterbi_block.fill(0);
-        let mut input_counter = 0;
-        for i in 0..(self.out_size * 4 + 24) {
-            if self.index_table[i] && input_counter < v.len() {
-                self.viterbi_block[i] = v[input_counter];
-                input_counter += 1;
-            }
-        }
+        depuncture_soft_bits(&self.index_table, v, &mut self.viterbi_block);
         self.viterbi.deconvolve(&self.viterbi_block, out_buffer);
     }
 }
@@ -922,8 +950,17 @@ fn find_profile(bit_rate: i16, prot_level: i16) -> Option<usize> {
         .position(|p| p.bit_rate == bit_rate && p.prot_level == prot_level)
 }
 
+#[inline]
+fn resolve_uep_profile_index(bit_rate: i16, prot_level: i16) -> Option<usize> {
+    if let Some(exact) = find_profile(bit_rate, prot_level) {
+        return Some(exact);
+    }
+    // Keep fallback bitrate-consistent: if the exact protection level is absent,
+    // use any profile with the same bitrate.
+    PROFILE_TABLE.iter().position(|p| p.bit_rate == bit_rate)
+}
+
 pub struct UepProtection {
-    out_size: usize,
     index_table: Vec<bool>,
     viterbi_block: Vec<i16>,
     viterbi: ViterbiSpiral,
@@ -931,22 +968,48 @@ pub struct UepProtection {
 
 impl UepProtection {
     pub fn new(bit_rate: i16, prot_level: i16) -> Self {
-        let out_size = 24 * bit_rate as usize;
-        let index = match find_profile(bit_rate, prot_level) {
+        if !is_valid_protection_bit_rate(bit_rate) {
+            tracing::warn!(
+                bit_rate,
+                prot_level,
+                "UEP invalid bit_rate, creating empty protection profile"
+            );
+            return UepProtection {
+                index_table: vec![false; 24],
+                viterbi_block: vec![0i16; 24],
+                viterbi: ViterbiSpiral::new(0),
+            };
+        }
+
+        let index = match resolve_uep_profile_index(bit_rate, prot_level) {
             Some(i) => i,
             None => {
-                // The FIG 0/1 carried an (bit_rate, prot_level) pair that is absent
-                // from the UEP profile table (ETSI EN 300 401 §6.2.1, Table 7).
-                // Fall back to profile index 0 rather than silently using index 1,
-                // which has no relationship to the requested parameters.
                 tracing::warn!(
                     bit_rate,
                     prot_level,
-                    "UEP profile not found in table, falling back to profile index 0"
+                    "UEP bitrate not found in ETSI table, creating empty protection profile"
                 );
-                0
+                return UepProtection {
+                    index_table: vec![false; 24],
+                    viterbi_block: vec![0i16; 24],
+                    viterbi: ViterbiSpiral::new(0),
+                };
             }
         };
+
+        if find_profile(bit_rate, prot_level).is_none() {
+            // The FIG 0/1 carried an (bit_rate, prot_level) pair that is absent
+            // from the UEP profile table (ETSI EN 300 401 §6.2.1, Table 7).
+            // Fall back to a profile with the same bitrate.
+            tracing::warn!(
+                bit_rate,
+                prot_level,
+                fallback_index = index,
+                "UEP profile not found in table, falling back to same-bitrate profile"
+            );
+        }
+
+        let out_size = 24 * bit_rate as usize;
         let p = &PROFILE_TABLE[index];
 
         let mut index_table = vec![false; out_size * 4 + 24];
@@ -1004,7 +1067,6 @@ impl UepProtection {
         }
 
         UepProtection {
-            out_size,
             index_table,
             viterbi_block: vec![0i16; out_size * 4 + 24],
             viterbi: ViterbiSpiral::new(out_size),
@@ -1012,14 +1074,7 @@ impl UepProtection {
     }
 
     pub fn deconvolve(&mut self, v: &[i16], out_buffer: &mut [u8]) {
-        self.viterbi_block.fill(0);
-        let mut input_counter = 0;
-        for i in 0..(self.out_size * 4 + 24) {
-            if self.index_table[i] && input_counter < v.len() {
-                self.viterbi_block[i] = v[input_counter];
-                input_counter += 1;
-            }
-        }
+        depuncture_soft_bits(&self.index_table, v, &mut self.viterbi_block);
         self.viterbi.deconvolve(&self.viterbi_block, out_buffer);
     }
 }
@@ -1041,10 +1096,78 @@ impl Protection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn count_marked_positions_counts_true_entries() {
+        let table = [true, false, true, true, false, false, true];
+        assert_eq!(count_marked_positions(&table), 4);
+    }
+
+    #[test]
+    fn resolve_uep_profile_index_known_pair() {
+        let idx = resolve_uep_profile_index(32, 4);
+        assert_eq!(idx, Some(1), "(32,4) must map to profile index 1");
+    }
+
+    #[test]
+    fn resolve_uep_profile_index_unknown_pair_falls_back_to_same_bitrate() {
+        let idx = resolve_uep_profile_index(999, 99);
+        assert_eq!(idx, None, "unknown bitrate must return None");
+    }
+
+    #[test]
+    fn resolve_uep_profile_index_unknown_level_with_known_bitrate() {
+        // 64 kbps exists in table, but level 99 does not.
+        let idx = resolve_uep_profile_index(64, 99).expect("must find same-bitrate fallback");
+        assert_eq!(PROFILE_TABLE[idx].bit_rate, 64);
+    }
+
+    #[test]
+    fn uep_profile_pairs_are_unique() {
+        // ETSI EN 300 401 §6.2.1 profile table must not contain duplicate
+        // (bit_rate, prot_level) keys.
+        let mut seen = HashSet::<(i16, i16)>::new();
+        for p in PROFILE_TABLE {
+            let key = (p.bit_rate, p.prot_level);
+            assert!(seen.insert(key), "duplicate UEP profile key: {key:?}");
+        }
+    }
+
+    #[test]
+    fn uep_profile_fields_have_valid_ranges() {
+        // Sanity ranges expected by constructor loops and get_pcodes lookup.
+        for p in PROFILE_TABLE {
+            assert!(p.bit_rate > 0, "bit_rate must be positive");
+            assert!(p.prot_level >= 1 && p.prot_level <= 5);
+
+            assert!(p.l1 >= 0 && p.l2 >= 0 && p.l3 >= 0 && p.l4 >= 0);
+            assert!(p.l1 + p.l2 + p.l3 + p.l4 > 0, "all L segments are zero");
+
+            assert!((1..=24).contains(&p.pi1));
+            assert!((1..=24).contains(&p.pi2));
+            assert!((1..=24).contains(&p.pi3));
+            if p.pi4 != -1 {
+                assert!((1..=24).contains(&p.pi4));
+            }
+        }
+    }
 
     #[test]
     fn eep_creation_a1() {
         let _p = EepProtection::new(64, 0);
+    }
+
+    #[test]
+    fn eep_index_table_has_valid_coverage() {
+        let p = EepProtection::new(64, 0);
+        assert_eq!(p.index_table.len(), 24 * 64 * 4 + 24);
+        let marked = count_marked_positions(&p.index_table);
+        assert!(marked > 0, "EEP index table must mark some positions");
+        assert!(
+            marked <= p.index_table.len(),
+            "marked positions cannot exceed table length"
+        );
     }
 
     #[test]
@@ -1099,6 +1222,18 @@ mod tests {
         let _p = UepProtection::new(999, 99);
     }
 
+    #[test]
+    fn uep_index_table_has_valid_coverage_for_known_profile() {
+        let p = UepProtection::new(64, 4);
+        assert_eq!(p.index_table.len(), 24 * 64 * 4 + 24);
+        let marked = count_marked_positions(&p.index_table);
+        assert!(marked > 0, "UEP index table must mark some positions");
+        assert!(
+            marked <= p.index_table.len(),
+            "marked positions cannot exceed table length"
+        );
+    }
+
     /// The fallback profile used when the requested (bit_rate, prot_level) is absent
     /// must allow deconvolution to complete without panic.
     /// (Previously unwrap_or(1) was used, which is index 1 and silently wrong;
@@ -1111,5 +1246,55 @@ mod tests {
         let input = vec![0i16; out_size * 4 + 24];
         let mut output = vec![0u8; out_size];
         p.deconvolve(&input, &mut output); // must not panic
+    }
+
+    #[test]
+    fn uep_unknown_bitrate_creates_empty_profile() {
+        let mut p = UepProtection::new(999, 99);
+        let input = vec![0i16; 24];
+        let mut output = Vec::<u8>::new();
+        p.deconvolve(&input, &mut output);
+        assert!(output.is_empty(), "unknown bitrate must emit no bits");
+        assert_eq!(count_marked_positions(&p.index_table), 0);
+    }
+
+    #[test]
+    fn eep_invalid_bit_rate_creates_empty_profile() {
+        let mut p = EepProtection::new(0, 0);
+        let input = vec![0i16; 24];
+        let mut output = Vec::<u8>::new();
+        p.deconvolve(&input, &mut output);
+        assert!(output.is_empty(), "empty EEP profile must emit no bits");
+        assert_eq!(count_marked_positions(&p.index_table), 0);
+    }
+
+    #[test]
+    fn uep_invalid_bit_rate_creates_empty_profile() {
+        let mut p = UepProtection::new(0, 0);
+        let input = vec![0i16; 24];
+        let mut output = Vec::<u8>::new();
+        p.deconvolve(&input, &mut output);
+        assert!(output.is_empty(), "empty UEP profile must emit no bits");
+        assert_eq!(count_marked_positions(&p.index_table), 0);
+    }
+
+    #[test]
+    fn depuncture_consumes_only_marked_positions() {
+        let table = [true, false, true, true, false];
+        let input = [10i16, 20, 30];
+        let mut block = [0i16; 5];
+        let consumed = depuncture_soft_bits(&table, &input, &mut block);
+        assert_eq!(consumed, 3);
+        assert_eq!(block, [10, 0, 20, 30, 0]);
+    }
+
+    #[test]
+    fn depuncture_truncated_input_leaves_remaining_zero() {
+        let table = [true, true, true, true];
+        let input = [7i16, 8];
+        let mut block = [99i16; 4];
+        let consumed = depuncture_soft_bits(&table, &input, &mut block);
+        assert_eq!(consumed, 2);
+        assert_eq!(block, [7, 8, 0, 0]);
     }
 }

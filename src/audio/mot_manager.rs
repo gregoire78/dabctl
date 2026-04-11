@@ -338,6 +338,10 @@ impl MotObject {
     fn total_body_size(&self) -> usize {
         self.result_file.body_size
     }
+
+    fn header_received(&self) -> bool {
+        self.header_received
+    }
 }
 
 /// MOT Manager: routes incoming Data Groups to MOT objects,
@@ -432,6 +436,22 @@ impl MotManager {
             last_seg,
             &dg[offset..offset + seg_size],
         );
+
+        // ETSI EN 301 234: body size comes from the header core.
+        // If accumulated body bytes exceed the declared size, the current
+        // object is irrecoverably malformed for this transport context.
+        if self.object.header_received()
+            && self.object.total_body_size() > 0
+            && self.object.current_body_size() > self.object.total_body_size()
+        {
+            tracing::debug!(
+                "MOT body overflow: received {} > declared {}, resetting current object",
+                self.object.current_body_size(),
+                self.object.total_body_size()
+            );
+            self.object = MotObject::new();
+            return (None, -1.0);
+        }
 
         let display = self.object.is_to_be_shown();
 
@@ -804,5 +824,33 @@ mod tests {
 
         let (result, _) = mgr.handle_data_group(&dg);
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_mot_manager_body_overflow_resets_object_and_recovers_same_tid() {
+        let mut mgr = MotManager::new();
+
+        // First object: declared body size is 2 bytes.
+        let header_raw = build_mot_header(2, CONTENT_TYPE_IMAGE, CONTENT_SUB_TYPE_JFIF, true);
+        let dg_header = build_mot_dg(3, 0, true, 7, &header_raw);
+        let (result, _) = mgr.handle_data_group(&dg_header);
+        assert!(result.is_none());
+
+        // Malformed body: 3 bytes, should trigger overflow reset.
+        let dg_body_overflow = build_mot_dg(4, 0, true, 7, &[0xAA, 0xBB, 0xCC]);
+        let (result, fraction) = mgr.handle_data_group(&dg_body_overflow);
+        assert!(result.is_none());
+        assert!(fraction < 0.0);
+
+        // Same transport_id must still be recoverable after reset.
+        let dg_header2 = build_mot_dg(3, 0, true, 7, &header_raw);
+        let (result, _) = mgr.handle_data_group(&dg_header2);
+        assert!(result.is_none());
+
+        let dg_body_ok = build_mot_dg(4, 0, true, 7, &[0x11, 0x22]);
+        let (result, _) = mgr.handle_data_group(&dg_body_ok);
+        assert!(result.is_some());
+        let file = result.unwrap();
+        assert_eq!(file.data, vec![0x11, 0x22]);
     }
 }

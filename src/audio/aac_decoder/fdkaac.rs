@@ -172,6 +172,12 @@ impl AacDecoder {
     }
 
     pub fn decode_frame(&mut self, data: &[u8]) -> Option<Vec<i16>> {
+        // ETSI TS 102 563 §5.1: an AU must carry AAC payload bytes.
+        // Empty payload is malformed and must be rejected deterministically.
+        if data.is_empty() {
+            return None;
+        }
+
         // Safety: PCM output buffer is stack-allocated with a known upper bound.
         unsafe {
             let mut au = data.to_vec();
@@ -280,7 +286,7 @@ mod tests {
         let asc: &[u8] = &[0x2B, 0x11, 0x88, 0x00, 0x06, 0x00, 0x4A, 0x00];
         if let Ok(mut dec) = AacDecoder::new(asc, 2) {
             let result = dec.decode_frame(&[]);
-            assert!(result.is_none() || result.is_some());
+            assert!(result.is_none());
         }
     }
 }

@@ -17,6 +17,7 @@ use std::thread;
 
 use clap::Args;
 use tracing::{debug, error, info, warn};
+use tracing_subscriber::filter::Directive;
 use tracing_subscriber::EnvFilter;
 
 use dabctl::audio::fic_decoder::FicDecoder;
@@ -35,6 +36,16 @@ use dabctl::pipeline::ofdm::ofdm_processor::OfdmProcessor;
 
 /// Bounded channel capacity in frames (~24 ms per frame → ~100 ms back-pressure).
 const CHANNEL_CAPACITY: usize = 4;
+
+#[inline]
+fn is_metadata_blackout_during_dropout(
+    sync_ok: i32,
+    sync_fail: i32,
+    dls_events: i32,
+    slide_events: i32,
+) -> bool {
+    sync_fail > sync_ok && dls_events == 0 && slide_events == 0
+}
 
 #[derive(Args, Debug)]
 pub struct Iq2pcmArgs {
@@ -91,6 +102,11 @@ pub struct Iq2pcmArgs {
     #[arg(long = "silent")]
     silent: bool,
 
+    /// Enable dedicated OFDM trace logs (sync/correlation/AFC), without
+    /// enabling trace for the whole application.
+    #[arg(long = "trace-ofdm", conflicts_with = "silent")]
+    trace_ofdm: bool,
+
     /// RTL-SDR device index
     #[arg(long = "device-index", default_value_t = 0)]
     device_index: u32,
@@ -115,11 +131,18 @@ pub enum AacBackend {
 
 #[allow(clippy::type_complexity)]
 pub fn run(args: Iq2pcmArgs) {
-    let filter = if args.silent {
+    let mut filter = if args.silent {
         EnvFilter::new("off")
     } else {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,rtl_sdr_rs=warn"))
     };
+
+    if args.trace_ofdm {
+        if let Ok(ofdm_directive) = "dabctl::pipeline::ofdm=trace".parse::<Directive>() {
+            filter = filter.add_directive(ofdm_directive);
+        }
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
@@ -325,6 +348,10 @@ pub fn run(args: Iq2pcmArgs) {
     let aus_decoded = Arc::new(AtomicI32::new(0));
     // Counts silence AUs emitted during signal fades (one per AU substituted).
     let silence_aus = Arc::new(AtomicI32::new(0));
+    // Metadata continuity counters (events emitted to PadOutput / fd 3).
+    let service_events = Arc::new(AtomicI32::new(0));
+    let dls_events = Arc::new(AtomicI32::new(0));
+    let slide_events = Arc::new(AtomicI32::new(0));
 
     // Monitor thread to log status and respect record_time
     let status_run = run.clone();
@@ -338,6 +365,9 @@ pub fn run(args: Iq2pcmArgs) {
     let c_sfail = sync_fail.clone();
     let c_au = aus_decoded.clone();
     let c_sil = silence_aus.clone();
+    let c_srv = service_events.clone();
+    let c_dls = dls_events.clone();
+    let c_sld = slide_events.clone();
     thread::spawn(move || {
         // Counts consecutive 1-second intervals where reception is degraded
         // (sfail > sok: majority of OFDM frames failed that second).
@@ -355,6 +385,9 @@ pub fn run(args: Iq2pcmArgs) {
             let sfail = c_sfail.swap(0, Ordering::SeqCst);
             let au = c_au.swap(0, Ordering::SeqCst);
             let sil = c_sil.swap(0, Ordering::SeqCst);
+            let srv = c_srv.swap(0, Ordering::SeqCst);
+            let dls = c_dls.swap(0, Ordering::SeqCst);
+            let sld = c_sld.swap(0, Ordering::SeqCst);
             let fib_ok = fs2_ok.swap(0, Ordering::SeqCst);
             let fib_tot = fs2_total.swap(0, Ordering::SeqCst);
             let fib_quality = if fib_tot > 0 {
@@ -394,6 +427,10 @@ pub fn run(args: Iq2pcmArgs) {
                 sync_fail = sfail,
                 aus = au,
                 silence_aus = sil,
+                service_events = srv,
+                dls_events = dls,
+                slide_events = sld,
+                metadata_blackout = is_metadata_blackout_during_dropout(sok, sfail, dls, sld),
                 freq_offset_hz = offset_hz,
                 mppm,
                 gain_db_x10,
@@ -419,6 +456,9 @@ pub fn run(args: Iq2pcmArgs) {
                         "Signal degraded for {} s (snr={} dB, freq_offset={} Hz){}",
                         consecutive_dropout_s, snr_val, offset_hz, hint,
                     );
+                    if is_metadata_blackout_during_dropout(sok, sfail, dls, sld) {
+                        warn!("Metadata blackout during dropout: no DLS/slide events in last 1 s");
+                    }
                 }
             } else {
                 if consecutive_dropout_s >= DROPOUT_WARN_SECS {
@@ -486,6 +526,7 @@ pub fn run(args: Iq2pcmArgs) {
             if let Some(svc) = fic_decoder.services.get(&target_sid) {
                 if !svc.label.is_empty() {
                     pad_output.write_service(&svc.label, &svc.short_label, svc.sid);
+                    service_events.fetch_add(1, Ordering::Relaxed);
                     info!("Service: {} (0x{:04X})", svc.label.trim(), svc.sid);
                     service_announced = true;
                 }
@@ -658,12 +699,14 @@ pub fn run(args: Iq2pcmArgs) {
                     pad_decoder.process_full(&pad.xpad, pad.xpad.len(), true, &pad.fpad);
                 if let Some(ref label) = pad_result.dynamic_label {
                     pad_output.write_dl(&label.text);
+                    dls_events.fetch_add(1, Ordering::Relaxed);
                     if !args.disable_dyn_fic {
                         debug!("DLS: {}", label.text);
                     }
                 }
                 if let Some(ref slide) = pad_result.slide {
                     pad_output.write_slide(slide);
+                    slide_events.fetch_add(1, Ordering::Relaxed);
                     if !args.disable_dyn_fic {
                         debug!(
                             "Slide: {} ({}, {} bytes)",
@@ -855,5 +898,328 @@ mod tests {
             result.is_err(),
             "clap must reject -G and --hardware-agc together"
         );
+    }
+
+    #[test]
+    fn trace_ofdm_defaults_to_false() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Wrapper {
+            #[command(flatten)]
+            inner: Iq2pcmArgs,
+        }
+        let args = Wrapper::parse_from(["test", "-C", "6C", "-s", "0xF2F8"]);
+        assert!(!args.inner.trace_ofdm);
+    }
+
+    #[test]
+    fn trace_ofdm_can_be_enabled() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Wrapper {
+            #[command(flatten)]
+            inner: Iq2pcmArgs,
+        }
+        let args = Wrapper::parse_from(["test", "-C", "6C", "-s", "0xF2F8", "--trace-ofdm"]);
+        assert!(args.inner.trace_ofdm);
+    }
+
+    #[test]
+    fn trace_ofdm_and_silent_are_mutually_exclusive() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Wrapper {
+            #[command(flatten)]
+            inner: Iq2pcmArgs,
+        }
+        let result = Wrapper::try_parse_from([
+            "test",
+            "-C",
+            "6C",
+            "-s",
+            "0xF2F8",
+            "--trace-ofdm",
+            "--silent",
+        ]);
+        assert!(
+            result.is_err(),
+            "clap must reject --trace-ofdm and --silent together"
+        );
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum MetaEvent {
+        Service,
+        Dls,
+        Slide,
+    }
+
+    #[test]
+    fn metadata_blackout_detects_dropout_without_dls_or_slide() {
+        assert!(is_metadata_blackout_during_dropout(1, 10, 0, 0));
+        assert!(is_metadata_blackout_during_dropout(0, 42, 0, 0));
+    }
+
+    #[test]
+    fn metadata_blackout_is_false_when_sync_not_degraded_or_metadata_present() {
+        assert!(!is_metadata_blackout_during_dropout(10, 1, 0, 0));
+        assert!(!is_metadata_blackout_during_dropout(1, 10, 1, 0));
+        assert!(!is_metadata_blackout_during_dropout(1, 10, 0, 1));
+    }
+
+    /// Simulate one metadata emission step from the main loop.
+    ///
+    /// ETSI TS 102 563 §5.1: after superframe sync loss, AU/PAD availability
+    /// can drop to zero temporarily; service metadata must stay monotonic and
+    /// never be re-emitted out of order when sync recovers.
+    fn simulate_metadata_step(
+        service_announced: bool,
+        service_ready: bool,
+        has_dls: bool,
+        has_slide: bool,
+    ) -> (bool, Vec<MetaEvent>) {
+        let mut announced = service_announced;
+        let mut events = Vec::new();
+
+        if !announced && service_ready {
+            events.push(MetaEvent::Service);
+            announced = true;
+        }
+        if has_dls {
+            events.push(MetaEvent::Dls);
+        }
+        if has_slide {
+            events.push(MetaEvent::Slide);
+        }
+
+        (announced, events)
+    }
+
+    #[test]
+    fn metadata_sequence_keeps_service_first_with_intermittent_sync_loss() {
+        let mut announced = false;
+        let mut sequence = Vec::new();
+
+        // Frame 1: service discovered while lock is unstable.
+        // Service must be emitted once, before any PAD metadata.
+        (announced, sequence) = {
+            let (a, mut e) = simulate_metadata_step(announced, true, false, false);
+            (a, {
+                let mut s = sequence;
+                s.append(&mut e);
+                s
+            })
+        };
+
+        // Frame 2: sync loss window, no PAD output.
+        (announced, sequence) = {
+            let (a, mut e) = simulate_metadata_step(announced, true, false, false);
+            (a, {
+                let mut s = sequence;
+                s.append(&mut e);
+                s
+            })
+        };
+
+        // Frame 3: sync recovered, DLS+slide available.
+        (announced, sequence) = {
+            let (a, mut e) = simulate_metadata_step(announced, true, true, true);
+            (a, {
+                let mut s = sequence;
+                s.append(&mut e);
+                s
+            })
+        };
+
+        assert!(announced);
+        assert_eq!(
+            sequence,
+            vec![MetaEvent::Service, MetaEvent::Dls, MetaEvent::Slide]
+        );
+    }
+
+    #[test]
+    fn metadata_sequence_does_not_reemit_service_after_recovery() {
+        let mut announced = false;
+        let mut service_count = 0usize;
+
+        let timeline = [
+            // first lock and service discovery
+            (true, false, false),
+            // long degraded phase
+            (true, false, false),
+            (true, false, false),
+            // recovered with DLS only
+            (true, true, false),
+            // later recovered with slide only
+            (true, false, true),
+        ];
+
+        for (service_ready, has_dls, has_slide) in timeline {
+            let (a, events) = simulate_metadata_step(announced, service_ready, has_dls, has_slide);
+            announced = a;
+            service_count += events
+                .iter()
+                .filter(|&&ev| ev == MetaEvent::Service)
+                .count();
+        }
+
+        assert_eq!(service_count, 1);
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct StabilityStats {
+        seconds: usize,
+        dropout_seconds: usize,
+        blackout_seconds: usize,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct StabilityAcceptance {
+        max_dropout_pct: usize,
+        max_blackout_pct: usize,
+    }
+
+    fn parse_status_field_i32(line: &str, key: &str) -> Option<i32> {
+        line.split_whitespace()
+            .find_map(|token| token.strip_prefix(&format!("{key}=")))
+            .and_then(|value| value.parse::<i32>().ok())
+    }
+
+    fn parse_status_field_bool(line: &str, key: &str) -> Option<bool> {
+        line.split_whitespace()
+            .find_map(|token| token.strip_prefix(&format!("{key}=")))
+            .and_then(|value| value.parse::<bool>().ok())
+    }
+
+    fn collect_stability_stats_from_status_lines(lines: &[&str]) -> StabilityStats {
+        let mut seconds = 0usize;
+        let mut dropout_seconds = 0usize;
+        let mut blackout_seconds = 0usize;
+
+        for line in lines {
+            if !line.contains(" status ") {
+                continue;
+            }
+            let sync_ok = parse_status_field_i32(line, "sync_ok").unwrap_or(0);
+            let sync_fail = parse_status_field_i32(line, "sync_fail").unwrap_or(0);
+            let metadata_blackout = parse_status_field_bool(line, "metadata_blackout")
+                .unwrap_or_else(|| {
+                    let dls = parse_status_field_i32(line, "dls_events").unwrap_or(0);
+                    let slide = parse_status_field_i32(line, "slide_events").unwrap_or(0);
+                    is_metadata_blackout_during_dropout(sync_ok, sync_fail, dls, slide)
+                });
+
+            seconds += 1;
+            if sync_fail > sync_ok {
+                dropout_seconds += 1;
+            }
+            if metadata_blackout {
+                blackout_seconds += 1;
+            }
+        }
+
+        StabilityStats {
+            seconds,
+            dropout_seconds,
+            blackout_seconds,
+        }
+    }
+
+    fn acceptance_for_campaign_window(window_seconds: usize) -> StabilityAcceptance {
+        match window_seconds {
+            300 => StabilityAcceptance {
+                max_dropout_pct: 40,
+                max_blackout_pct: 20,
+            },
+            900 => StabilityAcceptance {
+                max_dropout_pct: 30,
+                max_blackout_pct: 15,
+            },
+            1800 => StabilityAcceptance {
+                max_dropout_pct: 20,
+                max_blackout_pct: 10,
+            },
+            _ => StabilityAcceptance {
+                max_dropout_pct: 30,
+                max_blackout_pct: 15,
+            },
+        }
+    }
+
+    fn campaign_window_passes(stats: StabilityStats, acceptance: StabilityAcceptance) -> bool {
+        if stats.seconds == 0 {
+            return false;
+        }
+
+        let dropout_pct = stats.dropout_seconds * 100 / stats.seconds;
+        let blackout_pct = stats.blackout_seconds * 100 / stats.seconds;
+
+        dropout_pct <= acceptance.max_dropout_pct && blackout_pct <= acceptance.max_blackout_pct
+    }
+
+    #[test]
+    fn campaign_acceptance_profiles_for_5_15_30_min_windows() {
+        // 5 / 15 / 30 min windows used in long-run campaign acceptance.
+        assert_eq!(
+            acceptance_for_campaign_window(300),
+            StabilityAcceptance {
+                max_dropout_pct: 40,
+                max_blackout_pct: 20
+            }
+        );
+        assert_eq!(
+            acceptance_for_campaign_window(900),
+            StabilityAcceptance {
+                max_dropout_pct: 30,
+                max_blackout_pct: 15
+            }
+        );
+        assert_eq!(
+            acceptance_for_campaign_window(1800),
+            StabilityAcceptance {
+                max_dropout_pct: 20,
+                max_blackout_pct: 10
+            }
+        );
+    }
+
+    #[test]
+    fn log_driven_stats_collects_dropout_and_blackout_from_status_lines() {
+        let lines = vec![
+            "2026-04-11T22:49:11Z DEBUG status sync_ok=8 sync_fail=1 dls_events=1 slide_events=0 metadata_blackout=false",
+            "2026-04-11T22:49:22Z DEBUG status sync_ok=3 sync_fail=22 dls_events=0 slide_events=0 metadata_blackout=true",
+            "2026-04-11T22:49:23Z DEBUG status sync_ok=0 sync_fail=42 dls_events=0 slide_events=0 metadata_blackout=true",
+            "2026-04-11T22:49:29Z DEBUG status sync_ok=8 sync_fail=0 dls_events=1 slide_events=1 metadata_blackout=false",
+        ];
+
+        let stats = collect_stability_stats_from_status_lines(&lines);
+        assert_eq!(stats.seconds, 4);
+        assert_eq!(stats.dropout_seconds, 2);
+        assert_eq!(stats.blackout_seconds, 2);
+    }
+
+    #[test]
+    fn campaign_window_passes_when_under_thresholds() {
+        let stats = StabilityStats {
+            seconds: 300,
+            dropout_seconds: 90,
+            blackout_seconds: 45,
+        };
+        let acceptance = acceptance_for_campaign_window(300);
+
+        assert!(campaign_window_passes(stats, acceptance));
+    }
+
+    #[test]
+    fn campaign_window_fails_when_blackout_exceeds_threshold() {
+        let stats = StabilityStats {
+            seconds: 900,
+            dropout_seconds: 200,
+            blackout_seconds: 180,
+        };
+        let acceptance = acceptance_for_campaign_window(900);
+
+        assert!(!campaign_window_passes(stats, acceptance));
     }
 }

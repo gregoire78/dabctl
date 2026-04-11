@@ -388,9 +388,11 @@ impl PadDecoder {
         let mut result = PadResult::default();
 
         // Reverse X-PAD byte order (DAB+ provides it reversed for compatibility with DAB)
-        let used_len = xpad_len.min(MAX_XPAD_LEN);
+        // Guard against malformed callers that declare xpad_len larger than
+        // the actual provided buffer length.
+        let used_len = xpad_len.min(MAX_XPAD_LEN).min(xpad_data.len());
         for i in 0..used_len {
-            self.xpad_buf[i] = xpad_data[xpad_len - 1 - i];
+            self.xpad_buf[i] = xpad_data[used_len - 1 - i];
         }
 
         let fpad_type = fpad_data[0] >> 6;
@@ -763,5 +765,34 @@ mod tests {
         let raw = b"le c\xF3ur des Balkans";
         let text = decode_label_text(&raw[..], 0, false);
         assert_eq!(text, "le cœur des Balkans");
+    }
+
+    #[test]
+    fn process_full_ignores_declared_xpad_len_larger_than_buffer() {
+        let mut decoder = PadDecoder::new();
+        let xpad_data = [0x00u8, 0x00u8];
+        let fpad_data = [0x00u8, 0x00u8];
+
+        let result = decoder.process_full(&xpad_data, 10, false, &fpad_data);
+
+        assert!(result.dynamic_label.is_none());
+        assert!(result.slide.is_none());
+    }
+
+    #[test]
+    fn dl_plus_command_is_ignored_without_emitting_label_segment() {
+        let mut dg = vec![0x12u8, 0x00u8, 0xAAu8];
+        let crc = crc16_ccitt().calc(&dg);
+        dg.push((crc >> 8) as u8);
+        dg.push((crc & 0xFF) as u8);
+
+        let mut decoder = DlDataGroupDecoder::new();
+        let seg = decoder.process(true, &dg);
+
+        assert!(seg.is_none());
+        assert!(
+            decoder.data.is_empty(),
+            "decoder must reset after DL Plus command"
+        );
     }
 }

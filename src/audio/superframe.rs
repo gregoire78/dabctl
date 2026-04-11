@@ -367,7 +367,26 @@ impl SuperframeFilter {
             au_start[5] = (sf[9] as usize) << 4 | (sf[10] as usize) >> 4;
         }
 
+        self.sanitize_au_starts(&mut au_start);
         au_start
+    }
+
+    /// ETSI TS 102 563 §5.2 defines AU boundaries via header offsets.
+    /// On corrupted headers, keep boundaries monotonic and inside payload range.
+    fn sanitize_au_starts(&self, au_start: &mut [usize]) {
+        if au_start.is_empty() {
+            return;
+        }
+
+        let payload_end = self.sf_len / 120 * 110;
+        if let Some(last) = au_start.last_mut() {
+            *last = (*last).min(payload_end);
+        }
+
+        for i in 1..au_start.len() {
+            let prev = au_start[i - 1];
+            au_start[i] = au_start[i].min(payload_end).max(prev);
+        }
     }
 
     /// Get the current format (if determined)
@@ -632,5 +651,28 @@ mod tests {
         );
         assert_eq!(filter.write_head, 0, "write_head must be reset to 0");
         assert_eq!(filter.frame_count, 0, "frame_count must be reset to 0");
+    }
+
+    #[test]
+    fn sanitize_au_starts_clamps_values_to_payload_end() {
+        let mut filter = SuperframeFilter::new();
+        filter.sf_len = 600;
+        let mut starts = vec![6, 800, 900, 550];
+
+        filter.sanitize_au_starts(&mut starts);
+
+        // payload_end = 600/120*110 = 550
+        assert_eq!(starts, vec![6, 550, 550, 550]);
+    }
+
+    #[test]
+    fn sanitize_au_starts_enforces_monotonic_order() {
+        let mut filter = SuperframeFilter::new();
+        filter.sf_len = 600;
+        let mut starts = vec![11, 220, 200, 410, 300, 550, 550];
+
+        filter.sanitize_au_starts(&mut starts);
+
+        assert_eq!(starts, vec![11, 220, 220, 410, 410, 550, 550]);
     }
 }

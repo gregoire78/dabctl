@@ -11,6 +11,8 @@ const POLYS: [i32; RATE] = [0o155, 0o117, 0o123, 0o155];
 const RENORMALIZE_THRESHOLD: u32 = 137;
 /// Bias applied when mapping signed soft bits (−127..127) to unsigned symbols (0..254).
 const SOFT_DECISION_BIAS: i32 = 127;
+/// Neutral soft symbol used when input is truncated (0-confidence midpoint).
+const NEUTRAL_SOFT_SYMBOL: u8 = SOFT_DECISION_BIAS as u8;
 /// Chainback shift constants derived from K=7 and 8-bit byte width.
 const ADD_SHIFT: usize = 8_usize.saturating_sub(K - 1); // 2
 const SUB_SHIFT: usize = (K - 1).saturating_sub(8); // 0
@@ -30,6 +32,27 @@ fn parity(mut x: i32) -> i32 {
     x ^= x >> 16;
     x ^= x >> 8;
     PARTAB[(x & 0xff) as usize] as i32
+}
+
+#[inline]
+fn map_soft_decision_to_symbol(inp: i16) -> u8 {
+    (inp as i32 + SOFT_DECISION_BIAS).clamp(0, 255) as u8
+}
+
+#[inline]
+fn required_soft_input_len(frame_bits: usize) -> usize {
+    // Rate 1/4 trellis with K-1 tail bits: RATE * (N + K - 1).
+    RATE * (frame_bits + K - 1)
+}
+
+#[inline]
+fn decision_words_per_step() -> usize {
+    NUM_STATES.div_ceil(32)
+}
+
+#[inline]
+fn should_renormalize(min_metric: u32) -> bool {
+    min_metric > RENORMALIZE_THRESHOLD
 }
 
 pub struct ViterbiSpiral {
@@ -90,7 +113,7 @@ impl ViterbiSpiral {
         // Using the true minimum (not metrics[0]) avoids false negatives when state 0
         // is not on the best path.
         let min = *metrics.iter().min().unwrap(); // slice is always NUM_STATES long
-        if min > RENORMALIZE_THRESHOLD {
+        if should_renormalize(min) {
             for m in metrics.iter_mut() {
                 *m -= min;
             }
@@ -99,7 +122,7 @@ impl ViterbiSpiral {
 
     fn update_viterbi(&mut self) {
         let nbits = self.frame_bits + K - 1;
-        let words_per_decision = NUM_STATES.div_ceil(32);
+        let words_per_decision = decision_words_per_step();
 
         // Decision bits are already zeroed by init_viterbi; re-zero here to make
         // update_viterbi safe even if called without a preceding init_viterbi.
@@ -168,7 +191,7 @@ impl ViterbiSpiral {
 
     fn chainback(&mut self) {
         let nbits = self.frame_bits;
-        let words_per_decision = NUM_STATES.div_ceil(32);
+        let words_per_decision = decision_words_per_step();
 
         self.data.fill(0);
 
@@ -198,10 +221,12 @@ impl ViterbiSpiral {
     /// into hard bits (output: 0/1 bytes)
     pub fn deconvolve(&mut self, input: &[i16], output: &mut [u8]) {
         self.init_viterbi();
-        let total = (self.frame_bits + K - 1) * RATE;
+        let total = required_soft_input_len(self.frame_bits);
+        // Reset the active symbol window so truncated inputs do not reuse stale
+        // soft bits from previous calls.
+        self.symbols[..total].fill(NEUTRAL_SOFT_SYMBOL);
         for (i, &inp) in input.iter().enumerate().take(total.min(input.len())) {
-            let temp = (inp as i32 + SOFT_DECISION_BIAS).clamp(0, 255);
-            self.symbols[i] = temp as u8;
+            self.symbols[i] = map_soft_decision_to_symbol(inp);
         }
 
         self.update_viterbi();
@@ -221,6 +246,70 @@ mod tests {
     use super::*;
 
     #[test]
+    fn map_soft_decision_bounds_are_clamped() {
+        assert_eq!(map_soft_decision_to_symbol(i16::MIN), 0);
+        assert_eq!(map_soft_decision_to_symbol(i16::MAX), 255);
+    }
+
+    #[test]
+    fn map_soft_decision_nominal_range_matches_expected_bias() {
+        // ETSI EN 300 401 soft bits are nominally in [-127, +127].
+        assert_eq!(map_soft_decision_to_symbol(-127), 0);
+        assert_eq!(map_soft_decision_to_symbol(0), 127);
+        assert_eq!(map_soft_decision_to_symbol(127), 254);
+    }
+
+    #[test]
+    fn required_soft_input_len_matches_formula() {
+        assert_eq!(required_soft_input_len(0), RATE * (K - 1));
+        assert_eq!(required_soft_input_len(32), 152);
+        assert_eq!(required_soft_input_len(64), 280);
+    }
+
+    #[test]
+    fn required_soft_input_len_is_monotonic() {
+        assert!(required_soft_input_len(33) > required_soft_input_len(32));
+        assert!(required_soft_input_len(128) > required_soft_input_len(64));
+    }
+
+    #[test]
+    fn decision_words_per_step_matches_state_geometry() {
+        assert_eq!(NUM_STATES, 64);
+        assert_eq!(decision_words_per_step(), 2);
+    }
+
+    #[test]
+    fn decision_storage_size_matches_formula() {
+        let nbits = 32usize;
+        let words = (nbits + K - 1) * decision_words_per_step();
+        let v = ViterbiSpiral::new(nbits);
+        assert_eq!(v.decisions.len(), words);
+    }
+
+    #[test]
+    fn renormalize_guard_matches_threshold_rule() {
+        assert!(!should_renormalize(RENORMALIZE_THRESHOLD));
+        assert!(should_renormalize(RENORMALIZE_THRESHOLD + 1));
+    }
+
+    #[test]
+    fn renormalize_noop_when_min_is_below_or_equal_threshold() {
+        let mut metrics = vec![RENORMALIZE_THRESHOLD, RENORMALIZE_THRESHOLD + 5, 9];
+        let before = metrics.clone();
+        ViterbiSpiral::renormalize(&mut metrics);
+        assert_eq!(metrics, before);
+    }
+
+    #[test]
+    fn renormalize_subtracts_min_when_above_threshold() {
+        let mut metrics = vec![RENORMALIZE_THRESHOLD + 2, RENORMALIZE_THRESHOLD + 12, 200];
+        ViterbiSpiral::renormalize(&mut metrics);
+        assert_eq!(metrics[0], 0);
+        assert_eq!(metrics[1], 10);
+        assert_eq!(metrics[2], 61);
+    }
+
+    #[test]
     fn new_does_not_panic() {
         let _v = ViterbiSpiral::new(768);
     }
@@ -228,7 +317,7 @@ mod tests {
     #[test]
     fn zero_input_produces_zero_output() {
         let mut v = ViterbiSpiral::new(32);
-        let input = vec![0i16; 152];
+        let input = vec![0i16; required_soft_input_len(32)];
         let mut output = vec![0u8; 32];
         v.deconvolve(&input, &mut output);
         assert!(output.iter().all(|&b| b == 0));
@@ -237,7 +326,7 @@ mod tests {
     #[test]
     fn output_is_binary() {
         let mut v = ViterbiSpiral::new(64);
-        let input: Vec<i16> = (0..280)
+        let input: Vec<i16> = (0..required_soft_input_len(64))
             .map(|i| if i % 3 == 0 { 127 } else { -127 })
             .collect();
         let mut output = vec![0u8; 64];
@@ -249,7 +338,7 @@ mod tests {
     fn different_word_lengths() {
         for wl in [16, 32, 64, 128, 768] {
             let mut v = ViterbiSpiral::new(wl);
-            let input = vec![0i16; (wl + 6) * 4];
+            let input = vec![0i16; required_soft_input_len(wl)];
             let mut output = vec![0u8; wl];
             v.deconvolve(&input, &mut output);
         }
@@ -258,7 +347,7 @@ mod tests {
     #[test]
     fn strong_encoded_ones() {
         let mut v = ViterbiSpiral::new(32);
-        let input = vec![127i16; 152];
+        let input = vec![127i16; required_soft_input_len(32)];
         let mut output = vec![0u8; 32];
         v.deconvolve(&input, &mut output);
         assert!(output.iter().all(|&b| b == 0 || b == 1));
@@ -313,6 +402,33 @@ mod tests {
             v.deconvolve(&soft, &mut decoded);
             assert_eq!(decoded, original, "result must be stable on repeated calls");
         }
+    }
+
+    #[test]
+    fn truncated_input_does_not_reuse_previous_symbols() {
+        let nbits = 32usize;
+        let total_symbols = required_soft_input_len(nbits);
+
+        let mut reused = ViterbiSpiral::new(nbits);
+        let mut fresh = ViterbiSpiral::new(nbits);
+
+        // First run with a non-neutral pattern to contaminate internal symbol state
+        // in implementations that forget to clear it.
+        let strong = vec![127i16; total_symbols];
+        let mut sink = vec![0u8; nbits];
+        reused.deconvolve(&strong, &mut sink);
+
+        // Then run with a truncated input and compare with a fresh decoder.
+        let truncated = vec![0i16; total_symbols / 3];
+        let mut out_reused = vec![0u8; nbits];
+        let mut out_fresh = vec![0u8; nbits];
+        reused.deconvolve(&truncated, &mut out_reused);
+        fresh.deconvolve(&truncated, &mut out_fresh);
+
+        assert_eq!(
+            out_reused, out_fresh,
+            "short input output must not depend on previous decode calls"
+        );
     }
 
     /// Test-only rate-1/4 K=7 convolutional encoder.

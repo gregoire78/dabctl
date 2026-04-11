@@ -114,11 +114,7 @@ impl PadOutput {
     }
 
     fn save_slide_to_dir(&self, dir: PathBuf, file: &MotFile) {
-        let filename = if file.content_name.is_empty() {
-            format!("slide.{}", file.extension())
-        } else {
-            sanitize_filename(&file.content_name)
-        };
+        let filename = slide_content_name(file);
 
         let path = dir.join(&filename);
         match std::fs::write(&path, &file.data) {
@@ -145,8 +141,9 @@ impl PadOutput {
             slide: Slide<'a>,
         }
         let b64 = base64::engine::general_purpose::STANDARD.encode(&file.data);
+        let content_name = slide_content_name(file);
         let slide = Slide {
-            content_name: &file.content_name,
+            content_name: &content_name,
             content_type: file.mime_type(),
             data: b64,
         };
@@ -203,6 +200,15 @@ fn sanitize_filename(name: &str) -> String {
         .collect()
 }
 
+/// Content name emitted to both disk and JSON for slideshow consistency.
+fn slide_content_name(file: &MotFile) -> String {
+    if file.content_name.is_empty() {
+        format!("slide.{}", file.extension())
+    } else {
+        sanitize_filename(&file.content_name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,5 +228,42 @@ mod tests {
     #[test]
     fn test_sanitize_filename_special_chars() {
         assert_eq!(sanitize_filename("file<>:\"|?.jpg"), "file______.jpg");
+    }
+
+    #[test]
+    fn test_slide_content_name_falls_back_to_extension() {
+        let mut file = MotFile {
+            data: Vec::new(),
+            body_size: 0,
+            content_type: -1,
+            content_sub_type: -1,
+            content_name: String::new(),
+            content_name_charset: String::new(),
+            category_title: String::new(),
+            click_through_url: String::new(),
+            trigger_time_now: true,
+        };
+
+        file.content_type = crate::audio::mot_manager::CONTENT_TYPE_IMAGE as i16;
+        file.content_sub_type = crate::audio::mot_manager::CONTENT_SUB_TYPE_JFIF as i16;
+
+        assert_eq!(slide_content_name(&file), "slide.jpg");
+    }
+
+    #[test]
+    fn test_slide_content_name_sanitizes_broadcast_name() {
+        let file = MotFile {
+            data: Vec::new(),
+            body_size: 0,
+            content_type: -1,
+            content_sub_type: -1,
+            content_name: "../../bad name?.png".to_string(),
+            content_name_charset: String::new(),
+            category_title: String::new(),
+            click_through_url: String::new(),
+            trigger_time_now: true,
+        };
+
+        assert_eq!(slide_content_name(&file), "bad_name_.png");
     }
 }
