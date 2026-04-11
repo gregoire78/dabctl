@@ -74,7 +74,6 @@ impl MotDecoder {
             }
             return false;
         }
-        // Validation CRC extraite
         if !self.is_valid_crc() {
             tracing::trace!("MOT DG CRC INVALID (size={})", self.size_needed);
             self.reset();
@@ -86,7 +85,7 @@ impl MotDecoder {
 
     /// Get the completed Data Group bytes (including CRC).
     ///
-    /// Validation CRC du Data Group courant
+    /// Returns true when the CRC of the accumulated Data Group is valid.
     fn is_valid_crc(&self) -> bool {
         if self.size_needed < CRC_LEN {
             return false;
@@ -154,11 +153,11 @@ mod tests {
         // When/Then
         assert!(dec.is_valid_crc());
 
-        // Cas CRC faux
+        // invalid CRC — corrupt last byte
         let mut dec2 = MotDecoder::new();
         let mut bad = dg.clone();
         let last = bad.len() - 1;
-        bad[last] ^= 0xFF; // corrompre le CRC
+        bad[last] ^= 0xFF; // flip one CRC byte to corrupt it
         dec2.set_len(bad.len());
         dec2.process_subfield(true, &bad);
         assert!(!dec2.is_valid_crc());

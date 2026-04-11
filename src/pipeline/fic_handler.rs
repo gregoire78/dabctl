@@ -132,8 +132,7 @@ impl FicHandler {
 
         // CRC check on each of the 3 FIBs in this ficno
         *valid = true;
-        for i in (ficno * 3)..(ficno * 3 + 3) {
-            let fib_idx = i % 3;
+        for fib_idx in 0..3 {
             let p = &self.bit_buffer_out[fib_idx * 256..(fib_idx + 1) * 256];
             if !check_crc_bits(p, 256) {
                 *valid = false;
@@ -167,6 +166,19 @@ impl FicHandler {
     pub fn reset_quality_counters(&mut self) {
         self.fic_errors = 0;
         self.fic_success = 0;
+    }
+
+    /// Returns `(success, total)` FIB CRC counts for the current frame window.
+    ///
+    /// Prefer this over `get_fic_quality()` when accumulating counts over a
+    /// longer reporting window (e.g. the 1-second status log), so the quality
+    /// ratio can be computed from the summed counts rather than averaged
+    /// per-frame percentages.
+    pub fn get_fic_counts(&self) -> (i16, i16) {
+        (
+            self.fic_success as i16,
+            (self.fic_success + self.fic_errors) as i16,
+        )
     }
 
     pub fn get_fic_quality(&self) -> i16 {

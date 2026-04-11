@@ -4,7 +4,7 @@
 use num_complex::Complex32;
 use rtl_sdr_rs::{DeviceId, RtlSdr, TunerGain};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use tracing::{debug, info, warn};
@@ -57,9 +57,53 @@ const SAGC_HUNT_THRESHOLD: u32 = 3;
 /// Each tick is `SAGC_CHECK_INTERVAL` buffers:
 /// 80 × 4 × 8192 / 2_048_000 s ≈ 1.3 s base freeze; doubles each episode.
 const SAGC_HUNT_FREEZE_BASE: u32 = 80;
+/// Number of SAGC evaluation ticks after startup during which the hunting detector
+/// is inactive.  The first seconds of reception involve rapid gain adjustments as
+/// the OFDM sync is acquired; without a grace period these trigger the hunting
+/// suppressor and lock the gain for the rest of the session.
+/// 128 × 4 × 8192 / 2_048_000 s ≈ 2 s grace window.
+const SAGC_HUNT_GRACE_TICKS: u32 = 128;
 /// Maximum number of ticks the hunting freeze can reach after repeated doubling.
 /// 5120 × 4 × 8192 / 2_048_000 s ≈ 82 s — effectively permanent for a session.
 const SAGC_HUNT_FREEZE_MAX: u32 = 5120;
+/// SAGC: ADC clipping threshold on the ±128 raw-byte scale.
+/// Samples whose absolute value exceeds this are considered near-saturation.
+/// 120 / 127 ≈ 94.5 % of ADC full scale.
+const SAGC_CLIP_THRESHOLD: f32 = 120.0;
+/// SAGC: maximum fraction of I/Q scalar values allowed near ADC saturation per
+/// evaluation interval before the clipping path forces an immediate gain step
+/// down, bypassing the normal hold / confirm protection.
+///
+/// DAB OFDM signals have a peak-to-average ratio of ~10 dB. The slow IIR mean
+/// estimator (SAGC_CREL) can converge below SAGC_LEVEL_MAX while instantaneous
+/// peaks still clip the ADC, distorting the OFDM and causing sync failures.
+/// When more than 5 % of raw samples approach ADC saturation, the SAGC forces
+/// the gain down regardless of the mean-level state.
+const SAGC_CLIP_RATE_MAX: f32 = 0.05;
+
+/// Absolute signal-level floor on the ±128 scale below which the SAGC considers
+/// the signal absent (no aerial, genuine silence, or device disconnected).
+/// 3.0 / 128 ≈ 2.3 % ADC full scale.
+///
+/// The slow IIR release (`SAGC_CREL`) can keep `agc_level` high for > 30 s after
+/// signal loss, preventing gain recovery. When `agc_level` stays below this floor
+/// for `SAGC_SILENCE_TICKS` consecutive evaluation ticks, the level estimator is
+/// reset to 0 and the hunt history is cleared so the SAGC is ready to find the
+/// correct gain step when the signal returns.
+const SAGC_SILENCE_FLOOR: f32 = 3.0;
+/// Number of consecutive evaluation ticks where `agc_level < SAGC_SILENCE_FLOOR`
+/// before the silence-recovery path fires.
+/// 10 × 4 × 8192 / 2_048_000 s ≈ 160 ms of confirmed silence.
+const SAGC_SILENCE_TICKS: u32 = 10;
+/// Number of consecutive "stable zone" evaluation ticks (signal between
+/// `agc_level_min` and `SAGC_LEVEL_MAX`, no hold-off, no hunt freeze) required
+/// to reset the hunt-freeze backoff multiplier to its base value.
+///
+/// Without this reset, `hunt_freeze_ticks` doubles on every hunting episode and
+/// never decreases, leaving the SAGC permanently locked after an early episode
+/// even when the signal later stabilises.
+/// 500 × 4 × 8192 / 2_048_000 s ≈ 8 s of stability required.
+const SAGC_HUNT_RESET_TICKS: u32 = 500;
 
 /// Select the closest gain value from `gains` (sorted list in tenths of dB)
 /// given a percentage `gain_pct` in `0..=100`.
@@ -153,6 +197,9 @@ impl IqFifo {
 pub struct RtlsdrHandler {
     config: DeviceConfig,
     running: Arc<AtomicBool>,
+    /// Current tuner gain in tenths of dB, updated by the SAGC worker thread.
+    /// Value is -1 when hardware AGC is active (gain is unknown).
+    current_gain_tenths: Arc<AtomicI32>,
     fifo: Arc<IqFifo>,
     worker_handle: Option<thread::JoinHandle<()>>,
 }
@@ -174,6 +221,7 @@ impl RtlsdrHandler {
                 gain_mode,
             },
             running: Arc::new(AtomicBool::new(false)),
+            current_gain_tenths: Arc::new(AtomicI32::new(0)),
             fifo: Arc::new(IqFifo::new(capacity)),
             worker_handle: None,
         })
@@ -192,6 +240,7 @@ impl RtlsdrHandler {
         let config = self.config.clone();
         let running = self.running.clone();
         let fifo = self.fifo.clone();
+        let current_gain_tenths = self.current_gain_tenths.clone();
 
         // Oneshot channel: worker reports init success/failure before entering
         // the read loop.  This avoids opening the device twice.
@@ -299,6 +348,13 @@ impl RtlsdrHandler {
             // Signal successful initialization to the main thread.
             let _ = init_tx.send(Ok(()));
 
+            // Publish the initial gain so the status thread can read it immediately.
+            if hardware_agc {
+                current_gain_tenths.store(-1, Ordering::Relaxed);
+            } else {
+                current_gain_tenths.store(gains[initial_gain_idx], Ordering::Relaxed);
+            }
+
             // ── SAGC state ────────────────────────────────────────────────────
             // Pre-compute the lower threshold factor for every gain step.
             // Adapted from AbracaDABra's agcLevelMinFactorList.
@@ -319,16 +375,33 @@ impl RtlsdrHandler {
             // Prevents a single noisy measurement from triggering a gain step.
             let mut agc_up_confirm: u32 = 0; // ticks where level < level_min
             let mut agc_down_confirm: u32 = 0; // ticks where level > SAGC_LEVEL_MAX
-                                               // Hunting suppressor: tracks consecutive direction reversals and
-                                               // freezes the control loop when the gain bounces between two adjacent
-                                               // steps with no stable operating point.  Uses exponential backoff so
-                                               // that repeated episodes on the same pair converge to a stable lock
-                                               // on the lower (safer) gain step.
+                                               // Count of raw I/Q scalar values that exceeded SAGC_CLIP_THRESHOLD since
+                                               // the last SAGC evaluation tick. Reset after each evaluation.
+            let mut clip_count: u32 = 0;
+            // Hunting suppressor: tracks consecutive direction reversals and
+            // freezes the control loop when the gain bounces between two adjacent
+            // steps with no stable operating point.  Uses exponential backoff so
+            // that repeated episodes on the same pair converge to a stable lock
+            // on the lower (safer) gain step.
             let mut last_gain_dir: i32 = 0; // +1 = last change was up, -1 = down
             let mut hunt_count: u32 = 0;
             let mut hunt_freeze: u32 = 0;
             // Backoff multiplier: doubles with each hunting episode (capped at max).
             let mut hunt_freeze_ticks: u32 = SAGC_HUNT_FREEZE_BASE;
+            // Grace period: hunting detection is suppressed for the first
+            // SAGC_HUNT_GRACE_TICKS evaluation ticks after startup so that the
+            // rapid gain steps during initial OFDM sync acquisition do not
+            // immediately trigger the hunting suppressor and lock the gain.
+            let mut hunt_grace_cntr: u32 = SAGC_HUNT_GRACE_TICKS;
+            // Silence detector: consecutive evaluation ticks where agc_level is
+            // below SAGC_SILENCE_FLOOR. When it reaches SAGC_SILENCE_TICKS, the
+            // level estimator is reset so gain can recover without waiting for the
+            // slow IIR release.
+            let mut sagc_silence_cntr: u32 = 0;
+            // Stability counter: consecutive "stable zone" evaluation ticks.
+            // When it reaches SAGC_HUNT_RESET_TICKS, the hunt-freeze backoff
+            // multiplier is reset to SAGC_HUNT_FREEZE_BASE.
+            let mut hunt_stable_cntr: u32 = 0;
 
             // ── DOC state ─────────────────────────────────────────────────────
             // DC Offset Correction: independent IIR estimators for I and Q.
@@ -399,7 +472,15 @@ impl RtlsdrHandler {
                             let i_raw = raw[2 * k] as f32 - 128.0;
                             let q_raw = raw[2 * k + 1] as f32 - 128.0;
 
-                            // SAGC — absolute amplitude, operates before DOC
+                            // DOC accumulation (±128 scale)
+                            sum_i += i_raw;
+                            sum_q += q_raw;
+
+                            // SAGC — absolute amplitude on the raw (pre-DOC) scale.
+                            // SAGC goal is to keep the ADC within its linear range; ADC
+                            // saturation occurs on the raw signal, so raw abs is correct.
+                            // DC offset (≈ 2–5 on the ±128 scale) is negligible for this
+                            // purpose; measuring raw abs gives accurate ADC utilisation.
                             if sagc_enabled {
                                 for &abs_val in &[i_raw.abs(), q_raw.abs()] {
                                     let c = if abs_val > agc_level {
@@ -408,12 +489,12 @@ impl RtlsdrHandler {
                                         SAGC_CREL
                                     };
                                     agc_level += c * (abs_val - agc_level);
+                                    // Track ADC near-clipping for the clip-rate detector.
+                                    if abs_val >= SAGC_CLIP_THRESHOLD {
+                                        clip_count += 1;
+                                    }
                                 }
                             }
-
-                            // DOC accumulation (±128 scale)
-                            sum_i += i_raw;
-                            sum_q += q_raw;
 
                             // Store DC-corrected, normalised sample pair in local scratch
                             sample_buf[2 * k] = (i_raw - dc_i) / 128.0;
@@ -437,19 +518,83 @@ impl RtlsdrHandler {
                         // ── SAGC gain evaluation ──────────────────────────────
                         agc_read_cntr = agc_read_cntr.wrapping_add(1);
                         if sagc_enabled && agc_read_cntr.is_multiple_of(SAGC_CHECK_INTERVAL) {
-                            if hunt_freeze > 0 {
+                            // Count down the startup grace period.
+                            hunt_grace_cntr = hunt_grace_cntr.saturating_sub(1);
+
+                            // ── Clipping-path ────────────────────────────────────
+                            // A DAB OFDM signal has a peak-to-average ratio of ~10 dB.
+                            // The slow IIR mean estimator (SAGC_CREL) can converge below
+                            // SAGC_LEVEL_MAX while instantaneous peaks still clip the ADC,
+                            // causing OFDM demodulation failures. When more than
+                            // SAGC_CLIP_RATE_MAX of raw samples are near-saturating the ADC,
+                            // force an immediate gain step down bypassing hold / confirm.
+                            let total_samples = SAGC_CHECK_INTERVAL * n_pairs as u32 * 2;
+                            let clip_rate = clip_count as f32 / total_samples as f32;
+                            clip_count = 0;
+                            // Silence counter: maintained before every decision.
+                            // Resets automatically when the signal is above the floor.
+                            if agc_level >= SAGC_SILENCE_FLOOR {
+                                sagc_silence_cntr = 0;
+                            } else {
+                                sagc_silence_cntr = sagc_silence_cntr.saturating_add(1);
+                            }
+                            if clip_rate > SAGC_CLIP_RATE_MAX
+                                && gain_idx > 0
+                                && hunt_freeze == 0
+                                && agc_hold_cntr == 0
+                            {
+                                gain_idx -= 1;
+                                agc_level_min = level_min_factors[gain_idx] * SAGC_LEVEL_MAX;
+                                agc_hold_cntr = SAGC_HOLD_BUFFERS;
+                                agc_up_confirm = 0;
+                                agc_down_confirm = 0;
+                                if last_gain_dir == 1 && hunt_grace_cntr == 0 {
+                                    hunt_count += 1;
+                                } else {
+                                    hunt_count = 0;
+                                }
+                                last_gain_dir = -1;
+                                if let Err(e) =
+                                    sdr.set_tuner_gain(TunerGain::Manual(gains[gain_idx]))
+                                {
+                                    warn!("SAGC: set_tuner_gain failed: {}", e);
+                                } else {
+                                    debug!(
+                                        "SAGC: clip ↓ {:.1} dB (clip {:.1}%)",
+                                        gains[gain_idx] as f32 / 10.0,
+                                        clip_rate * 100.0,
+                                    );
+                                }
+                            } else if sagc_silence_cntr >= SAGC_SILENCE_TICKS {
+                                // True signal absence: the slow IIR release (SAGC_CREL)
+                                // would otherwise keep agc_level high for > 30 s, blocking
+                                // gain recovery. Reset the estimator and hunt history so the
+                                // SAGC can find the right gain step when the signal returns.
+                                agc_level = 0.0;
+                                hunt_freeze = 0;
+                                hunt_freeze_ticks = SAGC_HUNT_FREEZE_BASE;
+                                hunt_count = 0;
+                                last_gain_dir = 0;
+                                agc_up_confirm = 0;
+                                agc_down_confirm = 0;
+                                hunt_stable_cntr = 0;
+                                debug!("SAGC: silence detected → estimator and hunt state reset");
+                            } else if hunt_freeze > 0 {
                                 // Hunting suppressor active: hold current gain, reset
                                 // confirmation counters so we start fresh after the freeze.
                                 hunt_freeze -= 1;
+                                hunt_stable_cntr = 0;
                                 agc_up_confirm = 0;
                                 agc_down_confirm = 0;
                             } else if agc_hold_cntr > 0 {
                                 // Still in hold-off period after the last gain change.
                                 agc_hold_cntr -= 1;
+                                hunt_stable_cntr = 0;
                                 agc_up_confirm = 0;
                                 agc_down_confirm = 0;
                             } else if agc_level < agc_level_min && gain_idx + 1 < gains.len() {
                                 // Level below threshold: accumulate confirmation ticks.
+                                hunt_stable_cntr = 0;
                                 agc_down_confirm = 0;
                                 agc_up_confirm += 1;
                                 if agc_up_confirm >= SAGC_CONFIRM_COUNT {
@@ -459,7 +604,7 @@ impl RtlsdrHandler {
                                     agc_level_min = level_min_factors[gain_idx] * SAGC_LEVEL_MAX;
                                     agc_hold_cntr = SAGC_HOLD_BUFFERS;
                                     // Hunting detection: consecutive direction reversals.
-                                    if last_gain_dir == -1 {
+                                    if last_gain_dir == -1 && hunt_grace_cntr == 0 {
                                         hunt_count += 1;
                                         if hunt_count >= SAGC_HUNT_THRESHOLD {
                                             // Stay on the lower (safer) gain step and freeze.
@@ -521,6 +666,7 @@ impl RtlsdrHandler {
                                 }
                             } else if agc_level > SAGC_LEVEL_MAX && gain_idx > 0 {
                                 // Level above threshold: accumulate confirmation ticks.
+                                hunt_stable_cntr = 0;
                                 agc_up_confirm = 0;
                                 agc_down_confirm += 1;
                                 if agc_down_confirm >= SAGC_CONFIRM_COUNT {
@@ -530,7 +676,7 @@ impl RtlsdrHandler {
                                     agc_level_min = level_min_factors[gain_idx] * SAGC_LEVEL_MAX;
                                     agc_hold_cntr = SAGC_HOLD_BUFFERS;
                                     // Hunting detection: consecutive direction reversals.
-                                    if last_gain_dir == 1 {
+                                    if last_gain_dir == 1 && hunt_grace_cntr == 0 {
                                         hunt_count += 1;
                                         if hunt_count >= SAGC_HUNT_THRESHOLD {
                                             // Already on the lower step; freeze here.
@@ -592,7 +738,24 @@ impl RtlsdrHandler {
                                 // Signal in the stable zone — reset confirmation counters.
                                 agc_up_confirm = 0;
                                 agc_down_confirm = 0;
+                                // Count consecutive stable ticks toward hunt-backoff reset.
+                                // After SAGC_HUNT_RESET_TICKS ticks the backoff multiplier
+                                // returns to its base value, restoring SAGC responsiveness
+                                // after a sustained period of well-behaved operation.
+                                hunt_stable_cntr += 1;
+                                if hunt_stable_cntr >= SAGC_HUNT_RESET_TICKS
+                                    && hunt_freeze_ticks > SAGC_HUNT_FREEZE_BASE
+                                {
+                                    hunt_stable_cntr = 0;
+                                    hunt_freeze_ticks = SAGC_HUNT_FREEZE_BASE;
+                                    debug!("SAGC: sustained stability → hunt backoff reset");
+                                }
                             }
+                        }
+                        // Publish the current gain index after every SAGC evaluation so
+                        // the status thread always has an up-to-date value.
+                        if sagc_enabled {
+                            current_gain_tenths.store(gains[gain_idx], Ordering::Relaxed);
                         }
                     }
                     Err(e) => {
@@ -629,6 +792,19 @@ impl RtlsdrHandler {
     /// will exit as soon as the current `read_sync` call returns — typically < 1 s.
     pub fn reader_running(&self) -> Arc<AtomicBool> {
         self.running.clone()
+    }
+
+    /// Returns the current tuner gain in tenths of dB as reported by the SAGC
+    /// worker thread.  Returns -1 when hardware AGC is active (gain unknown).
+    pub fn current_gain_tenths_db(&self) -> i32 {
+        self.current_gain_tenths.load(Ordering::Relaxed)
+    }
+
+    /// Returns a clone of the shared gain atomic so callers that outlive this
+    /// handler (e.g. a status thread spawned before the OFDM move) can still
+    /// read the current gain.
+    pub fn gain_tenths_arc(&self) -> Arc<AtomicI32> {
+        self.current_gain_tenths.clone()
     }
 
     pub fn stop_reader(&mut self) {
@@ -958,5 +1134,77 @@ mod tests {
         }
         assert_eq!(gain_idx, 3, "gain must step up again after hold-off expiry");
         assert_eq!(agc_hold_cntr, SAGC_HOLD_BUFFERS);
+    }
+
+    // ── SAGC: silence detector ────────────────────────────────────────────────
+
+    #[test]
+    fn sagc_silence_detector_resets_level_and_hunt_state() {
+        // After SAGC_SILENCE_TICKS consecutive ticks with agc_level < SAGC_SILENCE_FLOOR,
+        // the level estimator must be reset to 0 and all hunt state cleared so the SAGC
+        // can find the right gain step when the signal returns.
+        // Start artificially high (due to slow IIR release); immediately overwritten
+        // to simulate signal loss before the first silence-detector tick.
+        let mut agc_level = SAGC_SILENCE_FLOOR - 0.1;
+        let mut hunt_freeze = 200u32;
+        let mut hunt_freeze_ticks = SAGC_HUNT_FREEZE_BASE * 4;
+        let mut hunt_count = 2u32;
+        let mut last_gain_dir = -1i32;
+        let mut sagc_silence_cntr = 0u32;
+
+        for _ in 0..SAGC_SILENCE_TICKS {
+            if agc_level >= SAGC_SILENCE_FLOOR {
+                sagc_silence_cntr = 0;
+            } else {
+                sagc_silence_cntr = sagc_silence_cntr.saturating_add(1);
+            }
+            if sagc_silence_cntr >= SAGC_SILENCE_TICKS {
+                agc_level = 0.0;
+                hunt_freeze = 0;
+                hunt_freeze_ticks = SAGC_HUNT_FREEZE_BASE;
+                hunt_count = 0;
+                last_gain_dir = 0;
+                sagc_silence_cntr = 0;
+            }
+        }
+
+        assert_eq!(agc_level, 0.0, "agc_level must be reset to 0 on silence");
+        assert_eq!(hunt_freeze, 0, "hunt_freeze must be cleared on silence");
+        assert_eq!(
+            hunt_freeze_ticks, SAGC_HUNT_FREEZE_BASE,
+            "hunt backoff must be reset to base on silence"
+        );
+        assert_eq!(hunt_count, 0, "hunt_count must be cleared on silence");
+        assert_eq!(last_gain_dir, 0, "last_gain_dir must be cleared on silence");
+    }
+
+    // ── SAGC: hunt backoff reset after stability ──────────────────────────────
+
+    #[test]
+    fn sagc_hunt_backoff_resets_after_stable_zone() {
+        // After SAGC_HUNT_RESET_TICKS consecutive stable-zone ticks, the
+        // hunt_freeze_ticks backoff multiplier must be reset to SAGC_HUNT_FREEZE_BASE,
+        // restoring full SAGC responsiveness after sustained stable operation.
+        let mut hunt_freeze_ticks: u32 = SAGC_HUNT_FREEZE_BASE * 8; // elevated by past hunting
+        let mut hunt_stable_cntr: u32 = 0;
+
+        for _ in 0..SAGC_HUNT_RESET_TICKS {
+            hunt_stable_cntr += 1;
+            if hunt_stable_cntr >= SAGC_HUNT_RESET_TICKS
+                && hunt_freeze_ticks > SAGC_HUNT_FREEZE_BASE
+            {
+                hunt_stable_cntr = 0;
+                hunt_freeze_ticks = SAGC_HUNT_FREEZE_BASE;
+            }
+        }
+
+        assert_eq!(
+            hunt_freeze_ticks, SAGC_HUNT_FREEZE_BASE,
+            "hunt backoff must be reset to base after sustained stability"
+        );
+        assert_eq!(
+            hunt_stable_cntr, 0,
+            "stability counter must reset after firing"
+        );
     }
 }

@@ -1,5 +1,4 @@
 pub mod band_handler;
-pub mod cif_interleaver;
 pub mod dab_constants;
 pub mod dab_frame;
 pub mod dab_params;

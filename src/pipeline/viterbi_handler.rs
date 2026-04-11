@@ -1,13 +1,19 @@
-// Viterbi decoder - converted from viterbi-spiral.cpp (eti-cmdline)
+// Viterbi decoder — converted from viterbi-spiral.cpp (eti-cmdline)
 //
-// This implements the "spiral" Viterbi decoder used for both FIC and MSC.
-// Polynomials: {0155, 0117, 0123, 0155} (octal, same as C++)
+// Rate 1/4, constraint length K=7 convolutional decoder used for both FIC and MSC.
+// Polynomials: {0155, 0117, 0123, 0155} (octal).
+// ETSI EN 300 401 §11.1 — convolutional coding (FIC); §13.2 (MSC EEP/UEP).
 
 const K: usize = 7;
 const RATE: usize = 4;
 const NUM_STATES: usize = 1 << (K - 1); // 64
 const POLYS: [i32; RATE] = [0o155, 0o117, 0o123, 0o155];
 const RENORMALIZE_THRESHOLD: u32 = 137;
+/// Bias applied when mapping signed soft bits (−127..127) to unsigned symbols (0..254).
+const SOFT_DECISION_BIAS: i32 = 127;
+/// Chainback shift constants derived from K=7 and 8-bit byte width.
+const ADD_SHIFT: usize = 8_usize.saturating_sub(K - 1); // 2
+const SUB_SHIFT: usize = (K - 1).saturating_sub(8); // 0
 
 static PARTAB: [u8; 256] = [
     0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 1, 0, 0, 1, 1, 0, 1, 0, 0, 1,
@@ -41,9 +47,10 @@ pub struct ViterbiSpiral {
 impl ViterbiSpiral {
     pub fn new(word_length: usize) -> Self {
         let mut branchtab = vec![0u8; RATE * NUM_STATES / 2];
+        // Layout: [state * RATE + rate_idx] — sequential per-state access for better cache usage.
         for state in 0..NUM_STATES / 2 {
             for i in 0..RATE {
-                branchtab[i * NUM_STATES / 2 + state] = if (POLYS[i] < 0) as u8
+                branchtab[state * RATE + i] = if (POLYS[i] < 0) as u8
                     ^ parity((2 * state as i32) & POLYS[i].abs()) as u8
                     != 0
                 {
@@ -64,23 +71,26 @@ impl ViterbiSpiral {
             data: vec![0u8; (word_length + K - 1) / 8 + 1],
             metrics1: vec![0u32; NUM_STATES],
             metrics2: vec![0u32; NUM_STATES],
-            decisions: vec![0u32; decision_words * 2],
+            decisions: vec![0u32; decision_words],
         }
     }
 
     fn init_viterbi(&mut self) {
-        for i in 0..NUM_STATES {
-            self.metrics1[i] = 63;
-        }
+        self.metrics1.fill(63);
         self.metrics1[0] = 0;
-        for d in self.decisions.iter_mut() {
-            *d = 0;
-        }
+        // Also reset metrics2: on the first trellis step it is the write buffer,
+        // but all 64 entries are overwritten before being read, so this is defensive.
+        self.metrics2.fill(0);
+        self.decisions.fill(0);
     }
 
     fn renormalize(metrics: &mut [u32]) {
-        if metrics[0] > RENORMALIZE_THRESHOLD {
-            let min = *metrics.iter().min().unwrap();
+        // ETSI EN 300 401 §11.1: prevent metric overflow by subtracting the minimum
+        // survivor metric when it exceeds the normalisation threshold.
+        // Using the true minimum (not metrics[0]) avoids false negatives when state 0
+        // is not on the best path.
+        let min = *metrics.iter().min().unwrap(); // slice is always NUM_STATES long
+        if min > RENORMALIZE_THRESHOLD {
             for m in metrics.iter_mut() {
                 *m -= min;
             }
@@ -91,10 +101,9 @@ impl ViterbiSpiral {
         let nbits = self.frame_bits + K - 1;
         let words_per_decision = NUM_STATES.div_ceil(32);
 
-        // Clear decisions
-        for d in self.decisions[..nbits * words_per_decision].iter_mut() {
-            *d = 0;
-        }
+        // Decision bits are already zeroed by init_viterbi; re-zero here to make
+        // update_viterbi safe even if called without a preceding init_viterbi.
+        self.decisions.fill(0);
 
         let max = RATE as u32 * 255;
         let mut use_metrics1_as_old = true;
@@ -121,10 +130,10 @@ impl ViterbiSpiral {
             // Batch butterfly: process all NUM_STATES/2 states
             // Written as a tight loop for auto-vectorization
             for i in 0..NUM_STATES / 2 {
-                // Compute branch metric
+                // Compute branch metric — sequential access: branchtab[i*RATE .. i*RATE+RATE]
                 let mut metric: u32 = 0;
                 for j in 0..RATE {
-                    metric += (branchtab[j * NUM_STATES / 2 + i] ^ symbols[sym_base + j]) as u32;
+                    metric += (branchtab[i * RATE + j] ^ symbols[sym_base + j]) as u32;
                 }
 
                 let m0 = old[i].wrapping_add(metric);
@@ -160,24 +169,19 @@ impl ViterbiSpiral {
     fn chainback(&mut self) {
         let nbits = self.frame_bits;
         let words_per_decision = NUM_STATES.div_ceil(32);
-        let add_shift = 8_usize.saturating_sub(K - 1);
-        let sub_shift = (K - 1).saturating_sub(8);
 
+        self.data.fill(0);
+
+        // The tail bits force the encoder to end in state 0, so we start traceback
+        // at endstate = 0 and skip the K-1 tail trellis steps.
         let mut endstate: u32 = 0;
-        endstate = (endstate % NUM_STATES as u32) << add_shift;
-
-        for i in 0..self.data.len() {
-            self.data[i] = 0;
-        }
-
-        // Look past tail
         let d_offset = K - 1;
         let mut nbits_remaining = nbits as i32;
         while nbits_remaining > 0 {
             nbits_remaining -= 1;
             let s = d_offset + nbits_remaining as usize;
             let dec_offset = s * words_per_decision;
-            let bit_idx = (endstate >> add_shift) as usize;
+            let bit_idx = (endstate >> ADD_SHIFT) as usize;
             let word_idx = bit_idx / 32;
             let bit_pos = bit_idx % 32;
             let k = if dec_offset + word_idx < self.decisions.len() {
@@ -185,8 +189,8 @@ impl ViterbiSpiral {
             } else {
                 0
             };
-            endstate = (endstate >> 1) | (k << (K as u32 - 2 + add_shift as u32));
-            self.data[nbits_remaining as usize >> 3] = (endstate >> sub_shift) as u8;
+            endstate = (endstate >> 1) | (k << (K as u32 - 2 + ADD_SHIFT as u32));
+            self.data[nbits_remaining as usize >> 3] = (endstate >> SUB_SHIFT) as u8;
         }
     }
 
@@ -196,7 +200,7 @@ impl ViterbiSpiral {
         self.init_viterbi();
         let total = (self.frame_bits + K - 1) * RATE;
         for (i, &inp) in input.iter().enumerate().take(total.min(input.len())) {
-            let temp = (inp as i32 + 127).clamp(0, 255);
+            let temp = (inp as i32 + SOFT_DECISION_BIAS).clamp(0, 255);
             self.symbols[i] = temp as u8;
         }
 
@@ -258,5 +262,76 @@ mod tests {
         let mut output = vec![0u8; 32];
         v.deconvolve(&input, &mut output);
         assert!(output.iter().all(|&b| b == 0 || b == 1));
+    }
+
+    #[test]
+    fn round_trip_all_zeros() {
+        // All-zero input: encoder state stays at 0, all parity bits = 0 (soft = -127).
+        // ETSI EN 300 401 §11.1
+        let nbits = 32usize;
+        let original = vec![0u8; nbits];
+        let soft = test_encode(&original);
+        assert!(
+            soft.iter().all(|&s| s == -127),
+            "all-zero encoder must produce all -127"
+        );
+
+        let mut v = ViterbiSpiral::new(nbits);
+        let mut decoded = vec![0u8; nbits];
+        v.deconvolve(&soft, &mut decoded);
+        assert_eq!(decoded, original, "decoded bits must match original");
+    }
+
+    #[test]
+    fn round_trip_single_one() {
+        // A single 1-bit at position 0, rest zeros.  The path metric for the correct
+        // sequence is strictly lower than all competing paths, so the decoder is
+        // unambiguous.  ETSI EN 300 401 §11.1.
+        let nbits = 32usize;
+        let mut original = vec![0u8; nbits];
+        original[0] = 1;
+        let soft = test_encode(&original);
+
+        let mut v = ViterbiSpiral::new(nbits);
+        let mut decoded = vec![0u8; nbits];
+        v.deconvolve(&soft, &mut decoded);
+
+        assert_eq!(decoded, original, "decoded bits must match original");
+    }
+
+    #[test]
+    fn decode_is_stable_across_repeated_calls() {
+        // Verify that re-using a ViterbiSpiral instance across multiple calls
+        // produces consistent results (metrics2 reset bug guard).
+        let nbits = 32usize;
+        let original = vec![0u8; nbits];
+        let soft = test_encode(&original);
+
+        let mut v = ViterbiSpiral::new(nbits);
+        let mut decoded = vec![0u8; nbits];
+        for _ in 0..3 {
+            v.deconvolve(&soft, &mut decoded);
+            assert_eq!(decoded, original, "result must be stable on repeated calls");
+        }
+    }
+
+    /// Test-only rate-1/4 K=7 convolutional encoder.
+    ///
+    /// State convention: `new_state = (old_state << 1 | input_bit) & (NUM_STATES − 1)`.
+    /// This is consistent with the butterfly formula `(2 * state + input) & (NUM_STATES − 1)`
+    /// used to build `branchtab`.
+    fn test_encode(bits: &[u8]) -> Vec<i16> {
+        let total = bits.len() + K - 1; // data bits + K-1 zero tail bits to flush the register
+        let mut out = Vec::with_capacity(total * RATE);
+        let mut state: usize = 0;
+
+        for &bit in bits.iter().chain(std::iter::repeat(&0u8).take(K - 1)) {
+            state = ((state << 1) | bit as usize) & (NUM_STATES - 1);
+            for &poly in POLYS.iter() {
+                let p = parity(state as i32 & poly);
+                out.push(if p == 0 { -127i16 } else { 127i16 });
+            }
+        }
+        out
     }
 }

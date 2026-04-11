@@ -13,42 +13,17 @@ fn is_valid_label(label: &str) -> bool {
     !label.is_empty() && label.chars().all(|c| !c.is_control())
 }
 
-/// Convert EBU Latin charset byte to UTF-8 char (EN 300 401, Table 1)
+/// Convert an EBU Latin byte to its UTF-8 character (ETSI EN 300 401 Table 1).
+///
+/// Covers all code points including the 0x00–0x1F special range, the ASCII
+/// overrides at 0x24/0x5C/0x5E/0x60, and the 0x7B–0xFF high-byte block.
+/// Bytes that map to an empty string (e.g. 0x00) fall back to the raw byte
+/// cast to `char` so callers can decide whether to skip them.
 fn ebu_to_char(ch: u8) -> char {
-    // EBU Latin differs from ISO 8859-1 in the 0x80..0xFF range
-    static EBU_TABLE: [char; 128] = [
-        // 0x80..0x8F
-        '\u{00E1}', '\u{00E0}', '\u{00E9}', '\u{00E8}', '\u{00ED}', '\u{00EC}', '\u{00F3}',
-        '\u{00F2}', '\u{00FA}', '\u{00F9}', '\u{00D1}', '\u{00C7}', '\u{015E}', '\u{00DF}',
-        '\u{00A1}', '\u{0132}', // 0x90..0x9F
-        '\u{00E2}', '\u{00E4}', '\u{00EA}', '\u{00EB}', '\u{00EE}', '\u{00EF}', '\u{00F4}',
-        '\u{00F6}', '\u{00FB}', '\u{00FC}', '\u{00F1}', '\u{00E7}', '\u{015F}', '\u{011F}',
-        '\u{0131}', '\u{0133}', // 0xA0..0xAF
-        '\u{00AA}', '\u{03B1}', '\u{00A9}', '\u{2030}', '\u{011E}', '\u{011B}', '\u{0148}',
-        '\u{0151}', '\u{03C0}', '\u{20AC}', '\u{00A3}', '\u{0024}', '\u{2190}', '\u{2191}',
-        '\u{2192}', '\u{2193}', // 0xB0..0xBF
-        '\u{00BA}', '\u{00B9}', '\u{00B2}', '\u{00B3}', '\u{00B1}', '\u{0130}', '\u{0144}',
-        '\u{0171}', '\u{00B5}', '\u{00BF}', '\u{00F7}', '\u{00B0}', '\u{00BC}', '\u{00BD}',
-        '\u{00BE}', '\u{00A7}', // 0xC0..0xCF
-        '\u{00C1}', '\u{00C0}', '\u{00C9}', '\u{00C8}', '\u{00CD}', '\u{00CC}', '\u{00D3}',
-        '\u{00D2}', '\u{00DA}', '\u{00D9}', '\u{0158}', '\u{010C}', '\u{0160}', '\u{017D}',
-        '\u{00D0}', '\u{013F}', // 0xD0..0xDF
-        '\u{00C2}', '\u{00C4}', '\u{00CA}', '\u{00CB}', '\u{00CE}', '\u{00CF}', '\u{00D4}',
-        '\u{00D6}', '\u{00DB}', '\u{00DC}', '\u{0159}', '\u{010D}', '\u{0161}', '\u{017E}',
-        '\u{0111}', '\u{0140}', // 0xE0..0xEF
-        '\u{00C3}', '\u{00C5}', '\u{00C6}', '\u{0152}', '\u{0177}', '\u{00DD}', '\u{00D5}',
-        '\u{00D8}', '\u{00DE}', '\u{014A}', '\u{0154}', '\u{0106}', '\u{015A}', '\u{0179}',
-        '\u{0166}', '\u{00F0}', // 0xF0..0xFF
-        '\u{00E3}', '\u{00E5}', '\u{00E6}', '\u{0153}', '\u{0175}', '\u{00FD}', '\u{00F5}',
-        '\u{00F8}', '\u{00FE}', '\u{014B}', '\u{0155}', '\u{0107}', '\u{015B}', '\u{017A}',
-        '\u{0167}', '\u{00FF}',
-    ];
-
-    if ch < 0x80 {
-        ch as char
-    } else {
-        EBU_TABLE[(ch - 0x80) as usize]
-    }
+    // Delegate to the canonical EBU Latin LUT shared with the audio layer.
+    // ETSI EN 300 401 §8.1.13
+    let s = crate::audio::ebu_latin::ebu_latin_char_to_utf8_string(ch);
+    s.chars().next().unwrap_or(ch as char)
 }
 
 // UEP protection level table (ETSI EN 300 401 Page 50)
@@ -436,23 +411,40 @@ mod tests {
 
     #[test]
     fn test_ebu_to_char_metropolitain() {
-        // 0x82 = 'é' in EBU Latin (was printed as \u{82} before fix)
+        // 0x82 = 'é' in EBU Latin (ETSI EN 300 401 Table 1)
         assert_eq!(ebu_to_char(0x82), 'é');
     }
 
     #[test]
     fn test_ebu_to_char_accented() {
-        assert_eq!(ebu_to_char(0x80), 'á'); // a accent aigu
-        assert_eq!(ebu_to_char(0x81), 'à'); // a accent grave
-        assert_eq!(ebu_to_char(0x83), 'è'); // e accent grave
-        assert_eq!(ebu_to_char(0x90), 'â'); // a circumflex
-        assert_eq!(ebu_to_char(0x91), 'ä'); // a umlaut
-        assert_eq!(ebu_to_char(0x9B), 'ç'); // c cedilla
+        assert_eq!(ebu_to_char(0x80), 'á');
+        assert_eq!(ebu_to_char(0x81), 'à');
+        assert_eq!(ebu_to_char(0x83), 'è');
+        assert_eq!(ebu_to_char(0x90), 'â');
+        assert_eq!(ebu_to_char(0x91), 'ä');
+        assert_eq!(ebu_to_char(0x9B), 'ç');
     }
 
     #[test]
     fn test_ebu_to_char_euro() {
         assert_eq!(ebu_to_char(0xA9), '€');
+    }
+
+    /// Bytes 0x7B–0x7F must yield EBU Latin chars, not raw ASCII punctuation.
+    /// Without the delegation fix, these would have returned `{|}~DEL`.
+    #[test]
+    fn test_ebu_to_char_7b_7f_range() {
+        assert_eq!(ebu_to_char(0x7B), '«'); // U+00AB
+        assert_eq!(ebu_to_char(0x7D), '»'); // U+00BB
+        assert_eq!(ebu_to_char(0x7F), 'Ħ'); // U+0126
+    }
+
+    /// ASCII-override bytes must return their EBU Latin counterparts, not ASCII.
+    #[test]
+    fn test_ebu_to_char_ascii_overrides() {
+        assert_eq!(ebu_to_char(0x24), 'ł'); // U+0142 — was '$'
+        assert_eq!(ebu_to_char(0x5E), 'Ł'); // U+0141 — was '^'
+        assert_eq!(ebu_to_char(0x60), 'Ą'); // U+0104 — was '`'
     }
 
     // ── process_fib helpers ───────────────────────────────────────────────────
@@ -593,11 +585,17 @@ mod tests {
     /// A FIG 1/1 whose decoded label contains a control character must NOT
     /// invoke `program_name_cb` and must NOT cache the label.
     /// This guards against FIC-CRC false positives during sync loss.
+    ///
+    /// Note: EBU Latin bytes 0x09 and 0x0C now correctly decode to printable
+    /// Unicode characters (Ȋ and Ġ) and are therefore valid label content.
+    /// Byte 0x0B maps to an empty string in the EBU Latin table, and falls
+    /// back to the raw `\x0B` (vertical tab) via `unwrap_or(ch as char)` —
+    /// a true control character that `is_valid_label` rejects.
     #[test]
     fn process_fib_corrupt_label_not_cached() {
         let mut label_bytes = [0u8; 16];
         label_bytes[0] = b'X';
-        label_bytes[1] = 0x0C; // form-feed control char (as seen in live log)
+        label_bytes[1] = 0x0B; // 0x0B decodes to '\x0B' (vertical tab — control char)
         label_bytes[2] = b'Z';
 
         let mut raw = [0u8; 22];
@@ -629,7 +627,7 @@ mod tests {
     fn process_fib_corrupt_label_32bit_sid_not_cached() {
         let mut label_bytes = [0u8; 16];
         label_bytes[0] = b'D';
-        label_bytes[1] = 0x09; // horizontal-tab control char
+        label_bytes[1] = 0x0B; // 0x0B decodes to '\x0B' (vertical tab — control char)
         label_bytes[2] = b'B';
 
         // FIG 1/5 layout (ETSI EN 300 401 §8.1.14.2):
