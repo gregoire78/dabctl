@@ -21,8 +21,11 @@ use smallvec::SmallVec;
 type EnsembleCb = Option<Arc<dyn Fn(&str, u32) + Send + Sync>>;
 /// Callback invoked with programme name and SId when FIC is decoded.
 type ProgramCb = Option<Arc<dyn Fn(&str, i32) + Send + Sync>>;
-/// Callback invoked with FIC quality percentage after each FIC frame.
-type FicQualityCb = Option<Arc<dyn Fn(i16) + Send + Sync>>;
+/// Callback invoked with `(success, total)` FIB CRC counts after each FIC frame.
+///
+/// The caller is responsible for accumulating these values over a reporting
+/// window and computing the quality ratio from the summed counts.
+type FicQualityCb = Option<Arc<dyn Fn(i16, i16) + Send + Sync>>;
 
 const RING_CAPACITY: usize = 512;
 const INLINE_SUBCH: usize = 8;
@@ -336,6 +339,10 @@ impl DabPipeline {
         let mut cif_count_hi: i16 = -1;
         let mut cif_count_lo: i16 = -1;
         let mut temp = vec![0i16; cif_buf_size];
+        // Set when OfdmFrameSync reports SyncLost; cleared after it is transferred
+        // to the next outgoing DabFrame so the audio thread can reset its
+        // superframe accumulator.
+        let mut sync_just_lost = false;
 
         let mut my_fic_handler = FicHandler::new(&params);
         my_fic_handler.fib_processor.ensemble_name_cb = ensemble_cb;
@@ -366,6 +373,7 @@ impl DabPipeline {
                     // latency (15 × 24 ms).
                     warn!(blkno, "OFDM frame sync lost, resyncing");
                     minor = 0;
+                    sync_just_lost = true;
                     ring.pop_commit();
                     continue;
                 }
@@ -407,7 +415,8 @@ impl DabPipeline {
                     cif_count_hi = hi;
                     cif_count_lo = lo;
                     if let Some(ref cb) = fic_quality_cb {
-                        cb(my_fic_handler.get_fic_quality());
+                        let (success, total) = my_fic_handler.get_fic_counts();
+                        cb(success, total);
                     }
                 }
                 ring.pop_commit();
@@ -422,11 +431,16 @@ impl DabPipeline {
             ring.pop_commit();
 
             if cif_index == number_of_blocks_per_cif - 1 {
+                // Time de-interleaving: ETSI EN 300 401 §12.3.
+                // Write the current CIF slot FIRST so that D=0 positions (i % 16 == 0)
+                // read back the just-written current-frame data, not the 16-frame-old
+                // value that occupied the same circular slot before this write.
+                // Matches the reference C++ order in eti-cmdline RunProcessor.cpp.
                 #[allow(clippy::manual_memcpy)]
                 for i in 0..(3072 * 18) {
                     let idx = interleave_map[i & 0x0F];
-                    temp[i] = cif_vector[(index_out + idx) & 0x0F][i];
                     cif_vector[index_out & 0x0F][i] = cif_in[i];
+                    temp[i] = cif_vector[(index_out + idx) & 0x0F][i];
                 }
 
                 if amount < 15 {
@@ -445,6 +459,13 @@ impl DabPipeline {
                 let (adj_hi, adj_lo) = adjust_cif_counter(cif_count_hi, cif_count_lo, minor);
 
                 let mut frame = DabFrame::new(fib_vector[index_out], adj_hi, adj_lo);
+
+                // Propagate OFDM sync-loss to the audio thread so it can reset
+                // SuperframeFilter before accumulating post-resync CIFs.
+                if sync_just_lost {
+                    frame.sync_lost = true;
+                    sync_just_lost = false;
+                }
 
                 // Snapshot `processing` once so the subchannel fill and the
                 // send-mode decision are always consistent for the same frame.
@@ -494,9 +515,9 @@ impl Drop for DabPipeline {
 /// Deconvolve, descramble and pack all active sub-channels from one CIF.
 /// Returns one `SubchannelFrame` per active sub-channel, in sub-channel ID order.
 ///
-/// # Safety
-/// Each parallel job accesses a unique index in `prot_table` and `descrambler`
-/// via raw pointers; all accesses are disjoint.
+/// For a single active sub-channel (the common dabctl use-case), processing is
+/// sequential to avoid Rayon thread-pool overhead.  For multiple sub-channels,
+/// jobs are executed in parallel via `rayon::par_iter`.
 fn process_cif_to_frames(
     input: &[i16],
     fic_handler: &FicHandler,
@@ -563,7 +584,39 @@ fn process_cif_to_frames(
         return SmallVec::new();
     }
 
+    // Fast path: single sub-channel (the typical case for dabctl).
+    // Skip Rayon thread-pool dispatch — for one task the per-job overhead of
+    // rayon (~50–200 µs of work-stealing coordination) adds more latency than
+    // it saves.  Sequential processing also avoids the raw-pointer aliasing
+    // dance required by the parallel path below.
+    if jobs.len() == 1 {
+        let mut result: SmallVec<[SubchannelFrame; INLINE_SUBCH]> = SmallVec::new();
+        for job in &jobs {
+            let mut bit_buf = vec![0u8; job.out_size];
+            if let Some(ref mut p) = prot_table[job.idx] {
+                p.deconvolve(&input[job.start..job.start + job.size], &mut bit_buf);
+            }
+            if let Some(ref d) = descrambler[job.idx] {
+                for j in 0..job.out_size {
+                    bit_buf[j] ^= d[j];
+                }
+            }
+            let mut packed = vec![0u8; job.byte_size];
+            pack_bits(&bit_buf[..job.out_size], &mut packed);
+            result.push(SubchannelFrame {
+                subchid: job.subchid,
+                data: Arc::from(packed.as_slice()),
+            });
+        }
+        return result;
+    }
+
     // Phase 3: parallel deconvolve + descramble + pack → own Arc<[u8]>
+    // Used when multiple sub-channels are active (full multiplex scenario).
+    //
+    // # Safety
+    // Each parallel job accesses a unique index in `prot_table` and `descrambler`
+    // via raw pointers; all accesses are disjoint.
     let input_ref: &[i16] = input;
     let prot_addr = prot_table.as_mut_ptr() as usize;
     let desc_addr = descrambler.as_ptr() as usize;
@@ -614,10 +667,10 @@ fn process_cif_to_frames(
 fn adjust_cif_counter(cif_count_hi: i16, cif_count_lo: i16, minor: u32) -> (u8, u8) {
     let mut lo = cif_count_lo as i32 + minor as i32;
     let mut hi = cif_count_hi as i32;
-    if lo >= 250 {
-        lo %= 250;
-        hi += 1;
-    }
+    // Propagate all carries: minor can exceed 250 in pathological cases where
+    // many MSC CIFs are processed before the next FIC frame.
+    hi += lo / 250;
+    lo %= 250;
     hi %= 20;
     (hi as u8, lo as u8)
 }
@@ -767,8 +820,10 @@ mod tests {
 
     #[test]
     fn cif_counter_lo_overflow_large_minor() {
-        // lo = 0 + 500 = 500 → 500 % 250 = 0, hi += 1.
-        assert_eq!(adjust_cif_counter(3, 0, 500), (4, 0));
+        // lo = 0 + 500 = 500 → two full carries of 250: hi += 2.
+        assert_eq!(adjust_cif_counter(3, 0, 500), (5, 0));
+        // lo = 0 + 501 → carries once (250) with remainder 251 → carries again.
+        assert_eq!(adjust_cif_counter(3, 0, 501), (5, 1));
     }
 
     #[test]
@@ -916,5 +971,169 @@ mod tests {
         // After wrapping, expected_block is 2 again.
         assert_eq!(s.advance(2), SyncAction::Process);
         assert_eq!(s.advance(3), SyncAction::Process);
+    }
+
+    // ── Time de-interleaving (ETSI EN 300 401 §12.3) ────────────────────────
+    //
+    // The interleave_map table assigns a delay D to each of the 16 byte lanes.
+    // The write-before-read order is critical: for D=0 (lane 0, every i % 16 == 0)
+    // the output must contain the CURRENT frame's sample, not the value that
+    // occupied the same circular slot 16 frames earlier.
+
+    /// The delay for lane 0 must be 0 — ETSI EN 300 401 §12.3, Table 22.
+    #[test]
+    fn interleave_map_delay_zero_at_lane_zero() {
+        let interleave_map: [usize; 16] = [0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15];
+        assert_eq!(
+            interleave_map[0], 0,
+            "lane 0 must have delay 0 (ETSI EN 300 401 §12.3)"
+        );
+    }
+
+    /// The delay table must be a permutation of 0..=15 — ETSI EN 300 401 §12.3.
+    #[test]
+    fn interleave_map_is_permutation_of_0_to_15() {
+        let interleave_map: [usize; 16] = [0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15];
+        let mut sorted = interleave_map;
+        sorted.sort();
+        assert_eq!(
+            sorted.to_vec(),
+            (0..16).collect::<Vec<usize>>(),
+            "interleave_map must be a permutation of 0..=15"
+        );
+    }
+
+    /// D=0 positions (i % 16 == 0): output must equal the current frame's value.
+    /// This verifies the write-before-read order is correct.
+    #[test]
+    fn time_deinterleave_d0_returns_current_frame_data() {
+        // ETSI EN 300 401 §12.3: delay D=0 → output sample = current input sample.
+        let interleave_map: [usize; 16] = [0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15];
+        let n = 32usize; // two full 16-lane rows
+        let mut cif_vector = vec![vec![0i16; n]; 16];
+        let mut temp = vec![0i16; n];
+        let index_out = 0usize;
+
+        // Pre-fill slot 0 with a sentinel to prove it is overwritten before the read.
+        cif_vector[0].fill(-1);
+
+        let cif_in: Vec<i16> = (100..100 + n as i16).collect();
+
+        // Correct order: write THEN read (fixes the bug).
+        for i in 0..n {
+            let idx = interleave_map[i & 0x0F];
+            cif_vector[index_out & 0x0F][i] = cif_in[i]; // write first
+            temp[i] = cif_vector[(index_out + idx) & 0x0F][i]; // read second
+        }
+
+        // All D=0 positions must contain the current-frame value.
+        for i in (0..n).step_by(16) {
+            assert_eq!(
+                temp[i], cif_in[i],
+                "D=0 at position {i}: expected {} (current frame), got {}",
+                cif_in[i], temp[i]
+            );
+        }
+    }
+
+    /// Regression: the old read-before-write order returned stale data for D=0.
+    #[test]
+    fn time_deinterleave_buggy_read_before_write_returns_stale_data() {
+        let interleave_map: [usize; 16] = [0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15];
+        let n = 16usize;
+        let mut cif_vector = vec![vec![0i16; n]; 16];
+        let mut temp_buggy = vec![0i16; n];
+        let index_out = 0usize;
+
+        // Pre-fill slot 0 with a sentinel (simulates stale data from 16 frames ago).
+        cif_vector[0].fill(-1);
+
+        let cif_in: Vec<i16> = (100..100 + n as i16).collect();
+
+        // Buggy (old) order: read BEFORE write.
+        for i in 0..n {
+            let idx = interleave_map[i & 0x0F];
+            temp_buggy[i] = cif_vector[(index_out + idx) & 0x0F][i]; // reads stale -1
+            cif_vector[index_out & 0x0F][i] = cif_in[i];
+        }
+
+        // Old code at D=0 (i=0): reads the stale sentinel, not the current frame.
+        assert_ne!(
+            temp_buggy[0], cif_in[0],
+            "buggy order must NOT return current-frame value at D=0"
+        );
+        assert_eq!(
+            temp_buggy[0], -1,
+            "buggy order must return the stale sentinel at D=0"
+        );
+    }
+
+    /// Non-zero delays must read from historical frames, not the current one.
+    /// Verifies that the circular history buffer is used correctly.
+    #[test]
+    fn time_deinterleave_non_zero_delay_reads_history() {
+        // For lane 1: delay D=8 (interleave_map[1] = 8).
+        // After 9 frames the D=8 output at lane 1 must equal the value written
+        // to that position 8 frames ago.
+        let interleave_map: [usize; 16] = [0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15];
+        let n = 16usize;
+        let mut cif_vector = vec![vec![0i16; n]; 16];
+        let mut temp = vec![0i16; n];
+
+        // Feed 9 frames; each frame writes a distinctive value (frame_no × 10).
+        for frame in 0usize..9 {
+            let index_out = frame & 0x0F;
+            let frame_value = frame as i16 * 10;
+            let cif_in = vec![frame_value; n];
+
+            for i in 0..n {
+                let idx = interleave_map[i & 0x0F];
+                cif_vector[index_out][i] = cif_in[i];
+                temp[i] = cif_vector[(index_out + idx) & 0x0F][i];
+            }
+        }
+
+        // At frame 8 (index_out=8): i=1, idx=8 → cif_vector[(8+8)&0xF][1] = cif_vector[0][1].
+        // Frame 0 wrote value 0, so temp[1] must be 0.
+        assert_eq!(
+            temp[1], 0,
+            "D=8 after 9 frames: expected frame-0 value (0), got {}",
+            temp[1]
+        );
+    }
+
+    /// The maximum delay in the table is 15: the last position that becomes
+    /// valid is filled after 16 frames of history.
+    #[test]
+    fn time_deinterleave_max_delay_15_reads_oldest_frame() {
+        // Lane 15: delay D=15 (interleave_map[15] = 15).
+        // interleave_map: [0,8,4,12,2,10,6,14,1,9,5,13,3,11,7,15]
+        //                   0 1 2  3 4  5 6  7 8 9 ....            15
+        let interleave_map: [usize; 16] = [0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15];
+        assert_eq!(interleave_map[15], 15, "sanity: lane 15 must have delay 15");
+
+        let n = 16usize;
+        let mut cif_vector = vec![vec![0i16; n]; 16];
+        let mut temp = vec![0i16; n];
+
+        // Feed 16 frames.
+        for frame in 0usize..16 {
+            let index_out = frame & 0x0F;
+            let frame_value = frame as i16 * 10;
+            let cif_in = vec![frame_value; n];
+            for i in 0..n {
+                let idx = interleave_map[i & 0x0F];
+                cif_vector[index_out][i] = cif_in[i];
+                temp[i] = cif_vector[(index_out + idx) & 0x0F][i];
+            }
+        }
+
+        // At frame 15 (index_out=15): i=15, idx=15 → cif_vector[(15+15)&0xF][15]
+        // = cif_vector[14][15]. Frame 14 wrote value 140.
+        assert_eq!(
+            temp[15], 140,
+            "D=15 after 16 frames: expected 140 (frame 14 value), got {}",
+            temp[15]
+        );
     }
 }

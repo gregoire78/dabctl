@@ -60,17 +60,26 @@ pub fn spawn_pcm_writer(out: impl Write + Send + 'static) -> PcmWriter {
     let (tx, rx) = mpsc::sync_channel::<Vec<i16>>(PCM_QUEUE_CAPACITY);
     std::thread::spawn(move || {
         let mut out = out;
+        // Pre-allocated byte scratch buffer: reused across all frames to avoid
+        // one Vec<u8> allocation per decoded AU (~25/s on the hot PCM path).
+        // Initial capacity covers one HE-AAC v2 frame at 48 kHz stereo
+        // (1920 samples × 2 ch × 2 bytes = 7680 bytes).
+        let mut byte_buf: Vec<u8> = Vec::with_capacity(8 * 1024);
         while let Ok(frame) = rx.recv() {
-            write_frame(&mut out, &frame);
+            write_frame(&mut out, &frame, &mut byte_buf);
         }
     });
     PcmWriter::new(tx)
 }
 
 /// Encode `samples` as S16LE and write to `out` (ETSI TS 102 563 §5.2).
-fn write_frame(out: &mut impl Write, samples: &[i16]) {
-    let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
-    if let Err(e) = out.write_all(&bytes) {
+///
+/// `byte_buf` is a pre-allocated scratch buffer that is cleared and reused
+/// on every call, eliminating per-frame heap allocations.
+fn write_frame(out: &mut impl Write, samples: &[i16], byte_buf: &mut Vec<u8>) {
+    byte_buf.clear();
+    byte_buf.extend(samples.iter().flat_map(|s| s.to_le_bytes()));
+    if let Err(e) = out.write_all(byte_buf) {
         tracing::warn!("PCM write failed: {e}");
     }
     if let Err(e) = out.flush() {
@@ -130,7 +139,8 @@ mod tests {
     fn write_frame_encodes_as_s16le() {
         let samples: &[i16] = &[0x0102i16, -1, i16::MIN, i16::MAX];
         let mut buf = Vec::new();
-        write_frame(&mut buf, samples);
+        let mut byte_buf = Vec::new();
+        write_frame(&mut buf, samples, &mut byte_buf);
         let expected: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
         assert_eq!(buf, expected);
     }
@@ -139,7 +149,8 @@ mod tests {
     #[test]
     fn write_frame_empty_slice_produces_no_bytes() {
         let mut buf = Vec::new();
-        write_frame(&mut buf, &[]);
+        let mut byte_buf = Vec::new();
+        write_frame(&mut buf, &[], &mut byte_buf);
         assert!(buf.is_empty());
     }
 }

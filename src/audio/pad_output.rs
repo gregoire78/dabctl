@@ -155,19 +155,26 @@ impl PadOutput {
     }
 
     fn write_json_struct<T: serde::Serialize>(&mut self, value: &T) {
-        if let Some(ref mut writer) = self.writer {
-            match serde_json::to_string(value) {
-                Ok(json) => {
-                    if let Err(e) = writeln!(writer, "{}", json) {
-                        tracing::warn!("Metadata write to fd 3 failed: {e}");
-                    }
-                    if let Err(e) = writer.flush() {
-                        tracing::warn!("Metadata flush on fd 3 failed: {e}");
-                    }
+        if self.writer.is_none() {
+            return;
+        }
+        match serde_json::to_string(value) {
+            Ok(json) => {
+                let failed = {
+                    let writer = self.writer.as_mut().unwrap();
+                    writeln!(writer, "{}", json)
+                        .err()
+                        .or_else(|| writer.flush().err())
+                };
+                if let Some(e) = failed {
+                    tracing::warn!(
+                        "Metadata write to fd 3 failed: {e} — fd 3 is open but not writable (pipe, socket, or inherited fd). Disabling JSON output. Redirect with 3>/path/to/file or 3>&1 to capture metadata."
+                    );
+                    self.writer = None;
                 }
-                Err(e) => {
-                    tracing::warn!("Metadata JSON serialization failed: {e}");
-                }
+            }
+            Err(e) => {
+                tracing::warn!("Metadata JSON serialization failed: {e}");
             }
         }
     }

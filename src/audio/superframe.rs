@@ -2,6 +2,7 @@
 /// checks fire code sync, extracts Access Units.
 use crate::audio::crc::{crc16_ccitt, crc_fire_code, CrcCalculator};
 use crate::audio::rs_decoder::RsDecoder;
+use tracing::trace;
 
 const FPAD_LEN: usize = 2;
 
@@ -107,7 +108,8 @@ impl SuperframeFormat {
     }
 }
 
-/// Fonction pure pour calculer le nombre d'AUs (access units) selon dac_rate et sbr_flag
+/// Computes the number of Access Units contained in one DAB+ superframe,
+/// determined by `dac_rate` and `sbr_flag` (ETSI TS 102 563 §5.2).
 pub fn calculate_number_of_access_units(dac_rate: bool, sbr_flag: bool) -> usize {
     match (dac_rate, sbr_flag) {
         (true, true) => 3,
@@ -210,10 +212,25 @@ impl SuperframeFilter {
             let dst = i * self.frame_len..(i + 1) * self.frame_len;
             self.sf[dst].copy_from_slice(&self.sf_raw[src]);
         }
-        let (_corr, _uncorr) = self.rs_dec.decode_superframe(&mut self.sf);
+        let (corr, uncorr) = self.rs_dec.decode_superframe(&mut self.sf);
+        if corr > 0 || uncorr {
+            trace!(
+                rs_corrected = corr,
+                rs_uncorrectable = uncorr,
+                "SUPERFRAME: RS decode"
+            );
+        }
 
         // Check fire code sync
         if !self.check_sync() {
+            // Log the CRC mismatch to help diagnose systematic vs random failures.
+            let crc_stored = (self.sf[0] as u16) << 8 | self.sf[1] as u16;
+            let crc_calced = crc_fire_code().calc(&self.sf[2..11]);
+            trace!(
+                stored = format_args!("0x{:04X}", crc_stored),
+                calc = format_args!("0x{:04X}", crc_calced),
+                "SUPERFRAME: fire code CRC fail"
+            );
             // Slide by 1 frame: set count to 4 so we collect just one more frame.
             // write_head already points to the next slot to overwrite.
             self.frame_count = 4;
@@ -274,6 +291,17 @@ impl SuperframeFilter {
 
         // Reset for next superframe
         self.frame_count = 0;
+
+        let decoded = access_units.len();
+        let expected = num_aus;
+        if decoded < expected {
+            trace!(
+                decoded,
+                expected,
+                dropped = expected - decoded,
+                "SUPERFRAME: AU CRC failures"
+            );
+        }
 
         SuperframeResult {
             access_units,
@@ -345,6 +373,27 @@ impl SuperframeFilter {
     /// Get the current format (if determined)
     pub fn format(&self) -> Option<&SuperframeFormat> {
         self.format.as_ref()
+    }
+
+    /// Discard the current rolling-window state and start a clean accumulation.
+    ///
+    /// Call this when the OFDM layer reports a frame sync loss (i.e. when a
+    /// `DabFrame` arrives with `sync_lost = true`).  Without a reset, the
+    /// 5-slot circular buffer retains CIFs from before the dropout; when new
+    /// CIFs arrive, the Fire-code check is run against a window that mixes
+    /// pre-dropout and post-dropout data, causing up to 5 consecutive
+    /// `sync_fail` events before the sliding window re-aligns with the true
+    /// superframe boundary.
+    ///
+    /// A reset reduces worst-case post-dropout `sync_fail` count from ~9 to
+    /// ~4 (one per possible boundary offset in the 5-CIF superframe period).
+    ///
+    /// ETSI TS 102 563 §5 — DAB+ superframe structure.
+    pub fn reset(&mut self) {
+        self.frame_count = 0;
+        self.write_head = 0;
+        // Overwrite stale CIF data so it is never mixed with post-resync CIFs.
+        self.sf_raw.fill(0);
     }
 }
 
@@ -530,5 +579,58 @@ mod tests {
             // Result may be sync_fail (fire CRC) or empty — never a panic.
             assert!(result.access_units.is_empty());
         }
+    }
+
+    /// `reset()` must discard all accumulated frames so the next 5 feeds
+    /// start a clean accumulation (no mixing with pre-reset CIF data).
+    #[test]
+    fn reset_discards_accumulated_frames_and_restarts_cleanly() {
+        let mut filter = SuperframeFilter::new();
+        let frame = vec![0u8; 120];
+
+        // Feed 4 frames — one less than the 5 needed to attempt a decode.
+        for _ in 0..4 {
+            let r = filter.feed(&frame);
+            assert!(r.access_units.is_empty(), "not enough frames yet");
+            assert!(!r.sync_ok);
+            assert!(!r.sync_fail);
+        }
+
+        // reset() before the 5th frame — the accumulator should restart.
+        filter.reset();
+
+        // After reset, feeding 4 more frames should NOT trigger a decode attempt.
+        for _ in 0..4 {
+            let r = filter.feed(&frame);
+            assert!(
+                r.access_units.is_empty(),
+                "should need 5 frames after reset"
+            );
+            assert!(!r.sync_ok);
+            assert!(!r.sync_fail);
+        }
+    }
+
+    /// After `reset()`, internal stale data is zeroed so that the first decode
+    /// attempt (on the 5th feed after reset) never reads pre-reset CIF bytes.
+    #[test]
+    fn reset_clears_stale_cif_data() {
+        let mut filter = SuperframeFilter::new();
+
+        // Prime the filter with non-zero data.
+        let non_zero = vec![0xFFu8; 120];
+        for _ in 0..5 {
+            let _ = filter.feed(&non_zero);
+        }
+
+        filter.reset();
+
+        // After reset, sf_raw must be fully zeroed.
+        assert!(
+            filter.sf_raw.iter().all(|&b| b == 0),
+            "stale CIF data not cleared"
+        );
+        assert_eq!(filter.write_head, 0, "write_head must be reset to 0");
+        assert_eq!(filter.frame_count, 0, "frame_count must be reset to 0");
     }
 }

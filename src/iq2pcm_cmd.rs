@@ -131,7 +131,11 @@ pub fn run(args: Iq2pcmArgs) {
     let time_synced = Arc::new(AtomicBool::new(false));
     let ensemble_recognized = Arc::new(AtomicBool::new(false));
     let signal_noise = Arc::new(AtomicI16::new(0));
-    let fic_success = Arc::new(AtomicI16::new(0));
+    // FIB CRC result accumulators — incremented each FIC frame, reset (swap 0) by the
+    // status thread every second so fib_quality reflects the same 1-second window as
+    // sync_ok/sync_fail instead of just the last individual frame.
+    let fic_ok = Arc::new(AtomicI32::new(0));
+    let fic_total = Arc::new(AtomicI32::new(0));
     let run = Arc::new(AtomicBool::new(false));
 
     let running_ctrlc = running.clone();
@@ -144,11 +148,16 @@ pub fn run(args: Iq2pcmArgs) {
     .expect("Error setting Ctrl-C handler");
 
     let channel = args.channel.to_uppercase();
-    let freq = band_handler::frequency(BAND_III, &channel);
-    if freq == -1 {
-        error!("Cannot handle channel {}", channel);
-        std::process::exit(4);
-    }
+    let freq = match band_handler::frequency(BAND_III, &channel) {
+        Some(f) => f,
+        None => {
+            error!(
+                "Unknown DAB channel '{}' — valid examples: 5A, 6C, 11C",
+                channel
+            );
+            std::process::exit(4);
+        }
+    };
     debug!("tunedFrequency = {}", freq as u32);
 
     let gain_mode = if args.hardware_agc {
@@ -184,10 +193,12 @@ pub fn run(args: Iq2pcmArgs) {
         Some(std::sync::Arc::new(move |name: &str, sid: i32| {
             debug!("program {} (0x{:X}) is in the list", name.trim(), sid);
         }));
-    let fs = fic_success.clone();
-    let fic_quality_cb: Option<std::sync::Arc<dyn Fn(i16) + Send + Sync>> =
-        Some(std::sync::Arc::new(move |quality: i16| {
-            fs.store(quality, Ordering::SeqCst);
+    let fok = fic_ok.clone();
+    let ftot = fic_total.clone();
+    let fic_quality_cb: Option<std::sync::Arc<dyn Fn(i16, i16) + Send + Sync>> =
+        Some(std::sync::Arc::new(move |success: i16, total: i16| {
+            fok.fetch_add(i32::from(success), Ordering::Relaxed);
+            ftot.fetch_add(i32::from(total), Ordering::Relaxed);
         }));
 
     let pipeline = DabPipeline::new(1, frame_tx, ensemble_cb, program_cb, fic_quality_cb);
@@ -195,12 +206,17 @@ pub fn run(args: Iq2pcmArgs) {
 
     let ts = time_synced.clone();
     let sn = signal_noise.clone();
+    let freq_offset_hz = Arc::new(AtomicI32::new(0));
     let mut ofdm_processor = OfdmProcessor::new(1, 2, 5, running.clone());
     ofdm_processor.set_sync_signal(move |synced| {
         ts.store(synced, Ordering::SeqCst);
     });
     ofdm_processor.set_show_snr(move |snr| {
         sn.store(snr, Ordering::SeqCst);
+    });
+    let fo = freq_offset_hz.clone();
+    ofdm_processor.set_show_freq_offset(move |offset_hz| {
+        fo.store(offset_hz, Ordering::Relaxed);
     });
 
     if !input_device.restart_reader() {
@@ -212,6 +228,9 @@ pub fn run(args: Iq2pcmArgs) {
     // the OFDM thread.  Setting this to false unblocks read_sync and lets the
     // worker exit, which in turn lets RtlsdrHandler::drop finish without stalling.
     let rtlsdr_running = input_device.reader_running();
+    // Capture the gain arc so the status thread can read it after input_device
+    // is moved into the OFDM thread.
+    let gain_tenths = input_device.gain_tenths_arc();
 
     // ── Thread 1: OFDM → DabPipeline ─────────────────────────────────────────
     let ofdm_thread = thread::spawn(move || {
@@ -310,7 +329,9 @@ pub fn run(args: Iq2pcmArgs) {
     // Monitor thread to log status and respect record_time
     let status_run = run.clone();
     let sn2 = signal_noise.clone();
-    let fs2 = fic_success.clone();
+    let fs2_ok = fic_ok.clone();
+    let fs2_total = fic_total.clone();
+    let c_fo = freq_offset_hz.clone();
     let running2 = running.clone();
     let c_fi = frames_in.clone();
     let c_fns = frames_no_subch.clone();
@@ -319,6 +340,15 @@ pub fn run(args: Iq2pcmArgs) {
     let c_au = aus_decoded.clone();
     let c_sil = silence_aus.clone();
     thread::spawn(move || {
+        // Counts consecutive 1-second intervals where reception is degraded
+        // (sfail > sok: majority of OFDM frames failed that second).
+        // Used to emit a WARN after DROPOUT_WARN_SECS dominated-by-failure seconds.
+        // Using sfail > sok (rather than sok == 0) catches fading conditions where
+        // a few frames recover within a second but overall reception is still broken,
+        // preventing a single partial-recovery tick from resetting the counter.
+        const DROPOUT_WARN_SECS: u32 = 5;
+        let mut consecutive_dropout_s: u32 = 0;
+
         while status_run.load(Ordering::SeqCst) {
             let fi = c_fi.swap(0, Ordering::SeqCst);
             let fns = c_fns.swap(0, Ordering::SeqCst);
@@ -326,17 +356,81 @@ pub fn run(args: Iq2pcmArgs) {
             let sfail = c_sfail.swap(0, Ordering::SeqCst);
             let au = c_au.swap(0, Ordering::SeqCst);
             let sil = c_sil.swap(0, Ordering::SeqCst);
+            let fib_ok = fs2_ok.swap(0, Ordering::SeqCst);
+            let fib_tot = fs2_total.swap(0, Ordering::SeqCst);
+            let fib_quality = if fib_tot > 0 {
+                fib_ok * 100 / fib_tot
+            } else {
+                0
+            };
+
+            // Current tuner gain (tenths of dB); -1 = hardware AGC active.
+            let gain_t = gain_tenths.load(Ordering::Relaxed);
+            let gain_db_x10 = if gain_t >= 0 { gain_t } else { 0 };
+
+            // B. Only report frequency offset and PPM when the OFDM decoder is
+            // locked (sync_ok > 0).  During a full dropout the phase-reference
+            // correlator produces arbitrary values that would mislead the reader.
+            let (offset_hz, mppm) = if sok > 0 {
+                // Derive PPM from the OFDM AFC total offset (coarse + fine).
+                // ppm = offset_hz × 1_000_000 / tuned_freq_hz (ETSI EN 300 401 §8.4.3).
+                // Reported in milli-PPM (×1000) so sub-PPM offsets are visible.
+                let off = c_fo.load(Ordering::Relaxed);
+                let ppm = if freq > 0 {
+                    off * 1_000_000_000 / freq
+                } else {
+                    0
+                };
+                (off, ppm)
+            } else {
+                (0, 0)
+            };
+
             debug!(
                 snr = sn2.load(Ordering::SeqCst),
-                fib_quality = fs2.load(Ordering::SeqCst),
+                fib_quality,
                 frames = fi,
                 no_subch = fns,
                 sync_ok = sok,
                 sync_fail = sfail,
                 aus = au,
                 silence_aus = sil,
+                freq_offset_hz = offset_hz,
+                mppm,
+                gain_db_x10,
                 "status"
             );
+
+            // C. Emit a WARN when reception has been degraded (sfail majority) for
+            // DROPOUT_WARN_SECS consecutive seconds.  sfail > sok means failures
+            // outnumbered successes that second — a reliable proxy for "the listener
+            // is hearing dropouts" even during fading with intermittent recovery.
+            if sfail > sok {
+                consecutive_dropout_s += 1;
+                if consecutive_dropout_s == DROPOUT_WARN_SECS {
+                    let snr_val = sn2.load(Ordering::SeqCst);
+                    let hint = if offset_hz == 0 && snr_val < 6 {
+                        " — weak RF signal, check antenna"
+                    } else if offset_hz.abs() > 500 {
+                        " — large frequency offset, try -p to adjust PPM"
+                    } else {
+                        " — OFDM sync lost, audio interrupted"
+                    };
+                    warn!(
+                        "Signal degraded for {} s (snr={} dB, freq_offset={} Hz){}",
+                        consecutive_dropout_s, snr_val, offset_hz, hint,
+                    );
+                }
+            } else {
+                if consecutive_dropout_s >= DROPOUT_WARN_SECS {
+                    info!(
+                        "Signal recovered after {} s of degraded reception",
+                        consecutive_dropout_s
+                    );
+                }
+                consecutive_dropout_s = 0;
+            }
+
             thread::sleep(std::time::Duration::from_secs(1));
         }
         running2.store(false, Ordering::SeqCst);
@@ -418,6 +512,15 @@ pub fn run(args: Iq2pcmArgs) {
 
         // ── DAB+ path: superframe → RS → AU → AAC → PCM ──────────────────────
         {
+            // When the OFDM layer detected a block-sequence discontinuity, the
+            // rolling 5-CIF window in SuperframeFilter still holds pre-dropout CIF
+            // data.  Mixing old and new CIFs guarantees a Fire-code failure on the
+            // next decode attempt.  Reset now so the first 5 post-resync CIFs form
+            // a clean candidate.  (ETSI TS 102 563 §5 — DAB+ superframe structure)
+            if frame.sync_lost {
+                superframe.reset();
+                tracing::debug!("superframe accumulator reset after OFDM sync loss");
+            }
             let result = superframe.feed(subchannel_data);
             if result.sync_ok {
                 sync_ok.fetch_add(1, Ordering::Relaxed);
@@ -482,8 +585,10 @@ pub fn run(args: Iq2pcmArgs) {
             }
 
             if let Some(ref mut dec) = aac_decoder {
+                let mut decoded_this_frame: usize = 0;
                 for au in &result.access_units {
                     if let Some(pcm) = dec.decode_frame(&au.data) {
+                        decoded_this_frame += 1;
                         aus_decoded.fetch_add(1, Ordering::Relaxed);
                         // Capture the silence frame shape from the first successful decode.
                         if au_silence.is_none() {
@@ -493,11 +598,41 @@ pub fn run(args: Iq2pcmArgs) {
                         silence_next = silence_deadline_after_good_au(std::time::Instant::now());
                     }
                 }
-                // On sync_fail: push silence into the deferred buffer instead
-                // of writing it immediately.  The buffer holds for 5 CIF ticks
-                // (~120 ms) before flushing.  If sync_ok arrives within that
-                // window, cancel() discards the pending silence so no gap
-                // is inserted into the stream (ETSI TS 102 563 §5.1).
+
+                // ── sync_ok path: fill each missing AU in this superframe ──────────
+                // On a structurally valid superframe (fire-code OK), individual AUs can
+                // still fail their inner CRC (ETSI TS 102 563 §5.3.2) or the AAC
+                // decoder can return None. Each missing AU is an ~40 ms gap at 48 kHz
+                // with SBR. Injecting silence immediately preserves the total PCM
+                // duration and keeps ffmpeg speed ≥ 1.0×.
+                //
+                // The silence frames are pushed AFTER the good AUs from this
+                // superframe: the exact positions of failed AUs within the superframe
+                // are not recoverable once the CRC-failed AUs have been discarded by
+                // the superframe decoder.
+                //
+                // Note: no rate-limiting is needed here. The number of silence frames
+                // is bounded by au_count per superframe (~3 every 120 ms = real-time).
+                // ETSI TS 102 563 §5.1 — one DAB+ superframe = 5 CIF × ~24 ms.
+                if result.sync_ok && !args.no_silence_fill {
+                    let missing = au_count.saturating_sub(decoded_this_frame);
+                    if missing > 0 {
+                        if let Some(ref silence) = au_silence {
+                            for _ in 0..missing {
+                                if pcm_out.push(silence.clone()) {
+                                    silence_aus.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ── sync_fail path: rate-limited fill for fire-code failures ─────
+                // When the fire-code check itself fails, we have no superframe
+                // boundary to anchor fill rate. Rate-limit to one superframe period
+                // (120 ms) to match real-time, deferred via SilenceBuffer so a
+                // brief sync_ok recovery does not interleave silence with real audio.
+                // ETSI TS 102 563 §5.1.
                 if result.sync_fail && !args.no_silence_fill {
                     let now = std::time::Instant::now();
                     if now >= silence_next {
@@ -668,6 +803,35 @@ mod tests {
         }
         let args = Wrapper::parse_from(["test", "-C", "6C", "-s", "0xF2F8", "--no-silence-fill"]);
         assert!(args.inner.no_silence_fill);
+    }
+
+    // ── Silence fill: per-AU gap accounting on sync_ok ───────────────────────
+
+    /// When sync_ok=true but fewer AUs are decoded than expected, the number of
+    /// missing AUs must equal au_count − decoded. This is what drives the silence
+    /// injection on the sync_ok path (ETSI TS 102 563 §5.3.2).
+    #[test]
+    fn missing_aus_is_difference_between_expected_and_decoded() {
+        let au_count: usize = 3;
+        // All AUs failed CRC → 3 silence frames needed.
+        let decoded: usize = 0;
+        assert_eq!(au_count.saturating_sub(decoded), 3);
+
+        // Partial failure: 2 out of 3 decoded → 1 silence frame needed.
+        let decoded: usize = 2;
+        assert_eq!(au_count.saturating_sub(decoded), 1);
+
+        // All AUs decoded → no silence needed.
+        let decoded: usize = 3;
+        assert_eq!(au_count.saturating_sub(decoded), 0);
+    }
+
+    /// saturating_sub must not underflow when decoded somehow exceeds au_count.
+    #[test]
+    fn missing_aus_saturates_at_zero_when_decoded_exceeds_au_count() {
+        let au_count: usize = 3;
+        let decoded: usize = 5; // edge-case: AAC decoder emitted more frames
+        assert_eq!(au_count.saturating_sub(decoded), 0);
     }
 
     /// `-G` (manual gain) and `--hardware-agc` must be mutually exclusive.

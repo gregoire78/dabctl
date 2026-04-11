@@ -33,6 +33,16 @@ pub struct DabFrame {
     /// Active sub-channels in this frame.
     /// Typical ensembles carry 6–12 sub-channels; inline storage avoids heap allocation.
     pub subchannels: SmallVec<[SubchannelFrame; INLINE_SUBCH]>,
+
+    /// Set to `true` when the OFDM frame sequencer detected a block sequence
+    /// discontinuity (`SyncLost`) immediately before this frame was assembled.
+    ///
+    /// The audio thread should call `SuperframeFilter::reset()` when this flag
+    /// is set so the 5-CIF rolling window starts fresh from post-resync data.
+    /// Without a reset, the window would mix pre-dropout CIFs with new ones,
+    /// causing up to 5 consecutive Fire-code failures before re-alignment.
+    /// (ETSI TS 102 563 §5 — DAB+ superframe structure)
+    pub sync_lost: bool,
 }
 
 impl DabFrame {
@@ -44,6 +54,7 @@ impl DabFrame {
             cif_count_hi,
             cif_count_lo,
             subchannels: SmallVec::new(),
+            sync_lost: false,
         }
     }
 

@@ -229,7 +229,13 @@ static LBAND_FREQUENCIES: &[DabFrequency] = &[
     },
 ];
 
-pub fn frequency(dab_band: u8, channel: &str) -> i32 {
+/// Return the centre frequency in Hz for a named DAB channel, or `None` when
+/// the channel is not found in the table.
+///
+/// # Arguments
+/// * `dab_band` — `BAND_III` or `L_BAND` (ETSI EN 300 401 §7.1).
+/// * `channel` — channel label, e.g. `"6C"` or `"11C"` (case-insensitive).
+pub fn frequency(dab_band: u8, channel: &str) -> Option<i32> {
     let table = if dab_band == BAND_III {
         BAND_III_FREQUENCIES
     } else {
@@ -237,13 +243,10 @@ pub fn frequency(dab_band: u8, channel: &str) -> i32 {
     };
 
     let channel_upper = channel.to_uppercase();
-    for f in table {
-        if f.key == channel_upper {
-            return f.f_khz * 1000;
-        }
-    }
-    // Default: return first entry
-    table[0].f_khz * 1000
+    table
+        .iter()
+        .find(|f| f.key == channel_upper)
+        .map(|f| f.f_khz * 1000)
 }
 
 #[cfg(test)]
@@ -253,12 +256,12 @@ mod tests {
 
     #[test]
     fn known_channel_11c() {
-        assert_eq!(frequency(BAND_III, "11C"), 220352 * 1000);
+        assert_eq!(frequency(BAND_III, "11C"), Some(220352 * 1000));
     }
 
     #[test]
     fn channel_5a() {
-        assert_eq!(frequency(BAND_III, "5A"), 174928 * 1000);
+        assert_eq!(frequency(BAND_III, "5A"), Some(174928 * 1000));
     }
 
     #[test]
@@ -268,12 +271,14 @@ mod tests {
 
     #[test]
     fn lband() {
-        assert_eq!(frequency(L_BAND, "LA"), 1452960 * 1000);
+        assert_eq!(frequency(L_BAND, "LA"), Some(1452960 * 1000));
     }
 
     #[test]
-    fn unknown_returns_first() {
-        assert_eq!(frequency(BAND_III, "UNKNOWN"), 174928 * 1000);
+    fn unknown_channel_returns_none() {
+        assert_eq!(frequency(BAND_III, "UNKNOWN"), None);
+        assert_eq!(frequency(BAND_III, "ZZZ"), None);
+        assert_eq!(frequency(BAND_III, ""), None);
     }
 
     #[test]
@@ -285,7 +290,7 @@ mod tests {
         ];
         let mut prev = 0i32;
         for ch in &channels {
-            let f = frequency(BAND_III, ch);
+            let f = frequency(BAND_III, ch).expect("channel must be found");
             assert!(f > prev, "Frequency for {} should be > prev ({})", ch, prev);
             prev = f;
         }
