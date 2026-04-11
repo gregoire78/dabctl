@@ -105,6 +105,50 @@ const SAGC_SILENCE_TICKS: u32 = 10;
 /// 500 × 4 × 8192 / 2_048_000 s ≈ 8 s of stability required.
 const SAGC_HUNT_RESET_TICKS: u32 = 500;
 
+#[inline]
+fn compute_clip_rate(clip_count: u32, sagc_check_interval: u32, n_pairs: usize) -> f32 {
+    let total_samples = sagc_check_interval * n_pairs as u32 * 2;
+    if total_samples == 0 {
+        0.0
+    } else {
+        clip_count as f32 / total_samples as f32
+    }
+}
+
+#[inline]
+fn should_force_clip_gain_down(
+    clip_rate: f32,
+    gain_idx: usize,
+    hunt_freeze: u32,
+    agc_hold_cntr: u32,
+) -> bool {
+    clip_rate > SAGC_CLIP_RATE_MAX && gain_idx > 0 && hunt_freeze == 0 && agc_hold_cntr == 0
+}
+
+#[inline]
+fn update_sagc_silence_counter(agc_level: f32, silence_counter: u32) -> u32 {
+    if agc_level >= SAGC_SILENCE_FLOOR {
+        0
+    } else {
+        silence_counter.saturating_add(1)
+    }
+}
+
+#[inline]
+fn should_reset_on_silence(silence_counter: u32) -> bool {
+    silence_counter >= SAGC_SILENCE_TICKS
+}
+
+#[inline]
+fn apply_hunt_backoff_reset_if_stable(hunt_stable_cntr: u32, hunt_freeze_ticks: u32) -> (u32, u32) {
+    let stable_next = hunt_stable_cntr.saturating_add(1);
+    if stable_next >= SAGC_HUNT_RESET_TICKS && hunt_freeze_ticks > SAGC_HUNT_FREEZE_BASE {
+        (0, SAGC_HUNT_FREEZE_BASE)
+    } else {
+        (stable_next, hunt_freeze_ticks)
+    }
+}
+
 /// Select the closest gain value from `gains` (sorted list in tenths of dB)
 /// given a percentage `gain_pct` in `0..=100`.
 #[allow(dead_code)]
@@ -528,21 +572,19 @@ impl RtlsdrHandler {
                             // causing OFDM demodulation failures. When more than
                             // SAGC_CLIP_RATE_MAX of raw samples are near-saturating the ADC,
                             // force an immediate gain step down bypassing hold / confirm.
-                            let total_samples = SAGC_CHECK_INTERVAL * n_pairs as u32 * 2;
-                            let clip_rate = clip_count as f32 / total_samples as f32;
+                            let clip_rate =
+                                compute_clip_rate(clip_count, SAGC_CHECK_INTERVAL, n_pairs);
                             clip_count = 0;
                             // Silence counter: maintained before every decision.
                             // Resets automatically when the signal is above the floor.
-                            if agc_level >= SAGC_SILENCE_FLOOR {
-                                sagc_silence_cntr = 0;
-                            } else {
-                                sagc_silence_cntr = sagc_silence_cntr.saturating_add(1);
-                            }
-                            if clip_rate > SAGC_CLIP_RATE_MAX
-                                && gain_idx > 0
-                                && hunt_freeze == 0
-                                && agc_hold_cntr == 0
-                            {
+                            sagc_silence_cntr =
+                                update_sagc_silence_counter(agc_level, sagc_silence_cntr);
+                            if should_force_clip_gain_down(
+                                clip_rate,
+                                gain_idx,
+                                hunt_freeze,
+                                agc_hold_cntr,
+                            ) {
                                 gain_idx -= 1;
                                 agc_level_min = level_min_factors[gain_idx] * SAGC_LEVEL_MAX;
                                 agc_hold_cntr = SAGC_HOLD_BUFFERS;
@@ -565,7 +607,7 @@ impl RtlsdrHandler {
                                         clip_rate * 100.0,
                                     );
                                 }
-                            } else if sagc_silence_cntr >= SAGC_SILENCE_TICKS {
+                            } else if should_reset_on_silence(sagc_silence_cntr) {
                                 // True signal absence: the slow IIR release (SAGC_CREL)
                                 // would otherwise keep agc_level high for > 30 s, blocking
                                 // gain recovery. Reset the estimator and hunt history so the
@@ -742,14 +784,15 @@ impl RtlsdrHandler {
                                 // After SAGC_HUNT_RESET_TICKS ticks the backoff multiplier
                                 // returns to its base value, restoring SAGC responsiveness
                                 // after a sustained period of well-behaved operation.
-                                hunt_stable_cntr += 1;
-                                if hunt_stable_cntr >= SAGC_HUNT_RESET_TICKS
-                                    && hunt_freeze_ticks > SAGC_HUNT_FREEZE_BASE
-                                {
-                                    hunt_stable_cntr = 0;
-                                    hunt_freeze_ticks = SAGC_HUNT_FREEZE_BASE;
+                                let (stable_next, freeze_next) = apply_hunt_backoff_reset_if_stable(
+                                    hunt_stable_cntr,
+                                    hunt_freeze_ticks,
+                                );
+                                if freeze_next != hunt_freeze_ticks {
                                     debug!("SAGC: sustained stability → hunt backoff reset");
                                 }
+                                hunt_stable_cntr = stable_next;
+                                hunt_freeze_ticks = freeze_next;
                             }
                         }
                         // Publish the current gain index after every SAGC evaluation so
@@ -1153,12 +1196,8 @@ mod tests {
         let mut sagc_silence_cntr = 0u32;
 
         for _ in 0..SAGC_SILENCE_TICKS {
-            if agc_level >= SAGC_SILENCE_FLOOR {
-                sagc_silence_cntr = 0;
-            } else {
-                sagc_silence_cntr = sagc_silence_cntr.saturating_add(1);
-            }
-            if sagc_silence_cntr >= SAGC_SILENCE_TICKS {
+            sagc_silence_cntr = update_sagc_silence_counter(agc_level, sagc_silence_cntr);
+            if should_reset_on_silence(sagc_silence_cntr) {
                 agc_level = 0.0;
                 hunt_freeze = 0;
                 hunt_freeze_ticks = SAGC_HUNT_FREEZE_BASE;
@@ -1189,13 +1228,8 @@ mod tests {
         let mut hunt_stable_cntr: u32 = 0;
 
         for _ in 0..SAGC_HUNT_RESET_TICKS {
-            hunt_stable_cntr += 1;
-            if hunt_stable_cntr >= SAGC_HUNT_RESET_TICKS
-                && hunt_freeze_ticks > SAGC_HUNT_FREEZE_BASE
-            {
-                hunt_stable_cntr = 0;
-                hunt_freeze_ticks = SAGC_HUNT_FREEZE_BASE;
-            }
+            (hunt_stable_cntr, hunt_freeze_ticks) =
+                apply_hunt_backoff_reset_if_stable(hunt_stable_cntr, hunt_freeze_ticks);
         }
 
         assert_eq!(
@@ -1206,5 +1240,59 @@ mod tests {
             hunt_stable_cntr, 0,
             "stability counter must reset after firing"
         );
+    }
+
+    #[test]
+    fn silence_counter_resets_when_signal_recovers() {
+        let low = SAGC_SILENCE_FLOOR - 0.5;
+        let high = SAGC_SILENCE_FLOOR + 1.0;
+        let mut cntr = 0u32;
+
+        cntr = update_sagc_silence_counter(low, cntr);
+        cntr = update_sagc_silence_counter(low, cntr);
+        assert_eq!(cntr, 2);
+
+        cntr = update_sagc_silence_counter(high, cntr);
+        assert_eq!(cntr, 0, "silence counter must clear on recovered level");
+    }
+
+    #[test]
+    fn backoff_reset_helper_preserves_state_before_threshold() {
+        let (cntr, freeze) = apply_hunt_backoff_reset_if_stable(10, SAGC_HUNT_FREEZE_BASE * 2);
+        assert_eq!(cntr, 11);
+        assert_eq!(freeze, SAGC_HUNT_FREEZE_BASE * 2);
+    }
+
+    // ── SAGC: clip-rate decision helpers ─────────────────────────────────────
+
+    #[test]
+    fn clip_rate_returns_zero_when_no_samples() {
+        let rate = compute_clip_rate(10, SAGC_CHECK_INTERVAL, 0);
+        assert_eq!(rate, 0.0);
+    }
+
+    #[test]
+    fn clip_rate_matches_expected_ratio() {
+        let n_pairs = 4096usize;
+        let total_samples = SAGC_CHECK_INTERVAL * n_pairs as u32 * 2;
+        let clip_count = total_samples / 10; // 10%
+        let rate = compute_clip_rate(clip_count, SAGC_CHECK_INTERVAL, n_pairs);
+        let expected = clip_count as f32 / total_samples as f32;
+        assert!(
+            (rate - expected).abs() < 1e-9,
+            "clip rate mismatch: expected {expected}, got {rate}"
+        );
+    }
+
+    #[test]
+    fn force_clip_gain_down_requires_all_guards_to_pass() {
+        // Above clip threshold, valid gain index, no freeze, no hold => force down.
+        assert!(should_force_clip_gain_down(0.10, 3, 0, 0));
+
+        // Any guard failing must block the forced step.
+        assert!(!should_force_clip_gain_down(0.01, 3, 0, 0));
+        assert!(!should_force_clip_gain_down(0.10, 0, 0, 0));
+        assert!(!should_force_clip_gain_down(0.10, 3, 1, 0));
+        assert!(!should_force_clip_gain_down(0.10, 3, 0, 1));
     }
 }

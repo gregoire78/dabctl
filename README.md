@@ -399,6 +399,76 @@ sudo ./target/release/dabctl -C 6C -s 0xF2F8 --aac-decoder fdk-aac | ffplay …
 
 ---
 
+## Stability Campaign Runbook
+
+This runbook defines repeatable long-run checks using the 1 Hz `status` logs:
+
+- `sync_ok` / `sync_fail` — OFDM superframe decode health over the last second
+- `dls_events` / `slide_events` — metadata continuity emitted in the same second
+- `metadata_blackout=true` — degraded second with no DLS/slide events
+
+### 1) Run a capture campaign
+
+Use the helper script (writes logs to `test-local/iq2pcm.log`):
+
+```bash
+bash live-capture-iq2pcm.sh 8C 0xF201
+```
+
+Or run `dabctl` directly and save stderr logs:
+
+```bash
+sudo RUST_LOG=info,dabctl=debug ./target/release/dabctl -C 8C -s 0xF201 \
+  --slide-dir /tmp/slides --slide-base64 3>pad_metadata.json \
+  2>iq2pcm.log | ffmpeg -y -f s16le -ar 48000 -ac 2 -i pipe:0 output.wav
+```
+
+### 2) Compute campaign metrics from logs
+
+Count sampled status seconds:
+
+```bash
+grep -c " status " iq2pcm.log
+```
+
+Count degraded seconds (`sync_fail > sync_ok`) and blackout seconds:
+
+```bash
+awk '
+  / status / {
+    sok=sf=dls=sld=0;
+    for (i=1; i<=NF; i++) {
+      if ($i ~ /^sync_ok=/) { split($i,a,"="); sok=a[2]+0 }
+      else if ($i ~ /^sync_fail=/) { split($i,a,"="); sf=a[2]+0 }
+      else if ($i ~ /^dls_events=/) { split($i,a,"="); dls=a[2]+0 }
+      else if ($i ~ /^slide_events=/) { split($i,a,"="); sld=a[2]+0 }
+      else if ($i ~ /^metadata_blackout=/) { split($i,a,"="); mb=(a[2]=="true") }
+    }
+    secs++;
+    if (sf > sok) drop++;
+    if (mb || ((sf > sok) && dls==0 && sld==0)) black++;
+  }
+  END {
+    if (secs==0) { print "no status lines"; exit 1 }
+    printf("secs=%d drop=%d black=%d drop_pct=%.1f black_pct=%.1f\n",
+      secs, drop, black, 100*drop/secs, 100*black/secs)
+  }
+' iq2pcm.log
+```
+
+### 3) Acceptance thresholds (ETSI-TDD campaign)
+
+| Window | Max dropout % | Max blackout % |
+|---|---:|---:|
+| 5 min (300 s) | 40% | 20% |
+| 15 min (900 s) | 30% | 15% |
+| 30 min (1800 s) | 20% | 10% |
+
+These thresholds are enforced by log-driven tests in the codebase and should be
+used as operator acceptance gates for RF stability campaigns.
+
+---
+
 ## Man page
 
 ```bash

@@ -14,15 +14,11 @@ use crate::pipeline::dab_pipeline::DabPipeline;
 use crate::pipeline::ofdm::freq_interleaver::FreqInterleaver;
 use crate::pipeline::ofdm::phase_reference::PhaseReference;
 
-/// Maximum consecutive `check_endOfNull` failures tolerated in the synced loop
-/// before returning to notSynced. (ETSI EN 300 401 §8.4)
-const MAX_CONSECUTIVE_SYNC_FAIL: u32 = 3;
-/// Cost added to the leaky-bucket failure budget on each `check_endOfNull` miss.
-const FAIL_BUDGET_COST: u32 = 2;
-/// Leaky-bucket limit: when reached, forces return to notSynced even if false
-/// positives have kept `consecutive_sync_fail` below `MAX_CONSECUTIVE_SYNC_FAIL`.
-/// At 42 frames/s all-bad: budget rises 84/s — hits limit in ~2.4 s.
-const FAIL_BUDGET_LIMIT: u32 = 200;
+/// Adaptive phase-reference correlation threshold bounds.
+/// Lower values are more tolerant to fades, higher values reject false locks.
+const OFDM_THRESHOLD_MIN: i16 = 2;
+const OFDM_THRESHOLD_MAX: i16 = 7;
+const COARSE_RESET_FALLBACK_HZ: i32 = 0;
 
 pub struct OfdmProcessor {
     t_null: usize,
@@ -67,6 +63,34 @@ pub enum ProcessorError {
 }
 
 impl OfdmProcessor {
+    fn select_reacq_coarse_target(last_stable_coarse: Option<i32>) -> i32 {
+        last_stable_coarse.unwrap_or(COARSE_RESET_FALLBACK_HZ)
+    }
+
+    fn apply_reacq_frequency_reset(&mut self) {
+        // ETSI EN 300 401 §8.4: reset the frequency tracking state when
+        // re-entering acquisition so the scan starts from a deterministic
+        // coarse point and fine AFC restarts from zero.
+        let prev = self.coarse_corrector;
+        let target = Self::select_reacq_coarse_target(self.last_stable_coarse);
+        self.coarse_corrector = target;
+        self.fine_corrector = 0.0;
+
+        if self.last_stable_coarse.is_some() {
+            trace!(
+                prev_hz = prev,
+                restored_hz = target,
+                "OFDM: re-acq — coarse_corrector restored to stable value"
+            );
+        } else {
+            trace!(
+                prev_hz = prev,
+                reset_hz = target,
+                "OFDM: re-acq — coarse_corrector reset (no stable coarse yet)"
+            );
+        }
+    }
+
     pub fn new(dab_mode: u8, threshold_1: i16, threshold_2: i16, running: Arc<AtomicBool>) -> Self {
         let params = DabParams::new(dab_mode);
         let t_u = params.t_u as usize;
@@ -338,6 +362,15 @@ impl OfdmProcessor {
                 sync_buffer_index += 1;
             }
 
+            // Fixed thresholds (ETSI EN 300 401 §8.4): acquire with threshold_1,
+            // then track with threshold_2. No adaptive tighten/relax heuristics.
+            let acq_threshold = self
+                .threshold_1
+                .clamp(OFDM_THRESHOLD_MIN, OFDM_THRESHOLD_MAX);
+            let track_threshold = self
+                .threshold_2
+                .clamp(OFDM_THRESHOLD_MIN, OFDM_THRESHOLD_MAX);
+
             // SyncOnNull: look for the null level (a dip)
             let mut counter = 0i32;
             let phase = self.coarse_corrector + self.fine_corrector as i32;
@@ -404,7 +437,7 @@ impl OfdmProcessor {
 
             let start_index = self
                 .phase_synchronizer
-                .find_index(&self.ofdm_buffer[..self.t_u], self.threshold_1);
+                .find_index(&self.ofdm_buffer[..self.t_u], acq_threshold);
             if start_index < 0 {
                 trace!("OFDM: phase ref not found (correlation below threshold), retry");
                 continue; // notSynced
@@ -417,32 +450,10 @@ impl OfdmProcessor {
             // acquisition. sync_reached() will disable it once the first
             // frame has been decoded correctly.
             self.f2_correction = true;
-            // Restore the last known-good coarse corrector so that the
-            // re-acquisition scan starts close to the correct frequency.
-            // Without this, estimate_offset() running on noise during a deep
-            // fade accumulates a random walk that can push coarse_corrector
-            // hundreds of Hz from its stable value, delaying recovery.
-            if let Some(stable) = self.last_stable_coarse {
-                let prev = self.coarse_corrector;
-                self.coarse_corrector = stable;
-                self.fine_corrector = 0.0;
-                trace!(
-                    prev_hz = prev,
-                    restored_hz = stable,
-                    "OFDM: re-acq — coarse_corrector restored to stable value"
-                );
-            } else {
-                trace!(
-                    coarse_hz = self.coarse_corrector,
-                    "OFDM: re-acq — no stable coarse yet, keeping current value"
-                );
-            }
+            self.apply_reacq_frequency_reset();
 
-            let mut consecutive_sync_fail: u32 = 0;
-            let mut fail_budget: u32 = 0;
             let mut first_frame = true;
             loop {
-                let tolerating = consecutive_sync_fail > 0;
                 // SyncOnPhase: copy remaining data from sync
                 let remaining = self.t_u - start_index;
                 self.ofdm_buffer.copy_within(start_index..self.t_u, 0);
@@ -492,9 +503,6 @@ impl OfdmProcessor {
                 }
 
                 // Data blocks (symbols 2..L)
-                // During a tolerance frame (previous check failed), consume samples
-                // but skip AFC updates: noise-derived freq_corr would corrupt
-                // fine_corrector and prevent recovery when the signal returns.
                 let mut freq_corr = Complex32::new(0.0, 0.0);
                 for symbol_count in 2..=(self.nr_blocks as u16) {
                     let phase = self.coarse_corrector + self.fine_corrector as i32;
@@ -502,22 +510,17 @@ impl OfdmProcessor {
                         return;
                     }
 
-                    if !tolerating {
-                        // Accumulate frequency correction from cyclic prefix
-                        for i in self.t_u..self.t_s {
-                            freq_corr += block_buf[i] * block_buf[i - self.t_u].conj();
-                        }
-                        self.process_block(&block_buf, &mut ibits);
-                        eti_generator.process_block(&ibits, symbol_count as i16);
+                    // Accumulate frequency correction from cyclic prefix.
+                    for i in self.t_u..self.t_s {
+                        freq_corr += block_buf[i] * block_buf[i - self.t_u].conj();
                     }
+                    self.process_block(&block_buf, &mut ibits);
+                    eti_generator.process_block(&ibits, symbol_count as i16);
                 }
 
-                // Integrate frequency error — skipped when tolerating a sync miss
-                // to prevent noise from driving fine_corrector off the true value.
-                if !tolerating {
-                    self.fine_corrector += 0.1 * freq_corr.arg() / std::f32::consts::PI
-                        * (self.carrier_diff as f32 / 2.0);
-                }
+                // Integrate frequency error (ETSI EN 300 401 §8.4.3).
+                self.fine_corrector +=
+                    0.1 * freq_corr.arg() / std::f32::consts::PI * (self.carrier_diff as f32 / 2.0);
 
                 // Skip null symbol and compute SNR
                 let phase = self.coarse_corrector + self.fine_corrector as i32;
@@ -565,39 +568,21 @@ impl OfdmProcessor {
                 start_index = {
                     let idx = self
                         .phase_synchronizer
-                        .find_index(&check_buf, self.threshold_2);
+                        .find_index(&check_buf, track_threshold);
                     if idx < 0 {
-                        consecutive_sync_fail += 1;
-                        fail_budget = fail_budget.saturating_add(FAIL_BUDGET_COST);
-                        let hard_fail = consecutive_sync_fail >= MAX_CONSECUTIVE_SYNC_FAIL;
-                        let budget_fail = fail_budget >= FAIL_BUDGET_LIMIT;
                         trace!(
-                            consecutive = consecutive_sync_fail,
-                            max = MAX_CONSECUTIVE_SYNC_FAIL,
-                            fail_budget,
                             coarse_hz = self.coarse_corrector,
-                            "OFDM: sync check weak — tolerating"
+                            fine_hz = self.fine_corrector as i32,
+                            snr = snr as i16,
+                            "OFDM: tracking miss — returning to notSynced"
                         );
-                        if hard_fail || budget_fail {
-                            trace!(
-                                coarse_hz = self.coarse_corrector,
-                                fine_hz = self.fine_corrector as i32,
-                                snr = snr as i16,
-                                budget_fail,
-                                "OFDM: sync lost after consecutive failures — returning to notSynced"
-                            );
-                            // Reset SNR immediately so the status display shows
-                            // signal loss rather than the stale IIR value.
-                            snr = 0.0;
-                            snr_count = 0;
-                            self.emit_snr(0);
-                            break; // Lost sync, go back to notSynced
-                        }
-                        // Tolerate this frame: assume CP starts at beginning of buffer
-                        0usize
+                        // Reset SNR immediately so the status display shows
+                        // signal loss rather than the stale IIR value.
+                        snr = 0.0;
+                        snr_count = 0;
+                        self.emit_snr(0);
+                        break; // Lost sync, go back to notSynced
                     } else {
-                        consecutive_sync_fail = 0;
-                        fail_budget = fail_budget.saturating_sub(1);
                         idx as usize
                     }
                 };
@@ -618,74 +603,17 @@ impl OfdmProcessor {
 
 #[cfg(test)]
 mod tests {
-    /// Simulate the leaky-bucket failure budget used in the inner synced loop.
-    ///
-    /// Returns the budget value after applying a sequence of frame outcomes.
-    /// `true` = find_index success, `false` = find_index failure.
-    fn run_budget(outcomes: &[bool], cost: u32) -> u32 {
-        let mut budget: u32 = 0;
-        for &ok in outcomes {
-            if ok {
-                budget = budget.saturating_sub(1);
-            } else {
-                budget = budget.saturating_add(cost);
-            }
-        }
-        budget
+    use super::{OfdmProcessor, COARSE_RESET_FALLBACK_HZ};
+
+    #[test]
+    fn reacq_coarse_target_uses_stable_when_present() {
+        let target = OfdmProcessor::select_reacq_coarse_target(Some(-372));
+        assert_eq!(target, -372);
     }
 
-    /// All-bad frames must hit the limit well within 2.4 s at 42 fps.
     #[test]
-    fn fail_budget_sustained_absence_hits_limit() {
-        // With 42 bad frames/s and cost=2, budget rises by 84/s.
-        // Limit reached in ceil(LIMIT/COST) = 100 bad frames ≈ 2.4 s.
-        let all_bad: Vec<bool> = vec![false; 100];
-        let budget = run_budget(&all_bad, super::FAIL_BUDGET_COST);
-        assert!(
-            budget >= super::FAIL_BUDGET_LIMIT,
-            "Expected budget >= {} after 100 bad frames, got {budget}",
-            super::FAIL_BUDGET_LIMIT
-        );
-    }
-
-    /// Occasional false positives (1 per second) must NOT prevent the limit
-    /// from being reached during sustained signal absence.
-    #[test]
-    fn fail_budget_false_positives_cannot_prevent_reacquisition() {
-        // Pattern: 41 bad + 1 false positive per second.
-        // Net per second: 41*2 - 1 = 81.  Limit hit after ceil(200/81) ≈ 3 s.
-        let mut outcomes: Vec<bool> = Vec::new();
-        for _ in 0..5 {
-            // 5 seconds
-            outcomes.extend(vec![false; 41]);
-            outcomes.push(true); // false positive
-        }
-        let budget = run_budget(&outcomes, super::FAIL_BUDGET_COST);
-        assert!(
-            budget >= super::FAIL_BUDGET_LIMIT,
-            "False positives should not prevent limit; budget={budget}, limit={}",
-            super::FAIL_BUDGET_LIMIT
-        );
-    }
-
-    /// During normal reception (all frames succeed), the budget must stay at 0.
-    #[test]
-    fn fail_budget_good_signal_stays_zero() {
-        let all_good: Vec<bool> = vec![true; 500];
-        let budget = run_budget(&all_good, super::FAIL_BUDGET_COST);
-        assert_eq!(
-            budget, 0,
-            "Budget should saturate at 0 during good reception"
-        );
-    }
-
-    /// Budget must recover to 0 after a brief outage followed by signal return.
-    #[test]
-    fn fail_budget_recovers_after_brief_outage() {
-        // 50 bad frames then 200 good: should drain back to 0.
-        let mut outcomes: Vec<bool> = vec![false; 50];
-        outcomes.extend(vec![true; 200]);
-        let budget = run_budget(&outcomes, super::FAIL_BUDGET_COST);
-        assert_eq!(budget, 0, "Budget should drain to 0 after signal recovery");
+    fn reacq_coarse_target_falls_back_to_zero_without_stable() {
+        let target = OfdmProcessor::select_reacq_coarse_target(None);
+        assert_eq!(target, COARSE_RESET_FALLBACK_HZ);
     }
 }

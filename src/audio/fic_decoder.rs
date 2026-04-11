@@ -330,12 +330,11 @@ impl FicDecoder {
         let oe = (data[0] >> 3) & 0x01;
         let extension = data[0] & 0x07;
 
-        if oe == 1 || charset > 0 {
-            // Only support EBU charset, same ensemble
-            // Simply skip non-EBU for now
-            if charset > 16 {
-                return;
-            }
+        // ETSI EN 300 401 §8.1.13:
+        // - OE=1 carries labels for another ensemble and must be ignored.
+        // - The current decoder supports charset 0 (EBU Latin) only.
+        if oe == 1 || charset != 0 {
+            return;
         }
 
         match extension {
@@ -557,5 +556,129 @@ mod tests {
             "subchid 63 must be accepted"
         );
         assert_eq!(svc.primary_subchid, Some(63));
+    }
+
+    /// ETSI EN 300 401 §8.1.13: OE=1 means "other ensemble".
+    /// We must ignore FIG 1 labels not belonging to the selected ensemble.
+    #[test]
+    fn test_fig1_1_oe_other_ensemble_is_ignored() {
+        let mut dec = FicDecoder::new();
+
+        let mut data = [0u8; 21];
+        data[0] = 0x08 | 0x01; // charset=0, OE=1, extension=1 (service label)
+        data[1] = 0xF2;
+        data[2] = 0x01;
+        data[3] = b'T';
+        data[4] = b'E';
+        data[5] = b'S';
+        data[6] = b'T';
+
+        dec.process_fig1(&data);
+
+        assert!(
+            !dec.services.contains_key(&0xF201),
+            "FIG 1/1 with OE=1 must be ignored"
+        );
+    }
+
+    /// ETSI EN 300 401 §8.1.13: character set is signaled in FIG 1 header.
+    /// This decoder supports charset 0 (EBU Latin) only; other charsets are ignored.
+    #[test]
+    fn test_fig1_1_non_ebu_charset_is_ignored() {
+        let mut dec = FicDecoder::new();
+
+        let mut data = [0u8; 21];
+        data[0] = 0x10 | 0x01; // charset=1, OE=0, extension=1
+        data[1] = 0xF2;
+        data[2] = 0x01;
+        data[3] = b'T';
+        data[4] = b'E';
+        data[5] = b'S';
+        data[6] = b'T';
+
+        dec.process_fig1(&data);
+
+        assert!(
+            !dec.services.contains_key(&0xF201),
+            "FIG 1/1 with non-EBU charset must be ignored"
+        );
+    }
+
+    /// ETSI EN 300 401 §8.1.14.1 + §6.2.2:
+    /// FIG 1/1 label updates must not erase service-component mapping from FIG 0/2.
+    #[test]
+    fn test_fig1_label_update_preserves_fig0_component_mapping() {
+        let mut dec = FicDecoder::new();
+
+        // Seed mapping via FIG 0/2: SId 0xF201 -> primary subchid 5 (DAB+)
+        let fig0_2 = [
+            0xF2,
+            0x01,            // SId
+            0x01,            // one component
+            0x3F,            // tmid=0b00, ascty=63 (DAB+)
+            (5 << 2) | 0x02, // subchid=5, ps=1, ca=0
+        ];
+        dec.process_fig0_2(&fig0_2);
+
+        // Apply label via FIG 1/1 for the same SId.
+        let mut fig1_1 = [0u8; 21];
+        fig1_1[0] = 0x01; // charset=0, OE=0, extension=1
+        fig1_1[1] = 0xF2;
+        fig1_1[2] = 0x01;
+        fig1_1[3] = b'T';
+        fig1_1[4] = b'E';
+        fig1_1[5] = b'S';
+        fig1_1[6] = b'T';
+        dec.process_fig1(&fig1_1);
+
+        let svc = dec.services.get(&0xF201).expect("service must exist");
+        assert_eq!(svc.label, "TEST");
+        assert_eq!(svc.primary_subchid, Some(5));
+        let audio = svc
+            .audio_components
+            .get(&5)
+            .expect("audio component mapping must be preserved");
+        assert!(audio.dab_plus);
+        assert_eq!(audio.subchid, 5);
+    }
+
+    /// ETSI EN 300 401 §8.1.14.1 + §6.2.2:
+    /// If a service is created from FIG 1/1 first, later FIG 0/2 mapping must
+    /// attach components without losing existing labels.
+    #[test]
+    fn test_fig0_mapping_update_preserves_existing_fig1_label() {
+        let mut dec = FicDecoder::new();
+
+        // Create service from FIG 1/1 first.
+        let mut fig1_1 = [0u8; 21];
+        fig1_1[0] = 0x01; // charset=0, OE=0, extension=1
+        fig1_1[1] = 0xF2;
+        fig1_1[2] = 0x01;
+        fig1_1[3] = b'I';
+        fig1_1[4] = b'N';
+        fig1_1[5] = b'T';
+        fig1_1[6] = b'E';
+        fig1_1[7] = b'R';
+        dec.process_fig1(&fig1_1);
+
+        // Add component mapping later via FIG 0/2.
+        let fig0_2 = [
+            0xF2,
+            0x01,            // SId
+            0x01,            // one component
+            0x3F,            // tmid=0b00, ascty=63 (DAB+)
+            (8 << 2) | 0x02, // subchid=8, ps=1, ca=0
+        ];
+        dec.process_fig0_2(&fig0_2);
+
+        let svc = dec.services.get(&0xF201).expect("service must exist");
+        assert_eq!(svc.label, "INTER");
+        assert_eq!(svc.primary_subchid, Some(8));
+        let audio = svc
+            .audio_components
+            .get(&8)
+            .expect("audio component mapping must exist after FIG 0/2");
+        assert!(audio.dab_plus);
+        assert_eq!(audio.subchid, 8);
     }
 }
