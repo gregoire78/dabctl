@@ -218,31 +218,123 @@ src/
 
 ### Thread model
 
-1. **OFDM thread** — reads IQ samples from the RTL-SDR dongle, performs FFT, symbol
-   synchronisation, and frequency interleaving, and sends OFDM blocks to `DabPipeline`
-   via a pre-allocated SPSC ring buffer.
+`dabctl` runs **six threads**. Each stage is decoupled by a bounded channel that acts
+as both a data bus and a back-pressure valve.
 
-2. **DabPipeline thread** — receives OFDM blocks, decodes the FIC (Fast Information
-   Channel), applies CIF time interleaving, and runs Viterbi deconvolution on each
-   subchannel. Emits one `DabFrame` per CIF over a bounded `mpsc` channel (capacity
-   4 frames ≈ 100 ms of back-pressure).
+```mermaid
+flowchart TD
+    HW(["RTL-SDR dongle\n2.048 Msps IQ (USB)"])
 
-3. **Main thread** — consumes `DabFrame` objects, feeds `FicDecoder` for service
-   discovery, drives `SuperframeFilter` → `AacDecoder` for HE-AAC audio, and
-   `PadDecoder` → `PadOutput` for DLS/MOT metadata.
+    subgraph T1["Thread 1 — USB Worker (RtlsdrHandler)"]
+        USB["USB bulk read\nrtl-sdr-rs"]
+        DOC["DC offset correction\nf32 normalisation"]
+        SAGC["Software AGC\nfast-attack / slow-release IIR"]
+        USB --> DOC --> SAGC
+    end
+
+    FIFO[["IqFifo\nMutex&lt;VecDeque&lt;f32&gt;&gt; + Condvar\n~250 ms capacity"]]
+
+    subgraph T2["Thread 2 — OFDM (OfdmProcessor)"]
+        FFT["FFT + symbol sync\nPhaseReference"]
+        IFREQ["Carrier interleaver\nFreqInterleaver"]
+        FFT --> IFREQ
+    end
+
+    SPSC[["SpscRing — lock-free SPSC\ncapacity 512 OFDM blocks\ncache-padded, Condvar wake"]]
+
+    subgraph T3["Thread 3 — DabPipeline"]
+        FIC["FIC Viterbi decode\n+ FIG parsing"]
+        CIF["CIF time-interleaver\n16-frame sliding window"]
+        EEP["EEP / UEP deconvolution\nRayon parallel"]
+        FIC --> CIF --> EEP
+    end
+
+    MPSC_DF[["mpsc::SyncSender&lt;DabFrame&gt;\nbounded capacity 4\n≈ 100 ms back-pressure"]]
+
+    subgraph T4["Thread 4 — Main (audio drain loop)"]
+        FICD["FicDecoder\nservice discovery"]
+        SF["SuperframeFilter\n5 CIFs → RS FEC → Access Units"]
+        AAC["AacDecoder\nHE-AAC via libfaad2 or libfdk-aac"]
+        PAD["PadDecoder + PadOutput\nDLS, MOT slideshow → fd 3"]
+        FICD --> SF --> AAC
+        SF --> PAD
+    end
+
+    MPSC_PCM[["mpsc::SyncSender&lt;Vec&lt;i16&gt;&gt;\nbounded capacity 100\n≈ 4 s buffer"]]
+
+    subgraph T5["Thread 5 — PCM Writer (PcmWriter)"]
+        PCMW["S16LE byte encoding\nstdout write (pre-allocated scratch)"]
+    end
+
+    subgraph T6["Thread 6 — Status Monitor"]
+        MON["1 Hz log: SNR, FIB quality\nsync_ok / sync_fail, freq offset, gain\n5 s dropout detect + WARN"]
+    end
+
+    ATOMS(["Arc&lt;Atomic*&gt;\nrunning, time_synced\nensemble_recognized\nsnr, freq_offset, gain"])
+
+    STDOUT(["stdout\nS16LE 48 kHz stereo"])
+    FD3(["fd 3\nJSON: ensemble / service / DLS / slides"])
+
+    HW -->|"raw U8 bytes (USB)"| T1
+    SAGC -->|"f32 IQ pairs"| FIFO
+    FIFO -->|"Condvar wake"| T2
+    IFREQ -->|"i16 soft-bits"| SPSC
+    SPSC -->|"Condvar wake"| T3
+    EEP -->|"DabFrame"| MPSC_DF
+    MPSC_DF -->|"recv_timeout 50 ms"| T4
+    AAC -->|"Vec&lt;i16&gt;"| MPSC_PCM
+    MPSC_PCM -->|"blocking drain"| T5
+    PCMW -->|"S16LE bytes"| STDOUT
+    PAD -->|"JSON lines"| FD3
+    T1 -. "AtomicBool (running)" .-> ATOMS
+    T2 -. "AtomicI16 (snr)\nAtomicI32 (freq_offset)" .-> ATOMS
+    T3 -. "AtomicI32 (fib ok/total)" .-> ATOMS
+    T4 -. "AtomicBool (running)" .-> ATOMS
+    T6 -. "reads + resets counters" .-> ATOMS
+```
+
+| Thread | Role | Spawned by |
+|---|---|---|
+| **1 — USB Worker** | Reads raw IQ bytes from the RTL-SDR over USB, applies DC offset correction and software AGC (SAGC), and pushes normalised `f32` IQ pairs into `IqFifo`. | `RtlsdrHandler::restart_reader()` |
+| **2 — OFDM** | Reads IQ from `IqFifo`, runs FFT, symbol synchronisation, phase correction, and carrier frequency interleaving (ETSI EN 300 401 §8). Writes `i16` soft-bits into `SpscRing`. | `iq2pcm_cmd::run()` |
+| **3 — DabPipeline** | Reads OFDM soft-bits from `SpscRing`, performs FIC Viterbi decode and FIG parsing, applies the 16-frame CIF time-interleaver, and runs EEP/UEP subchannel deconvolution via Rayon (parallel when more than one sub-channel is active, sequential otherwise to avoid work-stealing overhead). Emits one `DabFrame` per CIF through a bounded `mpsc` channel (capacity 4 ≈ 100 ms of back-pressure). | `DabPipeline::new()` |
+| **4 — Main** | Receives `DabFrame` values through `recv_timeout(50 ms)` so a Ctrl-C can break the loop even when the channel is empty. Drives `FicDecoder` for service discovery, `SuperframeFilter` → Reed-Solomon → `AacDecoder` for HE-AAC (DAB+) audio, and `PadDecoder` → `PadOutput` for DLS and MOT slideshow metadata. Pushes PCM frames non-blocking to `PcmWriter`. | main thread |
+| **5 — PCM Writer** | Owns stdout. Receives owned `Vec<i16>` frames from a bounded channel (capacity 100 ≈ 4 s), converts them to S16LE bytes using a pre-allocated scratch buffer, and writes to stdout. Decouples transient pipe stalls from the audio decode loop, preventing backpressure from reaching the OFDM ring buffer. | `pcm_writer::spawn_pcm_writer()` |
+| **6 — Status Monitor** | Wakes once per second to log SNR, FIB CRC quality, sync_ok/sync_fail counts, frequency offset, and tuner gain. Reads counters from `Arc<Atomic*>` and resets them each tick so values reflect the last 1 s window. Emits a `WARN` after five consecutive seconds where failures outnumber successes. Exits when `run` is cleared by the Ctrl-C handler. | `iq2pcm_cmd::run()` |
+
+### Back-pressure and shutdown
+
+Each channel in the pipeline is **bounded**, so a slow stage blocks its producer
+rather than growing an unbounded queue:
+
+- `IqFifo` (~250 ms) — the USB worker blocks on a Condvar until the OFDM thread drains samples.
+- `SpscRing` (512 slots) — if the DabPipeline thread is slow, the OFDM thread drops the block and logs a warning.
+- `mpsc::SyncSender<DabFrame>` (capacity 4) — the DabPipeline thread blocks until the audio drain loop picks up a frame.
+- `mpsc::SyncSender<Vec<i16>>` (capacity 100) — the audio drain loop drops the frame and logs a warning if the PCM writer is stalled.
+
+On **Ctrl-C** or end-of-record:
+1. `running` and `run` atomics are set to `false` by the Ctrl-C handler.
+2. The status monitor exits its `while run` loop (it does not touch `running`).
+3. The audio drain loop breaks out of `recv_timeout`, then sets `running = false` and `rtlsdr_running = false`.
+4. Setting `rtlsdr_running = false` unblocks the USB worker's `read_sync` call so `RtlsdrHandler::drop` does not stall.
+5. `ofdm_thread.join()` waits for the OFDM thread and DabPipeline to drain.
+
+> **Rayon thread pool** — `DabPipeline` uses Rayon for parallel sub-channel deconvolution.
+> Rayon maintains a global thread pool sized to `num_cpus - 1` by default. On a 4-core device
+> (e.g. Raspberry Pi 4), the total thread count is **6 + 3 = 9**.
 
 ### Data flow
 
 ```
 RTL-SDR (2.048 MHz IQ)
-  └─ RtlsdrHandler (USB → f32 IQ)
-       └─ OfdmProcessor (FFT, symbol sync, carrier interleaving)
-            └─ DabPipeline (FIC + CIF → DabFrame)
-                 ├─ FicDecoder (service discovery via FIG parsing)
-                 └─ SuperframeFilter (5 CIFs → RS FEC → Access Units)
-                      ├─ AacDecoder (HE-AAC) → 16-bit PCM on stdout
+  └─ RtlsdrHandler — USB Worker (Thread 1)
+       └─ OfdmProcessor (Thread 2) — FFT, symbol sync, carrier interleaving
+            └─ DabPipeline (Thread 3) — FIC + CIF → DabFrame
+                 ├─ FicDecoder — service discovery via FIG parsing
+                 └─ SuperframeFilter — 5 CIFs → RS FEC → Access Units
+                      ├─ AacDecoder (HE-AAC) → 16-bit PCM → PcmWriter (Thread 5) → stdout
                       └─ PadDecoder (DLS + MOT slideshow)
-                           └─ PadOutput (JSON events on fd 3)
+                           └─ PadOutput → JSON events on fd 3
 ```
 
 ---
