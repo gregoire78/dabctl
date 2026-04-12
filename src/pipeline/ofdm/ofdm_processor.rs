@@ -18,7 +18,6 @@ use crate::pipeline::ofdm::phase_reference::PhaseReference;
 /// Lower values are more tolerant to fades, higher values reject false locks.
 const OFDM_THRESHOLD_MIN: i16 = 2;
 const OFDM_THRESHOLD_MAX: i16 = 7;
-const COARSE_RESET_FALLBACK_HZ: i32 = 0;
 
 pub struct OfdmProcessor {
     t_null: usize,
@@ -44,10 +43,6 @@ pub struct OfdmProcessor {
     coarse_corrector: i32,
     f2_correction: bool,
     s_level: f32,
-    /// Last `coarse_corrector` value confirmed by a successful first-frame lock.
-    /// Restored at the start of every re-acquisition so that `estimate_offset()`
-    /// running on noise cannot drive the corrector far from the known-good value.
-    last_stable_coarse: Option<i32>,
     running: Arc<AtomicBool>,
     // Callbacks
     sync_signal: Option<Box<dyn Fn(bool) + Send>>,
@@ -63,34 +58,6 @@ pub enum ProcessorError {
 }
 
 impl OfdmProcessor {
-    fn select_reacq_coarse_target(last_stable_coarse: Option<i32>) -> i32 {
-        last_stable_coarse.unwrap_or(COARSE_RESET_FALLBACK_HZ)
-    }
-
-    fn apply_reacq_frequency_reset(&mut self) {
-        // ETSI EN 300 401 §8.4: reset the frequency tracking state when
-        // re-entering acquisition so the scan starts from a deterministic
-        // coarse point and fine AFC restarts from zero.
-        let prev = self.coarse_corrector;
-        let target = Self::select_reacq_coarse_target(self.last_stable_coarse);
-        self.coarse_corrector = target;
-        self.fine_corrector = 0.0;
-
-        if self.last_stable_coarse.is_some() {
-            trace!(
-                prev_hz = prev,
-                restored_hz = target,
-                "OFDM: re-acq — coarse_corrector restored to stable value"
-            );
-        } else {
-            trace!(
-                prev_hz = prev,
-                reset_hz = target,
-                "OFDM: re-acq — coarse_corrector reset (no stable coarse yet)"
-            );
-        }
-    }
-
     pub fn new(dab_mode: u8, threshold_1: i16, threshold_2: i16, running: Arc<AtomicBool>) -> Self {
         let params = DabParams::new(dab_mode);
         let t_u = params.t_u as usize;
@@ -134,7 +101,6 @@ impl OfdmProcessor {
             coarse_corrector: 0,
             f2_correction: true,
             s_level: 0.0,
-            last_stable_coarse: None,
             running,
             sync_signal: None,
             show_snr: None,
@@ -159,15 +125,6 @@ impl OfdmProcessor {
 
     pub fn sync_reached(&mut self) {
         self.f2_correction = false;
-        // Save the current coarse corrector as the last known-good value.
-        // Restored on every subsequent re-acquisition to prevent noise from
-        // driving coarse_corrector far from the correct frequency during fades.
-        self.last_stable_coarse = Some(self.coarse_corrector);
-        trace!(
-            coarse_hz = self.coarse_corrector,
-            fine_hz = self.fine_corrector as i32,
-            "OFDM: first frame locked — stable_coarse saved"
-        );
     }
 
     fn emit_sync_signal(&self, val: bool) {
@@ -270,18 +227,11 @@ impl OfdmProcessor {
 
     /// Demodulate an OFDM data symbol into soft bits (differential QPSK).
     ///
-    /// Soft bits are scaled by the **mean carrier amplitude** of the symbol rather
-    /// than by each carrier's own amplitude.  In a multipath channel, attenuated
-    /// carriers have amplitudes near the noise floor; dividing by their own (tiny)
-    /// amplitude would produce ±127 — false certainty that poisons the Viterbi
-    /// decoder.  Dividing by the symbol mean instead preserves confidence: strong
-    /// carriers produce |ibits| ≈ 127, weak (faded) carriers produce |ibits| ≈ 0.
+    /// Soft bits are scaled per carrier as in eti-cmdline.
     fn process_block(&mut self, inv: &[Complex32], ibits: &mut [i16]) {
         self.fft_buffer[..self.t_u].copy_from_slice(&inv[self.t_g..self.t_g + self.t_u]);
         self.fft.process(&mut self.fft_buffer);
 
-        // Pass 1: compute differential samples and accumulate mean amplitude.
-        let mut sum_ab = 0.0f32;
         for i in 0..self.carriers {
             let mut index = self.freq_interleaver.map_in(i) as i32;
             if index < 0 {
@@ -291,19 +241,14 @@ impl OfdmProcessor {
             let r1 = self.fft_buffer[index] * self.reference_phase[index].conj();
             self.reference_phase[index] = self.fft_buffer[index];
             self.r1_buf[i] = r1;
-            sum_ab += jan_abs(r1);
-        }
-
-        let mean_ab = sum_ab / self.carriers as f32;
-        if mean_ab <= 0.0 {
-            return;
-        }
-
-        // Pass 2: produce soft bits scaled by symbol mean amplitude.
-        for i in 0..self.carriers {
-            let r1 = self.r1_buf[i];
-            ibits[i] = (-r1.re / mean_ab * 127.0).clamp(-127.0, 127.0) as i16;
-            ibits[self.carriers + i] = (-r1.im / mean_ab * 127.0).clamp(-127.0, 127.0) as i16;
+            let ab1 = jan_abs(r1);
+            if ab1 > 0.0 {
+                ibits[i] = (-r1.re / ab1 * 127.0).clamp(-127.0, 127.0) as i16;
+                ibits[self.carriers + i] = (-r1.im / ab1 * 127.0).clamp(-127.0, 127.0) as i16;
+            } else {
+                ibits[i] = 0;
+                ibits[self.carriers + i] = 0;
+            }
         }
     }
 
@@ -340,11 +285,6 @@ impl OfdmProcessor {
             sync_buffer_index = 0;
             current_strength = 0.0;
             self.s_level = 0.0;
-            // Reset the SNR IIR on every re-entry to notSynced so that stale
-            // pre-dropout values are never carried forward into the next sync.
-            snr = 0.0;
-            snr_count = 0;
-
             if self
                 .discard_samples(device, self.t_f, &mut block_buf)
                 .is_err()
@@ -362,8 +302,8 @@ impl OfdmProcessor {
                 sync_buffer_index += 1;
             }
 
-            // Fixed thresholds (ETSI EN 300 401 §8.4): acquire with threshold_1,
-            // then track with threshold_2. No adaptive tighten/relax heuristics.
+            // ETSI EN 300 401 §8.4: acquisition and tracking use configured
+            // fixed phase-correlation thresholds.
             let acq_threshold = self
                 .threshold_1
                 .clamp(OFDM_THRESHOLD_MIN, OFDM_THRESHOLD_MAX);
@@ -446,11 +386,8 @@ impl OfdmProcessor {
             // Synchronized - enter the main frame processing loop
             let mut start_index = start_index as usize;
 
-            // Re-enable coarse AFC for the initial frames of each new sync
-            // acquisition. sync_reached() will disable it once the first
-            // frame has been decoded correctly.
+            // Re-enable coarse AFC for each new acquisition cycle.
             self.f2_correction = true;
-            self.apply_reacq_frequency_reset();
 
             let mut first_frame = true;
             loop {
@@ -570,17 +507,7 @@ impl OfdmProcessor {
                         .phase_synchronizer
                         .find_index(&check_buf, track_threshold);
                     if idx < 0 {
-                        trace!(
-                            coarse_hz = self.coarse_corrector,
-                            fine_hz = self.fine_corrector as i32,
-                            snr = snr as i16,
-                            "OFDM: tracking miss — returning to notSynced"
-                        );
-                        // Reset SNR immediately so the status display shows
-                        // signal loss rather than the stale IIR value.
-                        snr = 0.0;
-                        snr_count = 0;
-                        self.emit_snr(0);
+                        trace!("OFDM: tracking miss — returning to notSynced");
                         break; // Lost sync, go back to notSynced
                     } else {
                         idx as usize
@@ -598,22 +525,5 @@ impl OfdmProcessor {
                 }
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{OfdmProcessor, COARSE_RESET_FALLBACK_HZ};
-
-    #[test]
-    fn reacq_coarse_target_uses_stable_when_present() {
-        let target = OfdmProcessor::select_reacq_coarse_target(Some(-372));
-        assert_eq!(target, -372);
-    }
-
-    #[test]
-    fn reacq_coarse_target_falls_back_to_zero_without_stable() {
-        let target = OfdmProcessor::select_reacq_coarse_target(None);
-        assert_eq!(target, COARSE_RESET_FALLBACK_HZ);
     }
 }
