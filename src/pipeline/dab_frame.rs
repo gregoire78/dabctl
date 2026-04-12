@@ -9,12 +9,6 @@
 /// - Subchannels: one `SubchannelFrame` per active sub-channel        (§7)
 use std::sync::Arc;
 
-use smallvec::SmallVec;
-
-/// Maximum active sub-channels in a typical DAB multiplex.
-/// Using inline storage up to 8 avoids heap allocation for most real-world ensembles.
-const INLINE_SUBCH: usize = 8;
-
 /// In-memory representation of one DAB frame post-Viterbi post-protection.
 ///
 /// Sent from `DabPipeline` (OFDM thread) to the audio thread via a bounded channel.
@@ -31,8 +25,7 @@ pub struct DabFrame {
     pub cif_count_lo: u8,
 
     /// Active sub-channels in this frame.
-    /// Typical ensembles carry 6–12 sub-channels; inline storage avoids heap allocation.
-    pub subchannels: SmallVec<[SubchannelFrame; INLINE_SUBCH]>,
+    pub subchannels: Vec<SubchannelFrame>,
 
     /// Set to `true` when the OFDM frame sequencer detected a block sequence
     /// discontinuity (`SyncLost`) immediately before this frame was assembled.
@@ -53,7 +46,7 @@ impl DabFrame {
             fic_data: Box::new(fic_data),
             cif_count_hi,
             cif_count_lo,
-            subchannels: SmallVec::new(),
+            subchannels: Vec::new(),
             sync_lost: false,
         }
     }
@@ -127,19 +120,13 @@ mod tests {
         }
     }
 
-    // ── SmallVec inline storage ───────────────────────────────────────────────
-
     #[test]
-    fn small_vec_stays_on_stack_for_eight_subchannels() {
+    fn subchannels_holds_eight_entries() {
         let mut frame = DabFrame::new([0u8; 96], 0, 0);
         for id in 0u8..8 {
             let data: Arc<[u8]> = Arc::from(vec![id; 4].as_slice());
             frame.push_subchannel(id, data);
         }
-        assert!(
-            !frame.subchannels.spilled(),
-            "SmallVec must not spill for 8 sub-channels"
-        );
         assert_eq!(frame.subchannels.len(), 8);
     }
 
