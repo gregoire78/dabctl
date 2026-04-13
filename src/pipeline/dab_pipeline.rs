@@ -10,7 +10,7 @@
 //   which compiles with `__PARALLEL__ 0`).
 // - `Vec<SubchannelFrame>` replaces `SmallVec` — no external dependency.
 
-use tracing::warn;
+use tracing::{trace, warn};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, TrySendError};
@@ -328,6 +328,7 @@ impl DabPipeline {
                     cif_count_lo = lo;
                     if let Some(ref cb) = fic_quality_cb {
                         let (success, total) = my_fic_handler.get_fic_counts();
+                        trace!(fic_ok = success, fic_total = total, "FIC frame decoded");
                         cb(success, total);
                     }
                 }
