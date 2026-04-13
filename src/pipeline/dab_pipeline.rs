@@ -857,4 +857,56 @@ mod tests {
             temp[15]
         );
     }
+
+    // ── DabPipeline construction and processing_flag ──────────────────────────
+
+    /// `DabPipeline::new` must not panic when all callbacks are `None`.
+    #[test]
+    fn pipeline_new_without_callbacks_does_not_panic() {
+        let (tx, _rx) = mpsc::sync_channel(4);
+        let _p = DabPipeline::new(1, tx, None, None, None);
+    }
+
+    /// `processing_flag` must start `false` — the pipeline should not process
+    /// FIC/CIF data until explicitly enabled by the caller.
+    #[test]
+    fn processing_flag_starts_false() {
+        let (tx, _rx) = mpsc::sync_channel(4);
+        let p = DabPipeline::new(1, tx, None, None, None);
+        assert!(
+            !p.processing_flag().load(Ordering::SeqCst),
+            "processing_flag must start false"
+        );
+    }
+
+    /// The caller must be able to set `processing_flag` to `true` via the
+    /// returned `Arc<AtomicBool>`.
+    #[test]
+    fn processing_flag_can_be_set_to_true() {
+        let (tx, _rx) = mpsc::sync_channel(4);
+        let p = DabPipeline::new(1, tx, None, None, None);
+        p.processing_flag().store(true, Ordering::SeqCst);
+        assert!(
+            p.processing_flag().load(Ordering::SeqCst),
+            "processing_flag must reflect the stored value"
+        );
+    }
+
+    /// The `FicQualityCb` must be wired through `DabPipeline::new` and invoked
+    /// by the pipeline thread when a FIC frame is processed at blkno==4.
+    /// This test verifies the callback arc is accepted without panicking.
+    #[test]
+    fn pipeline_accepts_fic_quality_callback() {
+        use std::sync::atomic::AtomicI32;
+        let (tx, _rx) = mpsc::sync_channel(4);
+        let count = Arc::new(AtomicI32::new(0));
+        let count2 = count.clone();
+        let cb: FicQualityCb = Some(Arc::new(move |_success, _total| {
+            count2.fetch_add(1, Ordering::Relaxed);
+        }));
+        // Construction must succeed; the callback is only invoked from run_loop,
+        // which we do not drive here, so count stays 0.
+        let _p = DabPipeline::new(1, tx, None, None, cb);
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+    }
 }

@@ -543,3 +543,129 @@ impl OfdmProcessor {
         } // outer acquisition loop
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicI16, AtomicI32, Ordering};
+    use std::sync::Arc;
+
+    fn make_processor(mode: u8) -> OfdmProcessor {
+        OfdmProcessor::new(mode, 2, 5, Arc::new(AtomicBool::new(true)))
+    }
+
+    // ── Construction ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn new_mode1_does_not_panic() {
+        let _p = make_processor(1);
+    }
+
+    #[test]
+    fn new_mode2_does_not_panic() {
+        let _p = make_processor(2);
+    }
+
+    #[test]
+    fn new_mode3_does_not_panic() {
+        let _p = make_processor(3);
+    }
+
+    #[test]
+    fn new_mode4_does_not_panic() {
+        let _p = make_processor(4);
+    }
+
+    // ── Callback wiring: sync_signal ─────────────────────────────────────────
+
+    #[test]
+    fn sync_signal_fires_true_when_emitted() {
+        let mut p = make_processor(1);
+        let fired = Arc::new(AtomicBool::new(false));
+        let fired2 = fired.clone();
+        p.set_sync_signal(move |v| fired2.store(v, Ordering::SeqCst));
+        p.emit_sync_signal(true);
+        assert!(fired.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn sync_signal_fires_false_when_emitted() {
+        let mut p = make_processor(1);
+        let fired = Arc::new(AtomicBool::new(true));
+        let fired2 = fired.clone();
+        p.set_sync_signal(move |v| fired2.store(v, Ordering::SeqCst));
+        p.emit_sync_signal(false);
+        assert!(!fired.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn no_sync_callback_does_not_panic() {
+        let p = make_processor(1);
+        p.emit_sync_signal(true); // must not panic
+    }
+
+    // ── Callback wiring: show_snr ────────────────────────────────────────────
+
+    #[test]
+    fn snr_signal_fires_with_correct_value() {
+        let mut p = make_processor(1);
+        let last_snr = Arc::new(AtomicI16::new(0));
+        let last2 = last_snr.clone();
+        p.set_show_snr(move |v| last2.store(v, Ordering::SeqCst));
+        p.emit_snr(42);
+        assert_eq!(last_snr.load(Ordering::SeqCst), 42);
+    }
+
+    #[test]
+    fn no_snr_callback_does_not_panic() {
+        let p = make_processor(1);
+        p.emit_snr(10); // must not panic
+    }
+
+    // ── Callback wiring: show_freq_offset ────────────────────────────────────
+
+    #[test]
+    fn freq_offset_signal_fires_with_correct_value() {
+        let mut p = make_processor(1);
+        let last = Arc::new(AtomicI32::new(0));
+        let last2 = last.clone();
+        p.set_show_freq_offset(move |v| last2.store(v, Ordering::SeqCst));
+        p.emit_freq_offset(-1234);
+        assert_eq!(last.load(Ordering::SeqCst), -1234);
+    }
+
+    #[test]
+    fn no_freq_offset_callback_does_not_panic() {
+        let p = make_processor(1);
+        p.emit_freq_offset(500); // must not panic
+    }
+
+    // ── sync_reached ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn f2_correction_starts_enabled() {
+        let p = make_processor(1);
+        assert!(p.f2_correction, "f2_correction must start enabled");
+    }
+
+    #[test]
+    fn sync_reached_disables_f2_correction() {
+        let mut p = make_processor(1);
+        p.sync_reached();
+        assert!(!p.f2_correction, "f2_correction must be disabled after sync_reached()");
+    }
+
+    // ── Initial frequency state ───────────────────────────────────────────────
+
+    #[test]
+    fn fine_corrector_starts_at_zero() {
+        let p = make_processor(1);
+        assert_eq!(p.fine_corrector, 0.0);
+    }
+
+    #[test]
+    fn coarse_corrector_starts_at_zero() {
+        let p = make_processor(1);
+        assert_eq!(p.coarse_corrector, 0);
+    }
+}

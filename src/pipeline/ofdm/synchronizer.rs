@@ -261,4 +261,124 @@ mod tests {
             "false_sync_pending should be true after 5 consecutive timeouts"
         );
     }
+
+    // ── reset ─────────────────────────────────────────────────────────────────
+
+    /// `reset` must zero the sliding-window strength and counter so that the
+    /// next acquisition attempt starts from a clean state.
+    #[test]
+    fn reset_clears_strength_and_counter() {
+        let mut state = SyncState::new(200_000, 2_656);
+        for _ in 0..SLIDING_WINDOW {
+            state.prefill(1.0);
+        }
+        // current_strength is now 50.0; reset should drop it back to 0.
+        state.reset();
+        assert_eq!(
+            state.current_strength, 0.0,
+            "current_strength must be zero after reset"
+        );
+        assert_eq!(state.counter, 0, "counter must be zero after reset");
+    }
+
+    /// After `reset`, the sliding window is empty; the phase must be
+    /// `SeekingNull` so the first `detect_null` call looks for a null symbol.
+    #[test]
+    fn reset_restores_seeking_null_phase() {
+        let mut state = SyncState::new(200_000, 2_656);
+        for _ in 0..SLIDING_WINDOW {
+            state.prefill(1.0);
+        }
+        // Manually drive to SeekingEndOfNull.
+        for _ in 0..60 {
+            if matches!(state.detect_null(0.0, 1.0), NullState::NullFound) {
+                break;
+            }
+        }
+        state.reset();
+        // After reset, prefill with a strong signal so the window is full.
+        for _ in 0..SLIDING_WINDOW {
+            state.prefill(2.0);
+        }
+        // A strong signal (current_strength/50 = 2.0 >> 0.5 × s_level = 0.5)
+        // must NOT trigger NullFound — the state machine is correctly in SeekingNull.
+        assert_eq!(
+            state.detect_null(2.0, 1.0),
+            NullState::Searching,
+            "state after reset+prefill must be SeekingNull (Searching on strong signal)"
+        );
+    }
+
+    // ── prefill ───────────────────────────────────────────────────────────────
+
+    /// `prefill` must accumulate amplitude into `current_strength`.
+    #[test]
+    fn prefill_accumulates_strength() {
+        let mut state = SyncState::new(200_000, 2_656);
+        for _ in 0..SLIDING_WINDOW {
+            state.prefill(2.0);
+        }
+        // After 50 prefill calls with amplitude 2.0: current_strength = 100.0.
+        assert!(
+            (state.current_strength - 100.0).abs() < 1e-3,
+            "current_strength after 50×2.0 prefill should be ≈100.0, got {}",
+            state.current_strength
+        );
+    }
+
+    // ── false_sync_pending ────────────────────────────────────────────────────
+
+    /// `false_sync_pending` must return `true` exactly once after the 5th
+    /// consecutive timeout and then revert to `false` (consuming the flag).
+    #[test]
+    fn false_sync_pending_is_consumed_after_read() {
+        let mut state = SyncState::new(10, 20);
+        for _ in 0..SLIDING_WINDOW {
+            state.prefill(1.0);
+        }
+        // Drive 5 × (t_f+1) timeouts.
+        for _ in 0..(5 * 11) {
+            state.detect_null(1.0, 1.0);
+        }
+        let first = state.false_sync_pending();
+        let second = state.false_sync_pending();
+        assert!(first, "flag must be true on first read after 5 timeouts");
+        assert!(!second, "flag must be false (consumed) on second read");
+    }
+
+    // ── end-of-null timeout ───────────────────────────────────────────────────
+
+    /// When the signal stays silent after a NullFound, the end-of-null counter
+    /// must eventually expire and return `Timeout`.
+    #[test]
+    fn end_of_null_timeout_when_signal_stays_quiet() {
+        // t_null=20: end-of-null counter expires after t_null + SLIDING_WINDOW calls.
+        let mut state = SyncState::new(200_000, 20);
+        for _ in 0..SLIDING_WINDOW {
+            state.prefill(1.0);
+        }
+
+        // Find NullFound by driving amplitude to zero.
+        let mut found_null = false;
+        for _ in 0..200 {
+            if matches!(state.detect_null(0.0, 1.0), NullState::NullFound) {
+                found_null = true;
+                break;
+            }
+        }
+        assert!(found_null, "NullFound must fire first");
+
+        // Keep feeding zero amplitude; eventually the end-of-null timer expires.
+        let mut got_timeout = false;
+        for _ in 0..(20 + SLIDING_WINDOW + 10) {
+            if matches!(state.detect_null(0.0, 1.0), NullState::Timeout) {
+                got_timeout = true;
+                break;
+            }
+        }
+        assert!(
+            got_timeout,
+            "Timeout must fire when end-of-null window is exhausted"
+        );
+    }
 }
