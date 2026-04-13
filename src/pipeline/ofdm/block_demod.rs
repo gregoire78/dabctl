@@ -85,6 +85,29 @@ impl BlockDemod {
     pub fn r1_buf(&self) -> &[Complex32] {
         &self.r1_buf
     }
+
+    /// Mutable access to post-differential symbols (for in-place equalisation).
+    pub fn r1_buf_mut(&mut self) -> &mut [Complex32] {
+        &mut self.r1_buf
+    }
+
+    /// Regenerate soft bits from the current `r1_buf`.
+    ///
+    /// Call this after in-place equalisation of `r1_buf_mut()` to propagate
+    /// the equalised symbols to `ibits` without re-running differential demod.
+    pub fn recompute_ibits(&self, ibits: &mut [i16]) {
+        for i in 0..self.carriers {
+            let r1 = self.r1_buf[i];
+            let ab1 = jan_abs(r1);
+            if ab1 > 0.0 {
+                ibits[i] = (-r1.re / ab1 * 127.0).clamp(-127.0, 127.0) as i16;
+                ibits[self.carriers + i] = (-r1.im / ab1 * 127.0).clamp(-127.0, 127.0) as i16;
+            } else {
+                ibits[i] = 0;
+                ibits[self.carriers + i] = 0;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
