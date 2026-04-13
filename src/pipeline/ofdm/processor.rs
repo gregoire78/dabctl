@@ -528,7 +528,7 @@ impl OfdmProcessor {
                         .phase_synchronizer
                         .find_index(&check_buf, track_threshold);
                     if idx < 0 {
-                        trace!(frames = inner_frame_count, "OFDM: tracking miss");
+                        trace!(frames = inner_frame_count, "OFDM: PRS correlation miss");
                         break;
                     }
                     idx as usize
