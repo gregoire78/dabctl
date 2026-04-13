@@ -12,10 +12,8 @@ use crate::pipeline::dab_constants::{jan_abs, DIFF_LENGTH, INPUT_RATE};
 use crate::pipeline::dab_params::DabParams;
 use crate::pipeline::dab_pipeline::DabPipeline;
 use crate::pipeline::ofdm::block_demod::BlockDemod;
-use crate::pipeline::ofdm::equalizer::Equalizer;
 use crate::pipeline::ofdm::fft_engine::FftEngine;
 use crate::pipeline::ofdm::freq_interleaver::FreqInterleaver;
-use crate::pipeline::ofdm::mer;
 use crate::pipeline::ofdm::nco::Nco;
 use crate::pipeline::ofdm::phase_reference::PhaseReference;
 use crate::pipeline::ofdm::synchronizer::{NullState, SyncState};
@@ -24,16 +22,12 @@ use crate::pipeline::ofdm::synchronizer::{NullState, SyncState};
 const OFDM_THRESHOLD_MIN: i16 = 2;
 const OFDM_THRESHOLD_MAX: i16 = 7;
 
-/// LMS equalizer step size — chosen conservatively to avoid instability.
-const EQUALIZER_MU: f32 = 0.01;
-
 /// Refactored OFDM processor.
 ///
 /// Each logical concern is delegated to a focused sub-module:
 /// - [`Nco`]        — frequency correction
 /// - [`FftEngine`]  — FFT with buffer reuse
 /// - [`BlockDemod`] — differential QPSK per symbol
-/// - [`Equalizer`]  — LMS per-carrier channel equalisation
 /// - [`SyncState`]  — null-symbol detection state machine
 /// - [`PhaseReference`] — PRS correlation and coarse AFC
 pub struct OfdmProcessor {
@@ -56,7 +50,6 @@ pub struct OfdmProcessor {
     nco: Nco,
     fft_engine: FftEngine,
     block_demod: BlockDemod,
-    equalizer: Equalizer,
     sync_state: SyncState,
 
     // ── Pre-computed lookup tables (allocated once) ───────────────────────────
@@ -66,10 +59,8 @@ pub struct OfdmProcessor {
     freq_map_adjusted: Vec<usize>,
 
     // ── Per-call reuse buffers (zero-allocation hot path) ─────────────────────
-    /// Full FFT output / equalizer write-back target (t_u complex values).
-    eq_buf: Vec<Complex32>,
-    /// Carrier-space scratch buffer for the equalizer (carriers complex values).
-    carrier_buf: Vec<Complex32>,
+    /// Full FFT output buffer (t_u complex values).
+    fft_buf: Vec<Complex32>,
     /// PRS / guard-stripping buffer (t_u complex values).
     ofdm_buffer: Vec<Complex32>,
 
@@ -140,12 +131,10 @@ impl OfdmProcessor {
             nco: Nco::new(),
             fft_engine: FftEngine::new_forward(t_u),
             block_demod: BlockDemod::new(carriers, t_u),
-            equalizer: Equalizer::new(carriers, EQUALIZER_MU),
             sync_state: SyncState::new(t_f, t_null),
             freq_map,
             freq_map_adjusted,
-            eq_buf: vec![Complex32::new(0.0, 0.0); t_u],
-            carrier_buf: vec![Complex32::new(0.0, 0.0); carriers],
+            fft_buf: vec![Complex32::new(0.0, 0.0); t_u],
             ofdm_buffer: vec![Complex32::new(0.0, 0.0); t_u],
             fine_corrector: 0.0,
             coarse_corrector: 0,
@@ -249,35 +238,18 @@ impl OfdmProcessor {
 
     // ── Block processing ──────────────────────────────────────────────────────
 
-    /// FFT the guard-stripped symbol, equalise carrier bins, set block-0 reference.
-    /// FFT one data block (guard-stripped), equalise, and demodulate to soft bits.
+    /// FFT one data block (guard-stripped) and demodulate to soft bits.
     ///
     /// `block` must be at least `t_s` samples long; the first `t_g` are the guard.
     fn process_data_block(&mut self, block: &[Complex32], ibits: &mut [i16]) {
-        // Strip cyclic prefix, run FFT into eq_buf.
+        // Strip cyclic prefix, run FFT.
         self.fft_engine
-            .process_into(&block[self.t_g..self.t_g + self.t_u], &mut self.eq_buf);
-
-        // Equalise carrier bins.
-        self.extract_and_equalize();
+            .process_into(&block[self.t_g..self.t_g + self.t_u], &mut self.fft_buf);
 
         // Differential QPSK demodulation.
-        // NLL splits the borrow: &mut block_demod, &eq_buf, &freq_map are disjoint fields.
         let t_u = self.t_u;
         self.block_demod
-            .process(&self.eq_buf, &self.freq_map, t_u, ibits);
-    }
-
-    /// Extract carrier bins from `eq_buf` into `carrier_buf`, apply LMS
-    /// equalisation, and write the equalized values back to `eq_buf`.
-    fn extract_and_equalize(&mut self) {
-        for (i, &bin) in self.freq_map_adjusted.iter().enumerate() {
-            self.carrier_buf[i] = self.eq_buf[bin];
-        }
-        self.equalizer.equalize(&mut self.carrier_buf);
-        for (i, &bin) in self.freq_map_adjusted.iter().enumerate() {
-            self.eq_buf[bin] = self.carrier_buf[i];
-        }
+            .process(&self.fft_buf, &self.freq_map, t_u, ibits);
     }
 
     // ── Main run loop ─────────────────────────────────────────────────────────
@@ -291,8 +263,6 @@ impl OfdmProcessor {
         let mut ibits = vec![0i16; 2 * self.carriers];
         let mut snr: f32 = 0.0;
         let mut snr_count = 0i32;
-        let mut mer_acc = 0.0f32;
-        let mut mer_count = 0u32;
 
         // Allocate per-frame scratch buffers (no hot-path allocation after this point).
         let mut null_buf = vec![Complex32::new(0.0, 0.0); self.t_null];
@@ -415,12 +385,11 @@ impl OfdmProcessor {
 
                 // ── Block 0 (PRS): FFT → set DQPSK reference ─────────────────
                 // Inline to allow NLL to split borrows across disjoint fields
-                // (ofdm_buffer, fft_engine, eq_buf, block_demod are all separate).
+                // (ofdm_buffer, fft_engine, fft_buf, block_demod are all separate).
                 let t_u = self.t_u;
                 self.fft_engine
-                    .process_into(&self.ofdm_buffer[..t_u], &mut self.eq_buf);
-                self.extract_and_equalize();
-                self.block_demod.set_reference_from_fft(&self.eq_buf);
+                    .process_into(&self.ofdm_buffer[..t_u], &mut self.fft_buf);
+                self.block_demod.set_reference_from_fft(&self.fft_buf);
 
                 // Coarse AFC from PRS (disabled once sync is confirmed).
                 if self.f2_correction {
@@ -456,10 +425,6 @@ impl OfdmProcessor {
                     }
                     self.process_data_block(&block_buf, &mut ibits);
                     eti_generator.process_block(&ibits, symbol_count as i16);
-
-                    // Accumulate MER from post-differential symbols.
-                    mer_acc += mer::estimate_mer(self.block_demod.r1_buf());
-                    mer_count += 1;
                 }
 
                 // Fine frequency update from cyclic-prefix correlation.
@@ -485,16 +450,9 @@ impl OfdmProcessor {
                 snr_count += 1;
                 if snr_count > 10 {
                     snr_count = 0;
-                    let avg_mer = if mer_count > 0 {
-                        mer_acc / mer_count as f32
-                    } else {
-                        0.0
-                    };
-                    self.emit_snr((snr + avg_mer) as i16);
+                    self.emit_snr(snr as i16);
                     let offset_hz = self.coarse_corrector + self.fine_corrector as i32;
                     self.emit_freq_offset(offset_hz);
-                    mer_acc = 0.0;
-                    mer_count = 0;
                 }
 
                 // ── Fine → coarse carrier wrap ────────────────────────────────
