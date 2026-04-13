@@ -159,6 +159,9 @@ pub fn run(args: Iq2pcmArgs) {
     // sync_ok/sync_fail instead of just the last individual frame.
     let fic_ok = Arc::new(AtomicI32::new(0));
     let fic_total = Arc::new(AtomicI32::new(0));
+    // Counts FIC frames delivered to DabPipeline per second.
+    // Distinguishes fib_quality=0 due to "no frames received" from "frames received, all CRC failures".
+    let fic_frames = Arc::new(AtomicI32::new(0));
     let run = Arc::new(AtomicBool::new(false));
 
     let running_ctrlc = running.clone();
@@ -218,10 +221,12 @@ pub fn run(args: Iq2pcmArgs) {
         }));
     let fok = fic_ok.clone();
     let ftot = fic_total.clone();
+    let ffr = fic_frames.clone();
     let fic_quality_cb: Option<std::sync::Arc<dyn Fn(i16, i16) + Send + Sync>> =
         Some(std::sync::Arc::new(move |success: i16, total: i16| {
             fok.fetch_add(i32::from(success), Ordering::Relaxed);
             ftot.fetch_add(i32::from(total), Ordering::Relaxed);
+            ffr.fetch_add(1, Ordering::Relaxed);
         }));
 
     let pipeline = DabPipeline::new(1, frame_tx, ensemble_cb, program_cb, fic_quality_cb);
@@ -358,6 +363,7 @@ pub fn run(args: Iq2pcmArgs) {
     let sn2 = signal_noise.clone();
     let fs2_ok = fic_ok.clone();
     let fs2_total = fic_total.clone();
+    let fs2_frames = fic_frames.clone();
     let c_fo = freq_offset_hz.clone();
     let c_fi = frames_in.clone();
     let c_fns = frames_no_subch.clone();
@@ -390,6 +396,7 @@ pub fn run(args: Iq2pcmArgs) {
             let sld = c_sld.swap(0, Ordering::SeqCst);
             let fib_ok = fs2_ok.swap(0, Ordering::SeqCst);
             let fib_tot = fs2_total.swap(0, Ordering::SeqCst);
+            let fib_frames = fs2_frames.swap(0, Ordering::SeqCst);
             let fib_quality = if fib_tot > 0 {
                 fib_ok * 100 / fib_tot
             } else {
@@ -421,6 +428,7 @@ pub fn run(args: Iq2pcmArgs) {
             debug!(
                 snr = sn2.load(Ordering::SeqCst),
                 fib_quality,
+                fib_frames,
                 frames = fi,
                 no_subch = fns,
                 sync_ok = sok,

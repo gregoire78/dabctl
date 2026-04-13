@@ -5,7 +5,7 @@ use num_complex::Complex32;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use tracing::trace;
+use tracing::{debug, trace};
 
 use crate::device::rtlsdr_handler::RtlsdrHandler;
 use crate::pipeline::dab_constants::{jan_abs, DIFF_LENGTH, INPUT_RATE};
@@ -376,14 +376,30 @@ impl OfdmProcessor {
                 continue;
             }
             let mut start_index = start_index as usize;
+            debug!(
+                start_index,
+                s_level = self.s_level,
+                coarse_hz = self.coarse_corrector,
+                fine_hz = self.fine_corrector as i32,
+                "OFDM: acquisition succeeded"
+            );
             self.f2_correction = true;
             let mut first_frame = true;
+            let mut inner_frame_count: u32 = 0;
 
             // ── Inner tracking loop ────────────────────────────────────────────
             loop {
                 // Align ofdm_buffer to the PRS boundary.
                 let remaining = self.t_u - start_index;
                 self.ofdm_buffer.copy_within(start_index..self.t_u, 0);
+
+                inner_frame_count += 1;
+                trace!(
+                    frame = inner_frame_count,
+                    start_index,
+                    s_level = self.s_level,
+                    "OFDM: frame"
+                );
 
                 eti_generator.new_frame();
 
@@ -459,6 +475,12 @@ impl OfdmProcessor {
                 // SNR from null-symbol noise floor vs. long-term signal level.
                 let null_mean = null_buf.iter().map(|s| s.norm()).sum::<f32>() / self.t_null as f32;
                 snr = 0.9 * snr + 0.1 * 20.0 * ((self.s_level + 0.005) / null_mean).log10();
+                trace!(
+                    s_level = self.s_level,
+                    null_mean,
+                    snr_db = snr,
+                    "OFDM: SNR sample"
+                );
 
                 snr_count += 1;
                 if snr_count > 10 {
@@ -506,7 +528,7 @@ impl OfdmProcessor {
                         .phase_synchronizer
                         .find_index(&check_buf, track_threshold);
                     if idx < 0 {
-                        trace!("OFDM: tracking miss");
+                        trace!(frames = inner_frame_count, "OFDM: tracking miss");
                         break;
                     }
                     idx as usize
