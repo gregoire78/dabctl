@@ -55,8 +55,6 @@ pub struct OfdmProcessor {
     // ── Pre-computed lookup tables (allocated once) ───────────────────────────
     /// Carrier-to-FFT-bin map (signed, as returned by FreqInterleaver).
     freq_map: Vec<i16>,
-    /// Carrier-to-FFT-bin map adjusted to the range 0..t_u.
-    freq_map_adjusted: Vec<usize>,
 
     // ── Per-call reuse buffers (zero-allocation hot path) ─────────────────────
     /// Full FFT output buffer (t_u complex values).
@@ -102,19 +100,8 @@ impl OfdmProcessor {
         let phase_synchronizer =
             PhaseReference::new(t_u, carriers, params.dab_mode, DIFF_LENGTH as usize);
 
-        // Pre-compute carrier→bin lookup tables once.
+        // Pre-compute carrier→bin lookup table once.
         let freq_map: Vec<i16> = (0..carriers).map(|i| freq_interleaver.map_in(i)).collect();
-        let freq_map_adjusted: Vec<usize> = freq_map
-            .iter()
-            .map(|&v| {
-                let idx = v as i32;
-                if idx < 0 {
-                    (idx + t_u as i32) as usize
-                } else {
-                    idx as usize
-                }
-            })
-            .collect();
 
         OfdmProcessor {
             t_null,
@@ -133,7 +120,6 @@ impl OfdmProcessor {
             block_demod: BlockDemod::new(carriers, t_u),
             sync_state: SyncState::new(t_f, t_null),
             freq_map,
-            freq_map_adjusted,
             fft_buf: vec![Complex32::new(0.0, 0.0); t_u],
             ofdm_buffer: vec![Complex32::new(0.0, 0.0); t_u],
             fine_corrector: 0.0,
