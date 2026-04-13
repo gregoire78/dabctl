@@ -12,11 +12,16 @@ use crate::pipeline::dab_constants::{jan_abs, DIFF_LENGTH, INPUT_RATE};
 use crate::pipeline::dab_params::DabParams;
 use crate::pipeline::dab_pipeline::DabPipeline;
 use crate::pipeline::ofdm::block_demod::BlockDemod;
+use crate::pipeline::ofdm::equalizer::Equalizer;
 use crate::pipeline::ofdm::fft_engine::FftEngine;
 use crate::pipeline::ofdm::freq_interleaver::FreqInterleaver;
+use crate::pipeline::ofdm::mer::estimate_mer;
 use crate::pipeline::ofdm::nco::Nco;
 use crate::pipeline::ofdm::phase_reference::PhaseReference;
 use crate::pipeline::ofdm::synchronizer::{NullState, SyncState};
+
+/// LMS step size for the decision-directed channel equalizer.
+const EQUALIZER_MU: f32 = 0.01;
 
 /// Acquisition / tracking detection thresholds (inclusive bounds).
 const OFDM_THRESHOLD_MIN: i16 = 2;
@@ -50,6 +55,7 @@ pub struct OfdmProcessor {
     nco: Nco,
     fft_engine: FftEngine,
     block_demod: BlockDemod,
+    equalizer: Equalizer,
     sync_state: SyncState,
 
     // ── Pre-computed lookup tables (allocated once) ───────────────────────────
@@ -118,6 +124,7 @@ impl OfdmProcessor {
             nco: Nco::new(),
             fft_engine: FftEngine::new_forward(t_u),
             block_demod: BlockDemod::new(carriers, t_u),
+            equalizer: Equalizer::new(carriers, EQUALIZER_MU),
             sync_state: SyncState::new(t_f, t_null),
             freq_map,
             fft_buf: vec![Complex32::new(0.0, 0.0); t_u],
@@ -224,7 +231,8 @@ impl OfdmProcessor {
 
     // ── Block processing ──────────────────────────────────────────────────────
 
-    /// FFT one data block (guard-stripped) and demodulate to soft bits.
+    /// FFT one data block (guard-stripped), demodulate to soft bits, and
+    /// apply the LMS equalizer on the post-differential symbols.
     ///
     /// `block` must be at least `t_s` samples long; the first `t_g` are the guard.
     fn process_data_block(&mut self, block: &[Complex32], ibits: &mut [i16]) {
@@ -232,10 +240,16 @@ impl OfdmProcessor {
         self.fft_engine
             .process_into(&block[self.t_g..self.t_g + self.t_u], &mut self.fft_buf);
 
-        // Differential QPSK demodulation.
+        // Differential QPSK demodulation → fills r1_buf and ibits.
         let t_u = self.t_u;
         self.block_demod
             .process(&self.fft_buf, &self.freq_map, t_u, ibits);
+
+        // Channel equalisation on post-differential symbols (LMS, per carrier).
+        self.equalizer.equalize(self.block_demod.r1_buf_mut());
+
+        // Regenerate soft bits from the equalised symbols.
+        self.block_demod.recompute_ibits(ibits);
     }
 
     // ── Main run loop ─────────────────────────────────────────────────────────
@@ -249,6 +263,8 @@ impl OfdmProcessor {
         let mut ibits = vec![0i16; 2 * self.carriers];
         let mut snr: f32 = 0.0;
         let mut snr_count = 0i32;
+        let mut mer_acc: f32 = 0.0;
+        let mut mer_count: u32 = 0;
 
         // Allocate per-frame scratch buffers (no hot-path allocation after this point).
         let mut null_buf = vec![Complex32::new(0.0, 0.0); self.t_null];
@@ -410,6 +426,8 @@ impl OfdmProcessor {
                         freq_corr += block_buf[i] * block_buf[i - self.t_u].conj();
                     }
                     self.process_data_block(&block_buf, &mut ibits);
+                    mer_acc += estimate_mer(self.block_demod.r1_buf());
+                    mer_count += 1;
                     eti_generator.process_block(&ibits, symbol_count as i16);
                 }
 
@@ -426,11 +444,22 @@ impl OfdmProcessor {
                 // SNR from null-symbol noise floor vs. long-term signal level.
                 let null_mean = null_buf.iter().map(|s| s.norm()).sum::<f32>() / self.t_null as f32;
                 snr = 0.9 * snr + 0.1 * 20.0 * ((self.s_level + 0.005) / null_mean).log10();
+
+                // MER from equalized post-differential symbols.
+                let avg_mer = if mer_count > 0 {
+                    mer_acc / mer_count as f32
+                } else {
+                    0.0
+                };
+                mer_acc = 0.0;
+                mer_count = 0;
+
                 trace!(
                     s_level = self.s_level,
                     null_mean,
                     snr_db = snr,
-                    "OFDM: SNR sample"
+                    mer_db = avg_mer,
+                    "OFDM: SNR/MER sample"
                 );
 
                 snr_count += 1;
