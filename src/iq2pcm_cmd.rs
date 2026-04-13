@@ -308,12 +308,6 @@ pub fn run(args: Iq2pcmArgs) {
     let mut pad_output = PadOutput::new(slide_dir, args.slide_base64);
     let mut superframe = SuperframeFilter::new();
     let mut aac_decoder: Option<dabctl::audio::aac_decoder::AacDecoder> = None;
-    // Silence fill: once we have decoded at least one AU, store a zero-filled
-    // frame of the same size so we can substitute silence during radio fades
-    // instead of emitting nothing (which causes buffer underruns downstream).
-    // Rate-limited to one superframe period (~120 ms) so we never emit faster
-    // than real-time even when sync_fail fires on every CIF frame.
-    let mut au_silence: Option<Vec<i16>> = None;
     let mut au_count: usize = 0;
     // Tracks the deadline for the next silence superframe.
     // Initialised lazily on the first real AU output.
@@ -629,10 +623,6 @@ pub fn run(args: Iq2pcmArgs) {
                     if let Some(pcm) = dec.decode_frame(&au.data) {
                         decoded_this_frame += 1;
                         aus_decoded.fetch_add(1, Ordering::Relaxed);
-                        // Capture the silence frame shape from the first successful decode.
-                        if au_silence.is_none() {
-                            au_silence = Some(vec![0i16; pcm.len()]);
-                        }
                         pcm_out.push(pcm);
                         silence_next = silence_deadline_after_good_au(std::time::Instant::now());
                     }
@@ -645,22 +635,18 @@ pub fn run(args: Iq2pcmArgs) {
                 // with SBR. Injecting silence immediately preserves the total PCM
                 // duration and keeps ffmpeg speed ≥ 1.0×.
                 //
-                // The silence frames are pushed AFTER the good AUs from this
-                // superframe: the exact positions of failed AUs within the superframe
-                // are not recoverable once the CRC-failed AUs have been discarded by
-                // the superframe decoder.
+                // Silence frames are produced by the AAC decoder via decode_or_silence
+                // so the frame size is always correct without inline Vec allocation.
                 //
                 // Note: no rate-limiting is needed here. The number of silence frames
                 // is bounded by au_count per superframe (~3 every 120 ms = real-time).
                 // ETSI TS 102 563 §5.1 — one DAB+ superframe = 5 CIF × ~24 ms.
                 if result.sync_ok && !args.no_silence_fill {
                     let missing = au_count.saturating_sub(decoded_this_frame);
-                    if missing > 0 {
-                        if let Some(ref silence) = au_silence {
-                            for _ in 0..missing {
-                                if pcm_out.push(silence.clone()) {
-                                    silence_aus.fetch_add(1, Ordering::Relaxed);
-                                }
+                    for _ in 0..missing {
+                        if let Some(sil) = dec.decode_or_silence(None) {
+                            if pcm_out.push(sil) {
+                                silence_aus.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                     }
@@ -671,14 +657,15 @@ pub fn run(args: Iq2pcmArgs) {
                 // boundary to anchor fill rate. Rate-limit to one superframe period
                 // (120 ms) to match real-time, deferred via SilenceBuffer so a
                 // brief sync_ok recovery does not interleave silence with real audio.
+                // Silence frames are produced by the AAC decoder via decode_or_silence.
                 // ETSI TS 102 563 §5.1.
                 if result.sync_fail && !args.no_silence_fill {
                     let now = std::time::Instant::now();
                     if now >= silence_next {
-                        if let Some(ref silence) = au_silence {
-                            let n = au_count.max(1);
-                            for _ in 0..n {
-                                silence_buffer.push(silence.clone());
+                        let n = au_count.max(1);
+                        for _ in 0..n {
+                            if let Some(sil) = dec.decode_or_silence(None) {
+                                silence_buffer.push(sil);
                             }
                         }
                         silence_next = advance_silence_deadline(silence_next, now);

@@ -88,6 +88,30 @@ impl AacDecoder {
         Some(pcm)
     }
 
+    /// Decode one Access Unit, or produce a zero-filled silence frame when no
+    /// AU data is available (`au_data = None`) or when decoding fails.
+    ///
+    /// Returns `None` only when the frame size is not yet known (no successful
+    /// decode has occurred yet).  Silence content is generated entirely by the
+    /// AAC decoder backend — callers must not create silence frames themselves.
+    pub fn decode_or_silence(&mut self, au_data: Option<&[u8]>) -> Option<Vec<i16>> {
+        let pcm = match &mut self.inner {
+            AacDecoderInner::Faad2(d) => {
+                let pcm = d.decode_or_silence(au_data)?;
+                self.sample_rate = d.sample_rate;
+                self.channels = d.channels;
+                pcm
+            }
+            AacDecoderInner::FdkAac(d) => {
+                let pcm = d.decode_or_silence(au_data)?;
+                self.sample_rate = d.sample_rate;
+                self.channels = d.channels;
+                pcm
+            }
+        };
+        Some(pcm)
+    }
+
     pub fn audio_format(&self) -> AudioFormat {
         AudioFormat {
             sample_rate: self.sample_rate,

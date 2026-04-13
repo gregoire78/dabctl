@@ -76,6 +76,9 @@ pub struct AacDecoder {
     frame_info: ffi::NeAACDecFrameInfo,
     pub sample_rate: u32,
     pub channels: u8,
+    /// Number of interleaved i16 samples in the last successfully decoded frame.
+    /// Used to produce a zero-filled concealment frame when no AU data is available.
+    last_frame_samples: usize,
 }
 
 impl AacDecoder {
@@ -132,6 +135,7 @@ impl AacDecoder {
                 frame_info,
                 sample_rate: output_sr as u32,
                 channels: output_ch,
+                last_frame_samples: 0,
             })
         }
     }
@@ -164,9 +168,27 @@ impl AacDecoder {
                 return None;
             }
 
+            self.last_frame_samples = num_samples;
             let pcm_ptr = output as *const i16;
             Some(std::slice::from_raw_parts(pcm_ptr, num_samples).to_vec())
         }
+    }
+
+    /// Decode one Access Unit, or produce a zero-filled silence frame when no
+    /// AU data is available (`au_data = None`) or when decoding fails.
+    ///
+    /// Returns `None` only when the frame size is not yet known (no successful
+    /// decode has occurred yet), so no silence frame can be sized correctly.
+    pub fn decode_or_silence(&mut self, au_data: Option<&[u8]>) -> Option<Vec<i16>> {
+        if let Some(data) = au_data {
+            if let Some(pcm) = self.decode_frame(data) {
+                return Some(pcm);
+            }
+        }
+        if self.last_frame_samples == 0 {
+            return None;
+        }
+        Some(vec![0i16; self.last_frame_samples])
     }
 
     #[cfg_attr(feature = "fdk-aac", allow(dead_code))]
