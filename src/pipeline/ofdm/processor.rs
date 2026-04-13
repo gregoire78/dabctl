@@ -55,6 +55,8 @@ pub struct OfdmProcessor {
     nco: Nco,
     fft_engine: FftEngine,
     block_demod: BlockDemod,
+    /// Channel equalizer — reserved for future amplitude equalisation of the DQPSK path.
+    #[allow(dead_code)]
     equalizer: Equalizer,
     sync_state: SyncState,
 
@@ -244,12 +246,6 @@ impl OfdmProcessor {
         let t_u = self.t_u;
         self.block_demod
             .process(&self.fft_buf, &self.freq_map, t_u, ibits);
-
-        // Channel equalisation on post-differential symbols (LMS, per carrier).
-        self.equalizer.equalize(self.block_demod.r1_buf_mut());
-
-        // Regenerate soft bits from the equalised symbols.
-        self.block_demod.recompute_ibits(ibits);
     }
 
     // ── Main run loop ─────────────────────────────────────────────────────────

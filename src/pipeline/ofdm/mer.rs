@@ -15,35 +15,49 @@ pub fn nearest_qpsk(s: Complex32) -> Complex32 {
 
 /// Estimate MER (Modulation Error Ratio) in dB from post-differential-QPSK symbols.
 ///
+/// Each symbol is first normalised to the unit circle (`s / |s|`) before the
+/// nearest QPSK point is looked up.  This makes the metric independent of the
+/// per-carrier amplitude variation inherent to differential QPSK output (where
+/// magnitude ≈ |H(f)|², not 1).
+///
 /// ```text
-/// signal_power = mean(|s|²)
-/// error_power  = mean(|s − nearest_qpsk(s)|²)
-/// MER_dB       = 10 × log10(signal_power / error_power)
+/// s_norm       = s / |s|
+/// error_power  = mean(|s_norm − nearest_qpsk(s_norm)|²)
+/// MER_dB       = −10 × log10(error_power)     (signal_power = 1 after norm)
 /// ```
 ///
-/// Returns `0.0` if `symbols` is empty or `error_power` is near zero
+/// Returns `0.0` if `symbols` is empty, all zero, or `error_power` is near zero
 /// (perfect constellation alignment).
 pub fn estimate_mer(symbols: &[Complex32]) -> f32 {
     if symbols.is_empty() {
         return 0.0;
     }
 
-    let n = symbols.len() as f32;
-    let signal_power = symbols.iter().map(|&s| s.norm_sqr()).sum::<f32>() / n;
-    let error_power = symbols
-        .iter()
-        .map(|&s| {
-            let ideal = nearest_qpsk(s);
-            (s - ideal).norm_sqr()
-        })
-        .sum::<f32>()
-        / n;
+    let mut error_sum = 0.0f32;
+    let mut count = 0u32;
 
-    if error_power < f32::EPSILON {
+    for &s in symbols {
+        let mag = s.norm();
+        if mag < f32::EPSILON {
+            continue;
+        }
+        let s_norm = s / mag;
+        let ideal = nearest_qpsk(s_norm);
+        error_sum += (s_norm - ideal).norm_sqr();
+        count += 1;
+    }
+
+    if count == 0 {
         return 0.0;
     }
 
-    10.0 * (signal_power / error_power).log10()
+    let mean_error = error_sum / count as f32;
+    if mean_error < f32::EPSILON {
+        return 0.0;
+    }
+
+    // signal_power = 1 (normalised), so MER = 10 log10(1 / mean_error)
+    -10.0 * mean_error.log10()
 }
 
 #[cfg(test)]
@@ -52,8 +66,8 @@ mod tests {
     use std::f32::consts::FRAC_1_SQRT_2;
 
     #[test]
-    fn perfect_qpsk_returns_zero_or_very_high() {
-        // Exact QPSK points have error_power ≈ 0, triggering the near-zero guard.
+    fn perfect_qpsk_returns_zero() {
+        // Exact QPSK points on the unit circle → error_power ≈ 0, guard returns 0.0.
         let symbols = vec![
             Complex32::new(FRAC_1_SQRT_2, FRAC_1_SQRT_2),
             Complex32::new(-FRAC_1_SQRT_2, FRAC_1_SQRT_2),
@@ -65,9 +79,33 @@ mod tests {
     }
 
     #[test]
+    fn scaled_qpsk_gives_same_mer_as_unit_qpsk() {
+        // After normalisation, amplitude scaling must not affect the MER estimate.
+        let unit_symbols = vec![
+            Complex32::new(FRAC_1_SQRT_2, FRAC_1_SQRT_2),
+            Complex32::new(-FRAC_1_SQRT_2, FRAC_1_SQRT_2),
+        ];
+        let noise = 0.05_f32;
+        let noisy: Vec<Complex32> = unit_symbols
+            .iter()
+            .map(|&s| Complex32::new(s.re + noise, s.im + noise))
+            .collect();
+        let scaled_noisy: Vec<Complex32> = noisy.iter().map(|&s| s * 1000.0).collect();
+
+        let mer_unit = estimate_mer(&noisy);
+        let mer_scaled = estimate_mer(&scaled_noisy);
+        assert!(
+            (mer_unit - mer_scaled).abs() < 0.1,
+            "MER should be amplitude-invariant; unit={:.2} scaled={:.2}",
+            mer_unit,
+            mer_scaled,
+        );
+    }
+
+    #[test]
     fn near_perfect_qpsk_gives_high_mer() {
-        // QPSK symbols with 1% Gaussian-like noise should give MER > 30 dB.
-        let noise_scale = 0.01_f32;
+        // Symbols close to QPSK points should yield high MER (> 20 dB).
+        let noise_scale = 0.02_f32;
         let symbols: Vec<Complex32> = [
             (FRAC_1_SQRT_2, FRAC_1_SQRT_2),
             (-FRAC_1_SQRT_2, FRAC_1_SQRT_2),
@@ -80,28 +118,25 @@ mod tests {
 
         let mer = estimate_mer(&symbols);
         assert!(
-            mer > 30.0,
-            "near-perfect QPSK should give MER > 30 dB, got {:.1} dB",
+            mer > 20.0,
+            "near-perfect QPSK should give MER > 20 dB, got {:.1} dB",
             mer
         );
     }
 
     #[test]
     fn noisy_gives_low_mer() {
-        // Purely random noise concentrated away from the QPSK ideal points
-        // should give low MER (well below 10 dB).
-        // We construct symbols at the midpoints between QPSK neighbours —
-        // these have maximum distance from any ideal point.
+        // Symbols at 45° between QPSK neighbours have maximum distance from any ideal point.
         let symbols = vec![
-            Complex32::new(0.0, FRAC_1_SQRT_2), // equidistant from (±1/√2, 1/√2)
-            Complex32::new(FRAC_1_SQRT_2, 0.0), // equidistant from (1/√2, ±1/√2)
-            Complex32::new(0.0, -FRAC_1_SQRT_2), // equidistant from (±1/√2, -1/√2)
-            Complex32::new(-FRAC_1_SQRT_2, 0.0), // equidistant from (-1/√2, ±1/√2)
+            Complex32::new(0.0, 1.0),  // 90°  — equidistant from (+,+) and (-,+)
+            Complex32::new(1.0, 0.0),  // 0°   — equidistant from (+,+) and (+,-)
+            Complex32::new(0.0, -1.0), // 270° — equidistant from (+,-) and (-,-)
+            Complex32::new(-1.0, 0.0), // 180° — equidistant from (-,+) and (-,-)
         ];
         let mer = estimate_mer(&symbols);
         assert!(
             mer < 10.0,
-            "noisy symbols should give MER < 10 dB, got {:.1} dB",
+            "maximally noisy symbols should give MER < 10 dB, got {:.1} dB",
             mer
         );
     }
