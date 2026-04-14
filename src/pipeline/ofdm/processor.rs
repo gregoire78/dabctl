@@ -255,6 +255,19 @@ impl OfdmProcessor {
         self.block_demod
             .process(&self.fft_buf, &self.freq_map, t_u, ibits);
 
+        // Normalise each differential symbol to unit magnitude before equalization.
+        // The raw r1 values are products of two FFT outputs (|r1| ≈ |fft|²), which
+        // can be hundreds of times larger than 1.  The LMS step µ = 0.005 is tuned
+        // for unit-amplitude symbols: without normalisation µ·|sym|² ≫ 2 and the
+        // weights diverge, eventually producing NaN.  For DQPSK only the phase of
+        // r1 carries information, so discarding the magnitude is lossless.
+        for s in self.block_demod.r1_buf_mut() {
+            let mag = s.norm();
+            if mag > f32::EPSILON {
+                *s /= mag;
+            }
+        }
+
         // Apply LMS equalizer to post-differential symbols then regenerate soft
         // bits.  The two fields are disjoint so Rust NLL can split the borrows;
         // explicit tuple destructuring makes the disjointness visible to the
@@ -348,9 +361,6 @@ impl OfdmProcessor {
             let acq_threshold = self
                 .threshold_1
                 .clamp(OFDM_THRESHOLD_MIN, OFDM_THRESHOLD_MAX);
-            let track_threshold = self
-                .threshold_2
-                .clamp(OFDM_THRESHOLD_MIN, OFDM_THRESHOLD_MAX);
 
             let start_index = self
                 .phase_synchronizer
@@ -409,14 +419,18 @@ impl OfdmProcessor {
                 if self.f2_correction {
                     let correction = self.phase_synchronizer.estimate_offset(&self.ofdm_buffer);
                     if correction != 100 {
+                        // Clamp to ±3 carriers per step: estimate_offset is noisy at low
+                        // SNR and can return values up to ±35, which would send the
+                        // coarse corrector far from the true offset and prevent lock.
+                        let clamped = correction.clamp(-3, 3);
                         let prev = self.coarse_corrector;
-                        self.coarse_corrector += correction as i32 * self.carrier_diff;
+                        self.coarse_corrector += clamped as i32 * self.carrier_diff;
                         if self.coarse_corrector.abs() > 35_000 {
                             trace!(coarse_hz = self.coarse_corrector, "OFDM: coarse overflow");
                             self.coarse_corrector = 0;
-                        } else if correction != 0 {
+                        } else if clamped != 0 {
                             trace!(
-                                delta_carriers = correction,
+                                delta_carriers = clamped,
                                 prev_hz = prev,
                                 new_hz = self.coarse_corrector,
                                 "OFDM: coarse AFC step"
@@ -514,7 +528,7 @@ impl OfdmProcessor {
                 start_index = {
                     let idx = self
                         .phase_synchronizer
-                        .find_index(&check_buf, track_threshold);
+                        .find_index(&check_buf, acq_threshold);
                     if idx < 0 {
                         trace!(frames = inner_frame_count, "OFDM: PRS correlation miss");
                         break;
