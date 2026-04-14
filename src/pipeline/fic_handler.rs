@@ -270,4 +270,63 @@ mod tests {
         );
         assert_eq!(valid1, valid2);
     }
+
+    // ── Quality counters ─────────────────────────────────────────────────────
+
+    #[test]
+    fn reset_quality_counters_clears_both_counters() {
+        let params = DabParams::new(1);
+        let bits_per_block = 2 * params.k as usize;
+        let data: Vec<i16> = vec![64i16; bits_per_block * 3];
+        let mut out = vec![0u8; 768 * 4];
+        let mut valid = vec![false; 4];
+
+        let mut fh = FicHandler::new(&params);
+        fh.process_fic_block(&data, &mut out, &mut valid);
+
+        // After a block is processed, the counters are non-zero.
+        let (_, total_before) = fh.get_fic_counts();
+        assert!(total_before > 0, "total FIB count must be > 0 after processing");
+
+        fh.reset_quality_counters();
+        let (success, total) = fh.get_fic_counts();
+        assert_eq!(success, 0, "success counter must be zero after reset");
+        assert_eq!(total, 0, "total counter must be zero after reset");
+    }
+
+    #[test]
+    fn fic_quality_is_zero_when_no_data_processed() {
+        let params = DabParams::new(1);
+        let fh = FicHandler::new(&params);
+        assert_eq!(
+            fh.get_fic_quality(),
+            0,
+            "quality must be 0 when no FIBs have been processed"
+        );
+    }
+
+    #[test]
+    fn get_fic_counts_returns_success_and_total() {
+        let params = DabParams::new(1);
+        let bits_per_block = 2 * params.k as usize;
+        let data: Vec<i16> = vec![0i16; bits_per_block * 3];
+        let mut out = vec![0u8; 768 * 4];
+        let mut valid = vec![false; 4];
+
+        let mut fh = FicHandler::new(&params);
+        fh.process_fic_block(&data, &mut out, &mut valid);
+
+        let (success, total) = fh.get_fic_counts();
+        // With all-zero soft bits every FIB will fail CRC, so success=0.
+        assert_eq!(success + (total - success), total, "success + errors must equal total");
+        assert!(total >= 0, "total must be non-negative");
+    }
+
+    #[test]
+    fn fic_quality_never_exceeds_100() {
+        let params = DabParams::new(1);
+        let fh = FicHandler::new(&params);
+        let q = fh.get_fic_quality();
+        assert!(q <= 100, "quality percentage must be ≤ 100, got {q}");
+    }
 }

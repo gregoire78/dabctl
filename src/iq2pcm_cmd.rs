@@ -159,6 +159,9 @@ pub fn run(args: Iq2pcmArgs) {
     // sync_ok/sync_fail instead of just the last individual frame.
     let fic_ok = Arc::new(AtomicI32::new(0));
     let fic_total = Arc::new(AtomicI32::new(0));
+    // Counts FIC frames delivered to DabPipeline per second.
+    // Distinguishes fib_quality=0 due to "no frames received" from "frames received, all CRC failures".
+    let fic_frames = Arc::new(AtomicI32::new(0));
     let run = Arc::new(AtomicBool::new(false));
 
     let running_ctrlc = running.clone();
@@ -214,14 +217,19 @@ pub fn run(args: Iq2pcmArgs) {
         }));
     let program_cb: Option<std::sync::Arc<dyn Fn(&str, i32) + Send + Sync>> =
         Some(std::sync::Arc::new(move |name: &str, sid: i32| {
-            debug!("program {} (0x{:X}) is in the list", name.trim(), sid);
+            let label = name.trim();
+            if !label.is_empty() {
+                info!("Service discovered: {} (SId 0x{:04X})", label, sid as u32);
+            }
         }));
     let fok = fic_ok.clone();
     let ftot = fic_total.clone();
+    let ffr = fic_frames.clone();
     let fic_quality_cb: Option<std::sync::Arc<dyn Fn(i16, i16) + Send + Sync>> =
         Some(std::sync::Arc::new(move |success: i16, total: i16| {
             fok.fetch_add(i32::from(success), Ordering::Relaxed);
             ftot.fetch_add(i32::from(total), Ordering::Relaxed);
+            ffr.fetch_add(1, Ordering::Relaxed);
         }));
 
     let pipeline = DabPipeline::new(1, frame_tx, ensemble_cb, program_cb, fic_quality_cb);
@@ -230,7 +238,7 @@ pub fn run(args: Iq2pcmArgs) {
     let ts = time_synced.clone();
     let sn = signal_noise.clone();
     let freq_offset_hz = Arc::new(AtomicI32::new(0));
-    let mut ofdm_processor = OfdmProcessor::new(1, 2, 5, running.clone());
+    let mut ofdm_processor = OfdmProcessor::new(1, 2, running.clone());
     ofdm_processor.set_sync_signal(move |synced| {
         ts.store(synced, Ordering::SeqCst);
     });
@@ -294,7 +302,17 @@ pub fn run(args: Iq2pcmArgs) {
         }
     }
 
-    info!("Starting audio processing...");
+    if ensemble_recognized.load(Ordering::SeqCst) {
+        info!("Ensemble detected — starting audio processing...");
+    } else {
+        warn!(
+            "No ensemble detected within {} s (FIC decoding failed) — \
+             signal may be too weak; try increasing gain with -G or scanning \
+             first with: dabctl scan -C {}",
+            args.detect_time, args.channel
+        );
+        info!("Attempting audio processing anyway...");
+    }
     pipeline_processing_flag.store(true, Ordering::SeqCst);
     run.store(true, Ordering::SeqCst);
 
@@ -308,12 +326,6 @@ pub fn run(args: Iq2pcmArgs) {
     let mut pad_output = PadOutput::new(slide_dir, args.slide_base64);
     let mut superframe = SuperframeFilter::new();
     let mut aac_decoder: Option<dabctl::audio::aac_decoder::AacDecoder> = None;
-    // Silence fill: once we have decoded at least one AU, store a zero-filled
-    // frame of the same size so we can substitute silence during radio fades
-    // instead of emitting nothing (which causes buffer underruns downstream).
-    // Rate-limited to one superframe period (~120 ms) so we never emit faster
-    // than real-time even when sync_fail fires on every CIF frame.
-    let mut au_silence: Option<Vec<i16>> = None;
     let mut au_count: usize = 0;
     // Tracks the deadline for the next silence superframe.
     // Initialised lazily on the first real AU output.
@@ -358,6 +370,7 @@ pub fn run(args: Iq2pcmArgs) {
     let sn2 = signal_noise.clone();
     let fs2_ok = fic_ok.clone();
     let fs2_total = fic_total.clone();
+    let fs2_frames = fic_frames.clone();
     let c_fo = freq_offset_hz.clone();
     let c_fi = frames_in.clone();
     let c_fns = frames_no_subch.clone();
@@ -377,6 +390,19 @@ pub fn run(args: Iq2pcmArgs) {
         // preventing a single partial-recovery tick from resetting the counter.
         const DROPOUT_WARN_SECS: u32 = 5;
         let mut consecutive_dropout_s: u32 = 0;
+        // Counts consecutive 1-second intervals where OFDM is syncing
+        // (fib_frames > 0) but every delivered FIB fails its CRC check.
+        // This catches the case where the RTL-SDR crystal offset is large
+        // enough to prevent FIC decoding without ever triggering the
+        // sfail-based dropout warning (which fires only when audio services
+        // have been selected).
+        const FIB_FAIL_WARN_SECS: u32 = 5;
+        let mut consecutive_fib_fail_s: u32 = 0;
+        // AFC offset above which a PPM adjustment hint is shown (Hz).
+        // 500 Hz at 200 MHz corresponds to ~2.5 PPM, large enough to prevent FIC decoding.
+        const LARGE_FREQ_OFFSET_HZ: i32 = 500;
+        // SNR below which antenna/gain hints are preferred over PPM hints (dB, integer).
+        const WEAK_SNR_DB: i16 = 4;
 
         while status_run.load(Ordering::SeqCst) {
             let fi = c_fi.swap(0, Ordering::SeqCst);
@@ -390,6 +416,7 @@ pub fn run(args: Iq2pcmArgs) {
             let sld = c_sld.swap(0, Ordering::SeqCst);
             let fib_ok = fs2_ok.swap(0, Ordering::SeqCst);
             let fib_tot = fs2_total.swap(0, Ordering::SeqCst);
+            let fib_frames = fs2_frames.swap(0, Ordering::SeqCst);
             let fib_quality = if fib_tot > 0 {
                 fib_ok * 100 / fib_tot
             } else {
@@ -400,27 +427,26 @@ pub fn run(args: Iq2pcmArgs) {
             let gain_t = gain_tenths.load(Ordering::Relaxed);
             let gain_db_x10 = if gain_t >= 0 { gain_t } else { 0 };
 
-            // B. Only report frequency offset and PPM when the OFDM decoder is
-            // locked (sync_ok > 0).  During a full dropout the phase-reference
-            // correlator produces arbitrary values that would mislead the reader.
-            let (offset_hz, mppm) = if sok > 0 {
-                // Derive PPM from the OFDM AFC total offset (coarse + fine).
+            // B. Always report the OFDM AFC frequency offset so that users can
+            // diagnose crystal PPM errors even before audio decoding succeeds.
+            // The AFC correctors (coarse + fine) are updated inside the inner
+            // tracking loop and are therefore stable, meaningful values — unlike
+            // the phase-reference correlator output that could be noisy during a
+            // dropout.  mppm is only meaningful once the tuned frequency is known.
+            let off = c_fo.load(Ordering::Relaxed);
+            let mppm = if freq > 0 {
                 // ppm = offset_hz × 1_000_000 / tuned_freq_hz (ETSI EN 300 401 §8.4.3).
                 // Reported in milli-PPM (×1000) so sub-PPM offsets are visible.
-                let off = c_fo.load(Ordering::Relaxed);
-                let ppm = if freq > 0 {
-                    off * 1_000_000_000 / freq
-                } else {
-                    0
-                };
-                (off, ppm)
+                off * 1_000_000_000 / freq
             } else {
-                (0, 0)
+                0
             };
+            let offset_hz = off;
 
             debug!(
                 snr = sn2.load(Ordering::SeqCst),
                 fib_quality,
+                fib_frames,
                 frames = fi,
                 no_subch = fns,
                 sync_ok = sok,
@@ -447,7 +473,7 @@ pub fn run(args: Iq2pcmArgs) {
                     let snr_val = sn2.load(Ordering::SeqCst);
                     let hint = if offset_hz == 0 && snr_val < 6 {
                         " — weak RF signal, check antenna"
-                    } else if offset_hz.abs() > 500 {
+                    } else if offset_hz.abs() > LARGE_FREQ_OFFSET_HZ {
                         " — large frequency offset, try -p to adjust PPM"
                     } else {
                         " — OFDM sync lost, audio interrupted"
@@ -468,6 +494,32 @@ pub fn run(args: Iq2pcmArgs) {
                     );
                 }
                 consecutive_dropout_s = 0;
+            }
+
+            // D. Warn when OFDM is delivering FIC frames but every FIB fails
+            // CRC — a symptom of a large crystal PPM offset or a signal that
+            // is too weak for FIC decoding.  This fires even when no audio
+            // service has been selected (sok == 0), catching the pre-lock
+            // stage shown in the startup log.
+            if fib_frames > 0 && fib_quality == 0 {
+                consecutive_fib_fail_s += 1;
+                if consecutive_fib_fail_s == FIB_FAIL_WARN_SECS {
+                    let snr_val = sn2.load(Ordering::SeqCst);
+                    let hint = if offset_hz.abs() > LARGE_FREQ_OFFSET_HZ {
+                        " — large frequency offset, try -p to adjust PPM"
+                    } else if snr_val < WEAK_SNR_DB {
+                        " — weak RF signal, check antenna or increase gain"
+                    } else {
+                        " — check PPM offset (-p) or signal quality"
+                    };
+                    warn!(
+                        "OFDM syncing but all FIBs failing CRC for {} s \
+                         (snr={} dB, freq_offset={} Hz){}",
+                        consecutive_fib_fail_s, snr_val, offset_hz, hint,
+                    );
+                }
+            } else {
+                consecutive_fib_fail_s = 0;
             }
 
             thread::sleep(std::time::Duration::from_secs(1));
@@ -629,10 +681,6 @@ pub fn run(args: Iq2pcmArgs) {
                     if let Some(pcm) = dec.decode_frame(&au.data) {
                         decoded_this_frame += 1;
                         aus_decoded.fetch_add(1, Ordering::Relaxed);
-                        // Capture the silence frame shape from the first successful decode.
-                        if au_silence.is_none() {
-                            au_silence = Some(vec![0i16; pcm.len()]);
-                        }
                         pcm_out.push(pcm);
                         silence_next = silence_deadline_after_good_au(std::time::Instant::now());
                     }
@@ -645,22 +693,18 @@ pub fn run(args: Iq2pcmArgs) {
                 // with SBR. Injecting silence immediately preserves the total PCM
                 // duration and keeps ffmpeg speed ≥ 1.0×.
                 //
-                // The silence frames are pushed AFTER the good AUs from this
-                // superframe: the exact positions of failed AUs within the superframe
-                // are not recoverable once the CRC-failed AUs have been discarded by
-                // the superframe decoder.
+                // Silence frames are produced by the AAC decoder via decode_or_silence
+                // so the frame size is always correct without inline Vec allocation.
                 //
                 // Note: no rate-limiting is needed here. The number of silence frames
                 // is bounded by au_count per superframe (~3 every 120 ms = real-time).
                 // ETSI TS 102 563 §5.1 — one DAB+ superframe = 5 CIF × ~24 ms.
                 if result.sync_ok && !args.no_silence_fill {
                     let missing = au_count.saturating_sub(decoded_this_frame);
-                    if missing > 0 {
-                        if let Some(ref silence) = au_silence {
-                            for _ in 0..missing {
-                                if pcm_out.push(silence.clone()) {
-                                    silence_aus.fetch_add(1, Ordering::Relaxed);
-                                }
+                    for _ in 0..missing {
+                        if let Some(sil) = dec.decode_or_silence(None) {
+                            if pcm_out.push(sil) {
+                                silence_aus.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                     }
@@ -671,14 +715,15 @@ pub fn run(args: Iq2pcmArgs) {
                 // boundary to anchor fill rate. Rate-limit to one superframe period
                 // (120 ms) to match real-time, deferred via SilenceBuffer so a
                 // brief sync_ok recovery does not interleave silence with real audio.
+                // Silence frames are produced by the AAC decoder via decode_or_silence.
                 // ETSI TS 102 563 §5.1.
                 if result.sync_fail && !args.no_silence_fill {
                     let now = std::time::Instant::now();
                     if now >= silence_next {
-                        if let Some(ref silence) = au_silence {
-                            let n = au_count.max(1);
-                            for _ in 0..n {
-                                silence_buffer.push(silence.clone());
+                        let n = au_count.max(1);
+                        for _ in 0..n {
+                            if let Some(sil) = dec.decode_or_silence(None) {
+                                silence_buffer.push(sil);
                             }
                         }
                         silence_next = advance_silence_deadline(silence_next, now);

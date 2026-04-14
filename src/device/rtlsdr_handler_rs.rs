@@ -11,6 +11,10 @@ use tracing::{debug, info, warn};
 
 const READLEN_DEFAULT: usize = 8192;
 const INPUT_RATE: u32 = 2_048_000;
+/// DAB Band III channel bandwidth (ETSI EN 300 401 §2.2): 1.536 MHz.
+/// Setting the tuner IF filter to this value reduces adjacent-channel noise
+/// and improves SNR on the 8-bit RTL2832U ADC.
+const DAB_CHANNEL_BW: u32 = 1_536_000;
 
 /// SAGC: upper signal level threshold (int8 absolute-value scale, 0–127).
 /// Gain is reduced when the running estimate exceeds this value.
@@ -64,8 +68,21 @@ const SAGC_HUNT_FREEZE_BASE: u32 = 80;
 /// 128 × 4 × 8192 / 2_048_000 s ≈ 2 s grace window.
 const SAGC_HUNT_GRACE_TICKS: u32 = 128;
 /// Maximum number of ticks the hunting freeze can reach after repeated doubling.
-/// 5120 × 4 × 8192 / 2_048_000 s ≈ 82 s — effectively permanent for a session.
-const SAGC_HUNT_FREEZE_MAX: u32 = 5120;
+/// 300 × 4 × 8192 / 2_048_000 s ≈ 4.8 s — prevents permanent SAGC lockout after
+/// repeated gain-direction reversals caused by slowly-fading DAB channels.
+/// Even after several doubling episodes the SAGC recovers within ≤ 5 s and can
+/// respond to the next legitimate fade.
+const SAGC_HUNT_FREEZE_MAX: u32 = 300;
+/// Number of SAGC evaluation ticks without a gain-direction reversal before the
+/// `hunt_count` accumulator is reset to zero.
+///
+/// True hunting is rapid oscillation (UP/DOWN at < 1 s/cycle); legitimate AGC
+/// responses to DAB fades are slow (fade–recovery cycles are 10–30 s apart).
+/// After `SAGC_HUNT_TIMEOUT_TICKS` ticks with no reversal (≈ 6 s), `hunt_count`
+/// is zeroed so the next fade is treated as a fresh event and not blocked by
+/// accumulated history from previous fade cycles.
+/// 750 × 4 × 8192 / 2_048_000 s ≈ 6 s.
+const SAGC_HUNT_TIMEOUT_TICKS: u32 = 750;
 /// SAGC: ADC clipping threshold on the ±128 raw-byte scale.
 /// Samples whose absolute value exceeds this are considered near-saturation.
 /// 120 / 127 ≈ 94.5 % of ADC full scale.
@@ -355,6 +372,14 @@ impl RtlsdrHandler {
                 return;
             }
 
+            // Narrow the tuner IF filter to the DAB Band III channel bandwidth
+            // (1.536 MHz) to reject adjacent signals and maximise SNR on the
+            // 8-bit RTL2832U ADC.  Not all tuner chips honour this call, so a
+            // failure is non-fatal.
+            if let Err(e) = sdr.set_tuner_bandwidth(DAB_CHANNEL_BW) {
+                warn!("set_tuner_bandwidth failed (non-fatal): {}", e);
+            }
+
             if config.ppm_offset != 0 {
                 if let Err(e) = sdr.set_freq_correction(config.ppm_offset) {
                     warn!("set_freq_correction failed: {}", e);
@@ -446,6 +471,11 @@ impl RtlsdrHandler {
             // When it reaches SAGC_HUNT_RESET_TICKS, the hunt-freeze backoff
             // multiplier is reset to SAGC_HUNT_FREEZE_BASE.
             let mut hunt_stable_cntr: u32 = 0;
+            // Inactivity timer: evaluation ticks since the last gain-direction
+            // reversal.  When it reaches SAGC_HUNT_TIMEOUT_TICKS, `hunt_count`
+            // is reset to 0 so slowly-recurring fade cycles are not mistaken
+            // for rapid hunting.
+            let mut hunt_last_reversal_ticks: u32 = 0;
 
             // ── DOC state ─────────────────────────────────────────────────────
             // DC Offset Correction: independent IIR estimators for I and Q.
@@ -467,32 +497,15 @@ impl RtlsdrHandler {
             // SAGC + DOC arithmetic (one entry per raw byte).
             let mut sample_buf = vec![0.0f32; READLEN_DEFAULT];
             let mut raw = [0u8; READLEN_DEFAULT];
-            // Accumulation cursor for partial reads.
-            //
-            // USB bulk transfers on native hardware always return exactly READLEN_DEFAULT
-            // bytes.  When the device is forwarded via usbipd (USB over TCP), read_sync
-            // may return fewer bytes per call due to TCP segmentation.  We accumulate
-            // chunks into `raw` until the full READLEN_DEFAULT bytes are available before
-            // processing — avoiding the silent data loss that occurred when short reads
-            // were discarded.
-            let mut fill_pos: usize = 0;
             loop {
                 if !running.load(Ordering::SeqCst) {
                     break;
                 }
-                match sdr.read_sync(&mut raw[fill_pos..]) {
+                match sdr.read_sync(&mut raw) {
                     Ok(0) => {
                         tracing::warn!("read_sync returned 0 bytes; retrying");
                     }
-                    Ok(n) => {
-                        fill_pos += n;
-                        if fill_pos < READLEN_DEFAULT {
-                            // Partial read — accumulate further chunks before processing.
-                            continue;
-                        }
-                        // Full buffer ready; reset cursor for the next cycle.
-                        fill_pos = 0;
-
+                    Ok(_) => {
                         if startup_discard > 0 {
                             startup_discard -= 1;
                             continue;
@@ -565,6 +578,20 @@ impl RtlsdrHandler {
                             // Count down the startup grace period.
                             hunt_grace_cntr = hunt_grace_cntr.saturating_sub(1);
 
+                            // Hunt-count inactivity timeout: reset hunt_count after
+                            // SAGC_HUNT_TIMEOUT_TICKS ticks without a reversal so that
+                            // slow fade cycles (>= 6 s between gain-direction changes)
+                            // are not misidentified as rapid hunting.
+                            hunt_last_reversal_ticks = hunt_last_reversal_ticks.saturating_add(1);
+                            if hunt_last_reversal_ticks >= SAGC_HUNT_TIMEOUT_TICKS && hunt_count > 0
+                            {
+                                debug!(
+                                    "SAGC: hunt count reset after {} ticks of inactivity",
+                                    hunt_last_reversal_ticks
+                                );
+                                hunt_count = 0;
+                                hunt_last_reversal_ticks = 0;
+                            }
                             // ── Clipping-path ────────────────────────────────────
                             // A DAB OFDM signal has a peak-to-average ratio of ~10 dB.
                             // The slow IIR mean estimator (SAGC_CREL) can converge below
@@ -591,6 +618,7 @@ impl RtlsdrHandler {
                                 agc_up_confirm = 0;
                                 agc_down_confirm = 0;
                                 if last_gain_dir == 1 && hunt_grace_cntr == 0 {
+                                    hunt_last_reversal_ticks = 0;
                                     hunt_count += 1;
                                 } else {
                                     hunt_count = 0;
@@ -647,6 +675,7 @@ impl RtlsdrHandler {
                                     agc_hold_cntr = SAGC_HOLD_BUFFERS;
                                     // Hunting detection: consecutive direction reversals.
                                     if last_gain_dir == -1 && hunt_grace_cntr == 0 {
+                                        hunt_last_reversal_ticks = 0;
                                         hunt_count += 1;
                                         if hunt_count >= SAGC_HUNT_THRESHOLD {
                                             // Stay on the lower (safer) gain step and freeze.
@@ -719,6 +748,7 @@ impl RtlsdrHandler {
                                     agc_hold_cntr = SAGC_HOLD_BUFFERS;
                                     // Hunting detection: consecutive direction reversals.
                                     if last_gain_dir == 1 && hunt_grace_cntr == 0 {
+                                        hunt_last_reversal_ticks = 0;
                                         hunt_count += 1;
                                         if hunt_count >= SAGC_HUNT_THRESHOLD {
                                             // Already on the lower step; freeze here.

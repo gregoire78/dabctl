@@ -3,8 +3,9 @@
 
 mod iq2pcm_cmd;
 mod pcm_writer;
+mod scan_cmd;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -13,11 +14,22 @@ use clap::Parser;
     version
 )]
 struct Cli {
-    #[command(flatten)]
-    args: iq2pcm_cmd::Iq2pcmArgs,
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Play a DAB+ service: tune a channel and decode audio to stdout (PCM s16le 48kHz stereo)
+    Play(iq2pcm_cmd::Iq2pcmArgs),
+    /// Scan a DAB channel and list all available ensembles and services
+    Scan(scan_cmd::ScanArgs),
 }
 
 fn main() {
     let cli = Cli::parse();
-    iq2pcm_cmd::run(cli.args);
+    match cli.command {
+        Commands::Play(args) => iq2pcm_cmd::run(args),
+        Commands::Scan(args) => scan_cmd::run(args),
+    }
 }

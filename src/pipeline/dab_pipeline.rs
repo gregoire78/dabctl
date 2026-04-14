@@ -10,7 +10,7 @@
 //   which compiles with `__PARALLEL__ 0`).
 // - `Vec<SubchannelFrame>` replaces `SmallVec` — no external dependency.
 
-use tracing::warn;
+use tracing::{trace, warn};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, TrySendError};
@@ -20,6 +20,7 @@ use std::thread;
 use crate::pipeline::dab_frame::{DabFrame, SubchannelFrame};
 use crate::pipeline::dab_params::DabParams;
 use crate::pipeline::fic_handler::FicHandler;
+use crate::pipeline::ofdm::time_interleaver::TimeDeInterleaver;
 use crate::pipeline::protection::{EepProtection, Protection, UepProtection};
 
 /// Callback invoked with ensemble name and EId when FIC is decoded.
@@ -239,13 +240,11 @@ impl DabPipeline {
         let bits_per_block = 2 * params.get_carriers();
         // Mode I: 18 MSC blocks per CIF — ETSI EN 300 401 §14.1
         let number_of_blocks_per_cif: usize = 18;
-        // Time de-interleaving delay table — ETSI EN 300 401 §12.3, Table 22
-        let interleave_map: [usize; 16] = [0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15];
 
         let cif_buf_size = number_of_blocks_per_cif * bits_per_block;
         let mut cif_in = vec![0i16; cif_buf_size];
-        // Circular history for time de-interleaving: 16 successive CIF snapshots.
-        let mut cif_vector = vec![vec![0i16; cif_buf_size]; 16];
+        // COFDM time de-interleaver — ETSI EN 300 401 §12.3 (depth 16).
+        let mut time_deintlv = TimeDeInterleaver::new(cif_buf_size);
         // Circular FIB history: 4 FIBs packed into 96 bytes per slot.
         let mut fib_vector = vec![[0u8; 96]; 16];
         let mut fib_input = vec![0i16; 3 * bits_per_block];
@@ -255,9 +254,6 @@ impl DabPipeline {
 
         let mut index_out: usize = 0;
         let mut frame_sync = OfdmFrameSync::new(params.get_l() as i16);
-        // Number of CIFs accumulated so far; output is withheld until 15 full
-        // cycles have passed so the interleaver history is valid.
-        let mut amount: usize = 0;
         // Offset applied to the FIC-decoded CIF counter per emitted frame.
         let mut minor: u32 = 0;
         let mut cif_count_hi: i16 = -1;
@@ -282,10 +278,10 @@ impl DabPipeline {
                     tracing::debug!(blkno, "OFDM frame sync restored");
                 }
                 SyncAction::SyncLost => {
-                    // CIF interleaver history (index_out, amount) is NOT reset:
-                    // the 16-CIF sliding window survives a single dropped block.
-                    // Resetting it would cause ~360 ms of unnecessary warm-up
-                    // latency (15 × 24 ms).
+                    // The COFDM time de-interleaver ring is NOT reset on a single
+                    // dropped block: the 16-CIF sliding window survives a brief
+                    // sync glitch.  Resetting it would cause ~360 ms of unnecessary
+                    // warm-up latency (15 × 24 ms).
                     warn!(blkno, "OFDM frame sync lost, resyncing");
                     minor = 0;
                     sync_just_lost = true;
@@ -328,6 +324,7 @@ impl DabPipeline {
                     cif_count_lo = lo;
                     if let Some(ref cb) = fic_quality_cb {
                         let (success, total) = my_fic_handler.get_fic_counts();
+                        trace!(fic_ok = success, fic_total = total, "FIC frame decoded");
                         cb(success, total);
                     }
                 }
@@ -342,22 +339,10 @@ impl DabPipeline {
 
             // Emit one DabFrame when the last block of a CIF is received.
             if cif_index == number_of_blocks_per_cif - 1 {
-                // Time de-interleaving — ETSI EN 300 401 §12.3.
-                //
-                // Write the current CIF slot FIRST so that D=0 positions
-                // (i % 16 == 0) read back the just-written current-frame data,
-                // not the 16-frame-old value that occupied the same circular
-                // slot. This matches the reference C++ order in RunProcessor.cpp.
-                #[allow(clippy::manual_memcpy)]
-                for i in 0..(3072 * 18) {
-                    let idx = interleave_map[i & 0x0F];
-                    cif_vector[index_out & 0x0F][i] = cif_in[i];
-                    temp[i] = cif_vector[(index_out + idx) & 0x0F][i];
-                }
-
-                // Withhold output until the 16-slot interleaver history is full.
-                if amount < 15 {
-                    amount += 1;
+                // COFDM time de-interleaving — ETSI EN 300 401 §12.3.
+                // `push_cif` returns false during the first 15 warm-up cycles.
+                let ready = time_deintlv.push_cif(&cif_in, &mut temp);
+                if !ready {
                     index_out = (index_out + 1) & 0x0F;
                     minor = 0;
                     continue;
@@ -855,5 +840,57 @@ mod tests {
             "D=15 after 16 frames: expected 140 (frame 14 value), got {}",
             temp[15]
         );
+    }
+
+    // ── DabPipeline construction and processing_flag ──────────────────────────
+
+    /// `DabPipeline::new` must not panic when all callbacks are `None`.
+    #[test]
+    fn pipeline_new_without_callbacks_does_not_panic() {
+        let (tx, _rx) = mpsc::sync_channel(4);
+        let _p = DabPipeline::new(1, tx, None, None, None);
+    }
+
+    /// `processing_flag` must start `false` — the pipeline should not process
+    /// FIC/CIF data until explicitly enabled by the caller.
+    #[test]
+    fn processing_flag_starts_false() {
+        let (tx, _rx) = mpsc::sync_channel(4);
+        let p = DabPipeline::new(1, tx, None, None, None);
+        assert!(
+            !p.processing_flag().load(Ordering::SeqCst),
+            "processing_flag must start false"
+        );
+    }
+
+    /// The caller must be able to set `processing_flag` to `true` via the
+    /// returned `Arc<AtomicBool>`.
+    #[test]
+    fn processing_flag_can_be_set_to_true() {
+        let (tx, _rx) = mpsc::sync_channel(4);
+        let p = DabPipeline::new(1, tx, None, None, None);
+        p.processing_flag().store(true, Ordering::SeqCst);
+        assert!(
+            p.processing_flag().load(Ordering::SeqCst),
+            "processing_flag must reflect the stored value"
+        );
+    }
+
+    /// The `FicQualityCb` must be wired through `DabPipeline::new` and invoked
+    /// by the pipeline thread when a FIC frame is processed at blkno==4.
+    /// This test verifies the callback arc is accepted without panicking.
+    #[test]
+    fn pipeline_accepts_fic_quality_callback() {
+        use std::sync::atomic::AtomicI32;
+        let (tx, _rx) = mpsc::sync_channel(4);
+        let count = Arc::new(AtomicI32::new(0));
+        let count2 = count.clone();
+        let cb: FicQualityCb = Some(Arc::new(move |_success, _total| {
+            count2.fetch_add(1, Ordering::Relaxed);
+        }));
+        // Construction must succeed; the callback is only invoked from run_loop,
+        // which we do not drive here, so count stays 0.
+        let _p = DabPipeline::new(1, tx, None, None, cb);
+        assert_eq!(count.load(Ordering::Relaxed), 0);
     }
 }
