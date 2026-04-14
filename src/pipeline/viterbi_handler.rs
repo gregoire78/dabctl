@@ -431,6 +431,77 @@ mod tests {
         );
     }
 
+    // TEST 8.1 (DoD) — Viterbi recovery after degraded then restored soft bits.
+    //
+    // Phase 1: feed near-neutral soft bits (simulating very noisy OFDM).
+    // Phase 2: feed valid encoded soft bits (OFDM recovered).
+    // After recovery the decoder must produce valid binary-only output with no
+    // blocked state, matching a freshly initialised decoder.
+    #[test]
+    fn viterbi_recovers_after_degraded_then_clean_input() {
+        let nbits = 32usize;
+        let original = vec![0u8; nbits];
+        let clean_soft = test_encode(&original);
+        let total = required_soft_input_len(nbits);
+
+        let mut v = ViterbiSpiral::new(nbits);
+        let mut decoded = vec![0u8; nbits];
+
+        // Phase 1: feed several rounds of near-neutral soft bits (poor SNR).
+        let neutral_input = vec![1i16; total]; // ~0-confidence input, almost random
+        for _ in 0..5 {
+            v.deconvolve(&neutral_input, &mut decoded);
+            // Output may be garbage but must always be binary (0 or 1 only).
+            assert!(
+                decoded.iter().all(|&b| b == 0 || b == 1),
+                "output must be binary even under degraded input"
+            );
+        }
+
+        // Phase 2: feed the clean encoded all-zeros sequence three times.
+        // The decoder must converge to the correct output (no stuck state).
+        for attempt in 0..3 {
+            v.deconvolve(&clean_soft, &mut decoded);
+            assert!(
+                decoded.iter().all(|&b| b == 0 || b == 1),
+                "attempt {}: output contains non-binary values after recovery",
+                attempt
+            );
+        }
+
+        // On the final recovery pass the decoder must decode correctly.
+        v.deconvolve(&clean_soft, &mut decoded);
+        assert_eq!(
+            decoded, original,
+            "Viterbi must decode correctly after recovery from degraded input"
+        );
+    }
+
+    // TEST 8.1 (DoD) — Viterbi output is always binary (0 or 1).
+    //
+    // Regardless of soft-bit content (random pattern), every output byte must
+    // be strictly 0 or 1 — verifying no corrupt state propagation.
+    #[test]
+    fn viterbi_output_always_binary_under_random_input() {
+        let nbits = 64usize;
+        let mut v = ViterbiSpiral::new(nbits);
+        let total = required_soft_input_len(nbits);
+        let mut decoded = vec![0u8; nbits];
+
+        // Deterministic "random-looking" pattern: alternating ±63.
+        let soft: Vec<i16> = (0..total)
+            .map(|i| if i % 7 < 4 { 63i16 } else { -63i16 })
+            .collect();
+
+        for _ in 0..10 {
+            v.deconvolve(&soft, &mut decoded);
+            assert!(
+                decoded.iter().all(|&b| b == 0 || b == 1),
+                "Viterbi output must always be binary, got non-binary values"
+            );
+        }
+    }
+
     /// Test-only rate-1/4 K=7 convolutional encoder.
     ///
     /// State convention: `new_state = (old_state << 1 | input_bit) & (NUM_STATES − 1)`.

@@ -129,6 +129,60 @@ mod tests {
         );
     }
 
+    // TEST 1.1 (DoD) — CFO injection: phasor magnitude stays ≈1.0 for ±1/5/10 kHz
+    // over a long burst, confirming renormalisation handles all common CFO values.
+    #[test]
+    fn cfo_injection_phasor_stays_unit_at_1khz() {
+        let mut nco = Nco::new();
+        let freq_hz = 1_000i32;
+        let sample_rate = 2_048_000u32;
+        // Process 200 000 samples (≈ 0.1 s worth at 2.048 Msps) in 1-sample batches.
+        for _ in 0..200_000 {
+            let mut s = [Complex32::new(1.0, 0.0)];
+            nco.apply_batch(&mut s, freq_hz, sample_rate);
+        }
+        let norm = nco.phasor.norm();
+        assert!(
+            (norm - 1.0).abs() < 1e-4,
+            "+1 kHz CFO: phasor norm drifted to {:.6} (expected ≈1.0)",
+            norm
+        );
+    }
+
+    #[test]
+    fn cfo_injection_phasor_stays_unit_at_minus_5khz() {
+        let mut nco = Nco::new();
+        let freq_hz = -5_000i32;
+        let sample_rate = 2_048_000u32;
+        for _ in 0..200_000 {
+            let mut s = [Complex32::new(1.0, 0.0)];
+            nco.apply_batch(&mut s, freq_hz, sample_rate);
+        }
+        let norm = nco.phasor.norm();
+        assert!(
+            (norm - 1.0).abs() < 1e-4,
+            "-5 kHz CFO: phasor norm drifted to {:.6} (expected ≈1.0)",
+            norm
+        );
+    }
+
+    #[test]
+    fn cfo_injection_phasor_stays_unit_at_10khz() {
+        let mut nco = Nco::new();
+        let freq_hz = 10_000i32;
+        let sample_rate = 2_048_000u32;
+        for _ in 0..200_000 {
+            let mut s = [Complex32::new(1.0, 0.0)];
+            nco.apply_batch(&mut s, freq_hz, sample_rate);
+        }
+        let norm = nco.phasor.norm();
+        assert!(
+            (norm - 1.0).abs() < 1e-4,
+            "+10 kHz CFO: phasor norm drifted to {:.6} (expected ≈1.0)",
+            norm
+        );
+    }
+
     /// Helper to expose the internal phasor for testing; uses the zero-step
     /// property: apply_batch with freq=0 leaves the phasor unmoved, letting
     /// the calling test read it via `nco.phasor` if we temporarily make it pub.

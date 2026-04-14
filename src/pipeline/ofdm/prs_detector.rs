@@ -183,4 +183,47 @@ mod tests {
             offset
         );
     }
+
+    // TEST 2.2 (DoD) — PRS detector robustness under amplitude fading.
+    //
+    // Verify that the PRS detector still finds the correct index when the
+    // signal amplitude is strongly attenuated (simulating a deep fade).
+    // The correlation threshold must be tolerant enough to handle this.
+    #[test]
+    fn find_index_succeeds_with_attenuated_prs() {
+        let (detector, prs) = synthetic_prs_mode1();
+        // Scale amplitude to 10% — a severe fade scenario.
+        let attenuated: Vec<Complex32> = prs.iter().map(|&s| s * 0.1).collect();
+        let idx = detector.find_index(&attenuated, 2);
+        assert!(
+            idx >= 0,
+            "find_index should succeed even with 10% amplitude PRS, got {}",
+            idx
+        );
+        assert_eq!(
+            idx, 0,
+            "peak should still be at index 0 for attenuated unshifted PRS"
+        );
+    }
+
+    // TEST 2.2 (DoD) — PRS tracking with additive noise (reduced SNR).
+    //
+    // Add deterministic "noise" to the PRS and verify the detector is still
+    // able to locate the peak (lock not lost) at a low threshold.
+    #[test]
+    fn find_index_tolerates_moderate_noise() {
+        let (detector, prs) = synthetic_prs_mode1();
+        // Add a fixed small perturbation to every sample (deterministic, not random).
+        let noisy: Vec<Complex32> = prs
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| s + Complex32::new(0.05 * (i as f32 * 0.01).sin(), 0.0))
+            .collect();
+        let idx = detector.find_index(&noisy, 2);
+        assert!(
+            idx >= 0,
+            "find_index should succeed with moderate noise, got {}",
+            idx
+        );
+    }
 }

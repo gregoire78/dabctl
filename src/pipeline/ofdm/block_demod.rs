@@ -219,4 +219,111 @@ mod tests {
             assert_eq!(bit, 0, "all ibits should be 0 for zero FFT output");
         }
     }
+
+    // TEST 5.1 (DoD) — Softbits always bounded to [-127, 127].
+    //
+    // Feed various signal amplitudes (including extreme values) and verify
+    // that every soft bit produced by the DQPSK demodulator stays in [-127, 127].
+    #[test]
+    fn softbits_bounded_at_127_for_any_amplitude() {
+        let carriers = 4;
+        let t_u = 8;
+        let freq_map = simple_freq_map(carriers);
+
+        // Test several signal amplitudes including very large values.
+        for amplitude in &[0.001f32, 1.0, 10.0, 1000.0, 1e6] {
+            let reference: Vec<Complex32> = (0..t_u)
+                .map(|i| {
+                    if i > 0 && i <= carriers {
+                        Complex32::new(*amplitude, 0.0)
+                    } else {
+                        Complex32::new(0.0, 0.0)
+                    }
+                })
+                .collect();
+            let fft_out: Vec<Complex32> = (0..t_u)
+                .map(|i| {
+                    if i > 0 && i <= carriers {
+                        Complex32::new(*amplitude * FRAC_1_SQRT_2, *amplitude * FRAC_1_SQRT_2)
+                    } else {
+                        Complex32::new(0.0, 0.0)
+                    }
+                })
+                .collect();
+
+            let mut demod = BlockDemod::new(carriers, t_u);
+            demod.set_reference_from_fft(&reference);
+            let mut ibits = vec![0i16; 2 * carriers];
+            demod.process(&fft_out, &freq_map, t_u, &mut ibits);
+
+            for (idx, &bit) in ibits.iter().enumerate() {
+                assert!(
+                    bit >= -127 && bit <= 127,
+                    "softbits[{}] = {} out of bounds [-127, 127] at amplitude {}",
+                    idx,
+                    bit,
+                    amplitude
+                );
+            }
+        }
+    }
+
+    // TEST 5.1 (DoD) — Softbits symmetric for I and Q components.
+    //
+    // With a 45° QPSK signal relative to a real-valued reference, the
+    // differential demodulator produces equal I and Q components, confirming
+    // symmetric handling of both channels.
+    #[test]
+    fn softbits_symmetric_iq_for_qpsk() {
+        // Use a unit-real reference and a 45° QPSK data symbol.
+        // r1 = (1/√2 + i/√2) * conj(1+0j) = 1/√2 + i/√2
+        // ab1 = |1/√2| + |1/√2| = √2
+        // ibits[I] = -(1/√2)/√2 * 127 = -0.5 * 127 ≈ -64
+        // ibits[Q] = -(1/√2)/√2 * 127 = -0.5 * 127 ≈ -64  (equal to I)
+        let carriers = 4;
+        let t_u = 8;
+        let freq_map = simple_freq_map(carriers);
+
+        let reference: Vec<Complex32> = (0..t_u)
+            .map(|i| {
+                if i > 0 && i <= carriers {
+                    Complex32::new(1.0, 0.0) // unit-real reference
+                } else {
+                    Complex32::new(0.0, 0.0)
+                }
+            })
+            .collect();
+        // Data: 45° QPSK symbol (first quadrant).
+        let fft_out: Vec<Complex32> = (0..t_u)
+            .map(|i| {
+                if i > 0 && i <= carriers {
+                    Complex32::new(FRAC_1_SQRT_2, FRAC_1_SQRT_2)
+                } else {
+                    Complex32::new(0.0, 0.0)
+                }
+            })
+            .collect();
+
+        let mut demod = BlockDemod::new(carriers, t_u);
+        demod.set_reference_from_fft(&reference);
+        let mut ibits = vec![0i16; 2 * carriers];
+        demod.process(&fft_out, &freq_map, t_u, &mut ibits);
+
+        // All soft bits must be in [-127, 127].
+        for &bit in &ibits {
+            assert!(
+                bit >= -127 && bit <= 127,
+                "softbits must be in [-127, 127], got {}",
+                bit
+            );
+        }
+        // I and Q halves should be equal: same I and Q differential phase.
+        for i in 0..carriers {
+            assert_eq!(
+                ibits[i], ibits[carriers + i],
+                "I softbit[{}]={} should equal Q softbit at 45° input",
+                i, ibits[i]
+            );
+        }
+    }
 }

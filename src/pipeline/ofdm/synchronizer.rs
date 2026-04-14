@@ -381,4 +381,77 @@ mod tests {
             "Timeout must fire when end-of-null window is exhausted"
         );
     }
+
+    // TEST 2.1 (DoD) — NULL position stability over many frames.
+    //
+    // Build a synthetic signal with a periodic NULL at a fixed sample offset,
+    // process 100 frames, and verify that every frame detects the NULL at the
+    // same position with variance < ±1 sample.
+    #[test]
+    fn null_position_stable_over_many_frames() {
+        // Minimal synthetic DAB-like frame:
+        //   frame_len = 1000 samples, null_len = 100 samples.
+        //   Signal = 1.0 everywhere except samples [0, null_len) which are 0.0.
+        let frame_len = 1_000usize;
+        let null_len = 100usize;
+        let s_level = 1.0f32;
+
+        // Build one frame of samples.
+        let frame: Vec<f32> = (0..frame_len)
+            .map(|i| if i < null_len { 0.0 } else { 1.0 })
+            .collect();
+
+        let mut state = SyncState::new(frame_len * 2, null_len);
+
+        // Prime the sliding window with the signal-level portion.
+        for _ in 0..SLIDING_WINDOW {
+            state.prefill(1.0);
+        }
+
+        let mut null_positions: Vec<usize> = Vec::new();
+
+        for _frame_idx in 0..100 {
+            state.reset();
+            for _ in 0..SLIDING_WINDOW {
+                state.prefill(1.0);
+            }
+
+            let mut null_pos: Option<usize> = None;
+            for (i, &amp) in frame.iter().enumerate() {
+                match state.detect_null(amp, s_level) {
+                    NullState::NullFound => {
+                        null_pos = Some(i);
+                        break;
+                    }
+                    NullState::Timeout => break,
+                    _ => {}
+                }
+            }
+
+            if let Some(pos) = null_pos {
+                null_positions.push(pos);
+            }
+        }
+
+        assert!(
+            null_positions.len() >= 95,
+            "NULL should be detected in ≥ 95% of frames, got {}/100",
+            null_positions.len()
+        );
+
+        // Compute variance of NULL positions; they should all be equal.
+        let mean = null_positions.iter().sum::<usize>() as f64 / null_positions.len() as f64;
+        let variance: f64 = null_positions
+            .iter()
+            .map(|&p| (p as f64 - mean).powi(2))
+            .sum::<f64>()
+            / null_positions.len() as f64;
+
+        assert!(
+            variance < 1.0,
+            "NULL position variance should be < 1.0, got {:.2} (mean={:.1})",
+            variance,
+            mean
+        );
+    }
 }
