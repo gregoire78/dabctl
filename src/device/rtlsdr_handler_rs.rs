@@ -11,6 +11,10 @@ use tracing::{debug, info, warn};
 
 const READLEN_DEFAULT: usize = 8192;
 const INPUT_RATE: u32 = 2_048_000;
+/// DAB Band III channel bandwidth (ETSI EN 300 401 §2.2): 1.536 MHz.
+/// Setting the tuner IF filter to this value reduces adjacent-channel noise
+/// and improves SNR on the 8-bit RTL2832U ADC.
+const DAB_CHANNEL_BW: u32 = 1_536_000;
 
 /// SAGC: upper signal level threshold (int8 absolute-value scale, 0–127).
 /// Gain is reduced when the running estimate exceeds this value.
@@ -366,6 +370,14 @@ impl RtlsdrHandler {
                 let _ = init_tx.send(Err(msg));
                 running.store(false, Ordering::SeqCst);
                 return;
+            }
+
+            // Narrow the tuner IF filter to the DAB Band III channel bandwidth
+            // (1.536 MHz) to reject adjacent signals and maximise SNR on the
+            // 8-bit RTL2832U ADC.  Not all tuner chips honour this call, so a
+            // failure is non-fatal.
+            if let Err(e) = sdr.set_tuner_bandwidth(DAB_CHANNEL_BW) {
+                warn!("set_tuner_bandwidth failed (non-fatal): {}", e);
             }
 
             if config.ppm_offset != 0 {
