@@ -377,6 +377,19 @@ pub fn run(args: Iq2pcmArgs) {
         // preventing a single partial-recovery tick from resetting the counter.
         const DROPOUT_WARN_SECS: u32 = 5;
         let mut consecutive_dropout_s: u32 = 0;
+        // Counts consecutive 1-second intervals where OFDM is syncing
+        // (fib_frames > 0) but every delivered FIB fails its CRC check.
+        // This catches the case where the RTL-SDR crystal offset is large
+        // enough to prevent FIC decoding without ever triggering the
+        // sfail-based dropout warning (which fires only when audio services
+        // have been selected).
+        const FIB_FAIL_WARN_SECS: u32 = 5;
+        let mut consecutive_fib_fail_s: u32 = 0;
+        // AFC offset above which a PPM adjustment hint is shown (Hz).
+        // 500 Hz at 200 MHz corresponds to ~2.5 PPM, large enough to prevent FIC decoding.
+        const LARGE_FREQ_OFFSET_HZ: i32 = 500;
+        // SNR below which antenna/gain hints are preferred over PPM hints (dB, integer).
+        const WEAK_SNR_DB: i16 = 4;
 
         while status_run.load(Ordering::SeqCst) {
             let fi = c_fi.swap(0, Ordering::SeqCst);
@@ -401,23 +414,21 @@ pub fn run(args: Iq2pcmArgs) {
             let gain_t = gain_tenths.load(Ordering::Relaxed);
             let gain_db_x10 = if gain_t >= 0 { gain_t } else { 0 };
 
-            // B. Only report frequency offset and PPM when the OFDM decoder is
-            // locked (sync_ok > 0).  During a full dropout the phase-reference
-            // correlator produces arbitrary values that would mislead the reader.
-            let (offset_hz, mppm) = if sok > 0 {
-                // Derive PPM from the OFDM AFC total offset (coarse + fine).
+            // B. Always report the OFDM AFC frequency offset so that users can
+            // diagnose crystal PPM errors even before audio decoding succeeds.
+            // The AFC correctors (coarse + fine) are updated inside the inner
+            // tracking loop and are therefore stable, meaningful values — unlike
+            // the phase-reference correlator output that could be noisy during a
+            // dropout.  mppm is only meaningful once the tuned frequency is known.
+            let off = c_fo.load(Ordering::Relaxed);
+            let mppm = if freq > 0 {
                 // ppm = offset_hz × 1_000_000 / tuned_freq_hz (ETSI EN 300 401 §8.4.3).
                 // Reported in milli-PPM (×1000) so sub-PPM offsets are visible.
-                let off = c_fo.load(Ordering::Relaxed);
-                let ppm = if freq > 0 {
-                    off * 1_000_000_000 / freq
-                } else {
-                    0
-                };
-                (off, ppm)
+                off * 1_000_000_000 / freq
             } else {
-                (0, 0)
+                0
             };
+            let offset_hz = off;
 
             debug!(
                 snr = sn2.load(Ordering::SeqCst),
@@ -449,7 +460,7 @@ pub fn run(args: Iq2pcmArgs) {
                     let snr_val = sn2.load(Ordering::SeqCst);
                     let hint = if offset_hz == 0 && snr_val < 6 {
                         " — weak RF signal, check antenna"
-                    } else if offset_hz.abs() > 500 {
+                    } else if offset_hz.abs() > LARGE_FREQ_OFFSET_HZ {
                         " — large frequency offset, try -p to adjust PPM"
                     } else {
                         " — OFDM sync lost, audio interrupted"
@@ -470,6 +481,32 @@ pub fn run(args: Iq2pcmArgs) {
                     );
                 }
                 consecutive_dropout_s = 0;
+            }
+
+            // D. Warn when OFDM is delivering FIC frames but every FIB fails
+            // CRC — a symptom of a large crystal PPM offset or a signal that
+            // is too weak for FIC decoding.  This fires even when no audio
+            // service has been selected (sok == 0), catching the pre-lock
+            // stage shown in the startup log.
+            if fib_frames > 0 && fib_quality == 0 {
+                consecutive_fib_fail_s += 1;
+                if consecutive_fib_fail_s == FIB_FAIL_WARN_SECS {
+                    let snr_val = sn2.load(Ordering::SeqCst);
+                    let hint = if offset_hz.abs() > LARGE_FREQ_OFFSET_HZ {
+                        " — large frequency offset, try -p to adjust PPM"
+                    } else if snr_val < WEAK_SNR_DB {
+                        " — weak RF signal, check antenna or increase gain"
+                    } else {
+                        " — check PPM offset (-p) or signal quality"
+                    };
+                    warn!(
+                        "OFDM syncing but all FIBs failing CRC for {} s \
+                         (snr={} dB, freq_offset={} Hz){}",
+                        consecutive_fib_fail_s, snr_val, offset_hz, hint,
+                    );
+                }
+            } else {
+                consecutive_fib_fail_s = 0;
             }
 
             thread::sleep(std::time::Duration::from_secs(1));
