@@ -256,11 +256,12 @@ impl OfdmProcessor {
             .process(&self.fft_buf, &self.freq_map, t_u, ibits);
 
         // Apply LMS equalizer to post-differential symbols then regenerate soft
-        // bits.  Splitting borrows explicitly keeps NLL happy (equalizer and
-        // block_demod are separate struct fields).
-        let (eq, bd) = (&mut self.equalizer, &mut self.block_demod);
-        eq.equalize(bd.r1_buf_mut());
-        bd.recompute_ibits(ibits);
+        // bits.  The two fields are disjoint so Rust NLL can split the borrows;
+        // explicit tuple destructuring makes the disjointness visible to the
+        // borrow checker.
+        let (equalizer, block_demod) = (&mut self.equalizer, &mut self.block_demod);
+        equalizer.equalize(block_demod.r1_buf_mut());
+        block_demod.recompute_ibits(ibits);
     }
 
     // ── Main run loop ─────────────────────────────────────────────────────────
