@@ -28,10 +28,29 @@ git submodule update --init vendor/old-dab-rtlsdr
 # 3. Build (old-dab/rtlsdr backend compiled automatically)
 cargo build --release
 
-# 4. Listen — channel 6C, service NRJ (SID 0xF2F8)
-sudo ./target/release/dabctl -C 6C -s 0xF2F8 \
+# 4. Discover which services are available on a channel
+sudo ./target/release/dabctl scan -C 6C
+# → Ensemble found: NordwestDeutschland (EId 0x1001)
+# →   Service: NDR 2 (SId 0xF201)
+# →   Service: NDR Info (SId 0xF202)
+# → 2 service(s) found on channel 6C
+
+# 5. Play a service found by scan
+sudo ./target/release/dabctl play -C 6C -s 0xF201 \
   | ffplay -f s16le -ar 48000 -ac 2 -nodisp -i -
 ```
+
+### DAB pipeline
+
+`dabctl` follows the DAB signal chain:
+
+1. **Tune** — RTL-SDR is tuned to the Band III channel
+2. **OFDM sync** — coarse/fine frequency correction, timing recovery, FFT
+3. **FIC decode** (QPSK) — ensemble name and service list are extracted and logged
+4. **MSC decode** (QAM 4/16) — the selected sub-channel is extracted
+5. **DAB+ audio** — Reed-Solomon → superframe → HE-AAC → signed 16-bit PCM
+
+The `scan` subcommand runs steps 1–3 and exits.  The `play` subcommand runs all five steps and streams PCM on stdout.
 
 Audio output is **signed 16-bit PCM, stereo, 48 kHz** on stdout.
 Only **DAB+** services (HE-AAC) are decoded; classic DAB (MP2) is not supported.
@@ -135,8 +154,29 @@ A ready-to-use devcontainer is provided for VS Code and GitHub Codespaces
 
 ## CLI reference
 
+### `dabctl scan` — discover services
+
 ```
-dabctl -C <channel> -s <sid> [options]
+dabctl scan -C <channel> [options]
+```
+
+| Option | Short | Description | Default |
+|---|---|---|---|
+| `--channel` | `-C` | DAB channel to scan (e.g. `5A`, `6C`, `11C`) | **required** |
+| `--gain` | `-G` | Tuner gain in % (0–100) | software AGC |
+| `--hardware-agc` | | Use the RTL-SDR chip's built-in hardware AGC | off |
+| `--ppm` | `-p` | Frequency correction in PPM | `0` |
+| `--sync-time` | `-d` | Sync timeout in seconds | `5` |
+| `--detect-time` | `-D` | Service detection timeout in seconds | `10` |
+| `--device-index` | | RTL-SDR dongle index | `0` |
+| `--silent` | | No log output on stderr | off |
+
+Exit codes: `0` = services found, `1` = no DAB signal, `2` = signal found but FIC decoding failed (signal too weak).
+
+### `dabctl play` — play a service
+
+```
+dabctl play -C <channel> -s <sid> [options]
 ```
 
 | Option | Short | Description | Default |
@@ -178,29 +218,32 @@ Redirect with: `3>metadata.json`
 ## Examples
 
 ```bash
-# Software AGC (default)
-sudo ./target/release/dabctl -C 6C -s 0xF2F8 \
+# Step 1: discover which services are on channel 6C
+sudo ./target/release/dabctl scan -C 6C
+# → Ensemble found: NordwestDeutschland (EId 0x1001)
+# →   Service: NDR 2 (SId 0xF201)
+# →   Service: NDR Info (SId 0xF202)
+
+# Step 2: play a service (SId from scan output)
+sudo ./target/release/dabctl play -C 6C -s 0xF201 \
   | ffplay -f s16le -ar 48000 -ac 2 -nodisp -i -
 
 # Manual gain + frequency correction
-sudo ./target/release/dabctl -C 6C -s 0xF2F8 -G 20 -p 2 \
+sudo ./target/release/dabctl play -C 6C -s 0xF2F8 -G 20 -p 2 \
   | ffplay -f s16le -ar 48000 -ac 2 -nodisp -i -
 
 # aplay instead of ffplay
-sudo ./target/release/dabctl -C 11C -s 0xF2F8 -G 50 \
+sudo ./target/release/dabctl play -C 11C -s 0xF2F8 -G 50 \
   | aplay -f S16_LE -r 48000 -c 2
 
 # Capture slideshow and DLS metadata
-sudo ./target/release/dabctl -C 6C -s 0xF2F8 \
+sudo ./target/release/dabctl play -C 6C -s 0xF2F8 \
   --slide-dir /tmp/slides --slide-base64 3>pad_metadata.json \
   | ffplay -f s16le -ar 48000 -ac 2 -nodisp -i -
 
 # Convert to WAV
-sudo ./target/release/dabctl -C 6C -s 0xF2F8 -G 20 \
+sudo ./target/release/dabctl play -C 6C -s 0xF2F8 -G 20 \
   | sox -t raw -r 48000 -b 16 -c 2 -e signed-integer -L - output.wav
-
-# Automated capture helper script
-./live-capture-iq2pcm.sh 6C 0xF2F8 20
 ```
 
 ---
@@ -214,9 +257,10 @@ build.rs                        RTL-SDR backend selection (cmake / bindgen / lin
 vendor/
   old-dab-rtlsdr/               Vendored old-dab/rtlsdr C library (git submodule)
 src/
-  main.rs                       CLI entry point (clap) → pipeline
+  main.rs                       CLI entry point (clap) — `play` and `scan` subcommands
   lib.rs                        Module declarations
-  iq2pcm_cmd.rs                 Main pipeline: RTL-SDR → PCM
+  iq2pcm_cmd.rs                 `play` subcommand: RTL-SDR → PCM audio
+  scan_cmd.rs                   `scan` subcommand: discover ensembles and services
   device/
     mod.rs                      Backend selection via #[cfg(feature)]
     rtlsdr_handler_osmocom.rs   FFI handler shared by old-dab and osmocom backends
@@ -434,7 +478,7 @@ Check that the antenna is connected and oriented vertically for Band III.
 Try the alternative AAC backend (requires a `--features fdk-aac` build):
 
 ```bash
-sudo ./target/release/dabctl -C 6C -s 0xF2F8 --aac-decoder fdk-aac | ffplay …
+sudo ./target/release/dabctl play -C 6C -s 0xF2F8 --aac-decoder fdk-aac | ffplay …
 ```
 
 ---
@@ -458,7 +502,7 @@ bash live-capture-iq2pcm.sh 8C 0xF201
 Or run `dabctl` directly and save stderr logs:
 
 ```bash
-sudo RUST_LOG=info,dabctl=debug ./target/release/dabctl -C 8C -s 0xF201 \
+sudo RUST_LOG=info,dabctl=debug ./target/release/dabctl play -C 8C -s 0xF201 \
   --slide-dir /tmp/slides --slide-base64 3>pad_metadata.json \
   2>iq2pcm.log | ffmpeg -y -f s16le -ar 48000 -ac 2 -i pipe:0 output.wav
 ```

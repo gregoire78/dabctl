@@ -217,7 +217,10 @@ pub fn run(args: Iq2pcmArgs) {
         }));
     let program_cb: Option<std::sync::Arc<dyn Fn(&str, i32) + Send + Sync>> =
         Some(std::sync::Arc::new(move |name: &str, sid: i32| {
-            debug!("program {} (0x{:X}) is in the list", name.trim(), sid);
+            let label = name.trim();
+            if !label.is_empty() {
+                info!("Service discovered: {} (SId 0x{:04X})", label, sid as u32);
+            }
         }));
     let fok = fic_ok.clone();
     let ftot = fic_total.clone();
@@ -299,7 +302,17 @@ pub fn run(args: Iq2pcmArgs) {
         }
     }
 
-    info!("Starting audio processing...");
+    if ensemble_recognized.load(Ordering::SeqCst) {
+        info!("Ensemble detected — starting audio processing...");
+    } else {
+        warn!(
+            "No ensemble detected within {} s (FIC decoding failed) — \
+             signal may be too weak; try increasing gain with -G or scanning \
+             first with: dabctl scan -C {}",
+            args.detect_time, args.channel
+        );
+        info!("Attempting audio processing anyway...");
+    }
     pipeline_processing_flag.store(true, Ordering::SeqCst);
     run.store(true, Ordering::SeqCst);
 
