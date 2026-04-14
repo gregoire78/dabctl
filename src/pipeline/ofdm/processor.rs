@@ -27,6 +27,49 @@ use crate::pipeline::ofdm::synchronizer::{NullState, SyncState};
 /// 0.02) converges faster but risks oscillation under heavy multipath.
 const EQUALIZER_MU: f32 = 0.005;
 
+/// Maximum coarse AFC correction applied in a single PRS frame (carrier units).
+///
+/// RTL-SDR crystals are typically accurate to ±20–25 ppm.  At a 250 MHz centre
+/// frequency that is ±6 kHz, or ±6 carriers in DAB Mode 1 (1 kHz spacing).
+/// Clamping each step to ±3 carriers bounds the maximum single-frame correction
+/// to half the expected worst-case offset; the outer acquisition loop repeats
+/// until the coarse corrector has converged, after which the fine corrector
+/// (cyclic-prefix correlation) handles any sub-carrier residual.
+///
+/// Without this clamp the `estimate_offset` function — which is unreliable at
+/// SNR below ~6 dB — can return values up to ±35, causing the coarse corrector
+/// to oscillate by tens of kHz each frame and preventing lock entirely.
+const AFC_MAX_STEP_CARRIERS: i16 = 3;
+
+/// Normalise every complex symbol in `symbols` to unit magnitude in-place.
+///
+/// Symbols with magnitude below [`f32::EPSILON`] are left unchanged to avoid
+/// division by zero; their phase is undefined and any QPSK decision on them
+/// will be random regardless.
+///
+/// # Why this is needed
+///
+/// The raw differential QPSK output `r1 = fft_data × conj(fft_prs)` is a
+/// product of two FFT outputs, so its magnitude scales with `|fft|²` rather
+/// than `|fft|`.  For a DAB Mode 1 signal at typical SDR amplitude levels
+/// `|r1|` is on the order of 200–300, far larger than the unit-amplitude
+/// symbols the LMS equalizer expects.  The LMS stability condition
+/// `µ·|sym|² < 2` then becomes `0.005 × 256² ≈ 328 < 2` — completely
+/// violated — and equalizer weights diverge exponentially, producing NaN in
+/// the MER metric after approximately 16 symbols.
+///
+/// For DQPSK only the *phase* of `r1` carries information; normalising the
+/// magnitude to 1 is therefore lossless for both equalization and soft-bit
+/// generation.
+fn normalise_unit_circle(symbols: &mut [Complex32]) {
+    for s in symbols.iter_mut() {
+        let mag = s.norm();
+        if mag > f32::EPSILON {
+            *s /= mag;
+        }
+    }
+}
+
 /// Acquisition / tracking detection thresholds (inclusive bounds).
 const OFDM_THRESHOLD_MIN: i16 = 2;
 const OFDM_THRESHOLD_MAX: i16 = 7;
@@ -256,17 +299,8 @@ impl OfdmProcessor {
             .process(&self.fft_buf, &self.freq_map, t_u, ibits);
 
         // Normalise each differential symbol to unit magnitude before equalization.
-        // The raw r1 values are products of two FFT outputs (|r1| ≈ |fft|²), which
-        // can be hundreds of times larger than 1.  The LMS step µ = 0.005 is tuned
-        // for unit-amplitude symbols: without normalisation µ·|sym|² ≫ 2 and the
-        // weights diverge, eventually producing NaN.  For DQPSK only the phase of
-        // r1 carries information, so discarding the magnitude is lossless.
-        for s in self.block_demod.r1_buf_mut() {
-            let mag = s.norm();
-            if mag > f32::EPSILON {
-                *s /= mag;
-            }
-        }
+        // See [`normalise_unit_circle`] for a detailed explanation.
+        normalise_unit_circle(self.block_demod.r1_buf_mut());
 
         // Apply LMS equalizer to post-differential symbols then regenerate soft
         // bits.  The two fields are disjoint so Rust NLL can split the borrows;
@@ -419,10 +453,10 @@ impl OfdmProcessor {
                 if self.f2_correction {
                     let correction = self.phase_synchronizer.estimate_offset(&self.ofdm_buffer);
                     if correction != 100 {
-                        // Clamp to ±3 carriers per step: estimate_offset is noisy at low
+                        // Clamp to ±AFC_MAX_STEP_CARRIERS per step: estimate_offset is noisy at low
                         // SNR and can return values up to ±35, which would send the
                         // coarse corrector far from the true offset and prevent lock.
-                        let clamped = correction.clamp(-3, 3);
+                        let clamped = correction.clamp(-AFC_MAX_STEP_CARRIERS, AFC_MAX_STEP_CARRIERS);
                         let prev = self.coarse_corrector;
                         self.coarse_corrector += clamped as i32 * self.carrier_diff;
                         if self.coarse_corrector.abs() > 35_000 {
@@ -669,5 +703,71 @@ mod tests {
     fn coarse_corrector_starts_at_zero() {
         let p = make_processor(1);
         assert_eq!(p.coarse_corrector, 0);
+    }
+
+    // ── normalise_unit_circle ─────────────────────────────────────────────────
+
+    #[test]
+    fn normalise_unit_circle_scales_large_symbol_to_unit() {
+        // FFT-scale symbols have |r1| ≈ 256; after normalisation |s| must be 1.
+        let mut symbols = vec![Complex32::new(180.0, 100.0)];
+        normalise_unit_circle(&mut symbols);
+        let mag = symbols[0].norm();
+        assert!(
+            (mag - 1.0).abs() < 1e-5,
+            "expected unit magnitude, got {mag}"
+        );
+    }
+
+    #[test]
+    fn normalise_unit_circle_preserves_unit_symbol() {
+        use std::f32::consts::FRAC_1_SQRT_2;
+        let qpsk = Complex32::new(FRAC_1_SQRT_2, FRAC_1_SQRT_2);
+        let mut symbols = vec![qpsk];
+        normalise_unit_circle(&mut symbols);
+        let mag = symbols[0].norm();
+        assert!(
+            (mag - 1.0).abs() < 1e-5,
+            "unit symbol should stay unit, got {mag}"
+        );
+        // Phase must be unchanged.
+        let phase_before = qpsk.arg();
+        let phase_after = symbols[0].arg();
+        assert!(
+            (phase_before - phase_after).abs() < 1e-5,
+            "phase must be preserved: {phase_before} → {phase_after}"
+        );
+    }
+
+    #[test]
+    fn normalise_unit_circle_leaves_zero_symbol_unchanged() {
+        // A zero-magnitude symbol must not produce NaN (division by zero).
+        let mut symbols = vec![Complex32::new(0.0, 0.0)];
+        normalise_unit_circle(&mut symbols);
+        assert!(
+            symbols[0].re.is_finite() && symbols[0].im.is_finite(),
+            "zero symbol must not become NaN/Inf after normalisation"
+        );
+        assert_eq!(symbols[0], Complex32::new(0.0, 0.0));
+    }
+
+    #[test]
+    fn normalise_unit_circle_all_symbols_become_unit_magnitude() {
+        // Mixed large, small, and negative amplitudes; all must normalise to 1.
+        let inputs = [
+            Complex32::new(256.0, 256.0),
+            Complex32::new(-100.0, 50.0),
+            Complex32::new(0.5, -0.5),
+            Complex32::new(-0.01, 0.01),
+        ];
+        let mut symbols = inputs.to_vec();
+        normalise_unit_circle(&mut symbols);
+        for (i, s) in symbols.iter().enumerate() {
+            let mag = s.norm();
+            assert!(
+                (mag - 1.0).abs() < 1e-5,
+                "symbol[{i}] magnitude should be 1.0, got {mag}"
+            );
+        }
     }
 }
