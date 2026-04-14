@@ -10,3 +10,4 @@ pub mod phase_table;
 pub mod processor;
 pub mod prs_detector;
 pub mod synchronizer;
+pub mod time_interleaver;
