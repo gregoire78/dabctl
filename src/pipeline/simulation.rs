@@ -953,10 +953,10 @@ mod tests {
     #[test]
     fn print_snr_ber_table() {
         println!(
-            "\n{:<10} {:<14} {}",
-            "SNR (dB)", "BER COFDM", "Quality"
+            "\n{:<10} {:<14} {:<10} {:<12} {}",
+            "SNR (dB)", "BER COFDM", "FIB OK%", "Gain dB", "Quality"
         );
-        println!("{}", "─".repeat(38));
+        println!("{}", "─".repeat(58));
 
         for &snr in &[4.0f32, 6.0, 8.0, 10.0, 12.0] {
             let p = simulate_snr_point(snr, 200, 512);
@@ -968,8 +968,8 @@ mod tests {
                 "✗ seuil"
             };
             println!(
-                "{:<10.1} {:<14.3e} {}",
-                snr, p.ber_cofdm, quality
+                "{:<10.1} {:<14.3e} {:<10} {:<12} {}",
+                snr, p.ber_cofdm, fmt_fib(p.ber_cofdm), fmt_gain(p.coding_gain_db), quality
             );
         }
         println!();
@@ -1299,6 +1299,18 @@ mod tests {
         if g.is_infinite() { "+∞".into() } else { format!("{g:+.1} dB") }
     }
 
+    /// FIB decode success probability: P(all 240 data bits correct) × 100 %.
+    ///
+    /// A DAB FIB is 30 bytes of data + 2 bytes CRC-16-CCITT (ETSI EN 300 401 §5.2.2).
+    /// Assuming independent bit errors, P(FIB OK) = (1 − BER_COFDM)^240.
+    fn fib_ok_pct(ber_cofdm: f64) -> f64 {
+        (1.0 - ber_cofdm).powi(240) * 100.0
+    }
+
+    fn fmt_fib(ber_cofdm: f64) -> String {
+        format!("{:.1}%", fib_ok_pct(ber_cofdm))
+    }
+
     fn fmt_quality(ber_cofdm: f64, gain_db: f64) -> &'static str {
         if ber_cofdm == 0.0 {
             "✓ BON"
@@ -1311,10 +1323,12 @@ mod tests {
 
     fn print_sim_row(p: &SimResult) {
         println!(
-            "{:<26} {:<7.1} {:<13.3e} {}",
+            "{:<26} {:<7.1} {:<13.3e} {:<10} {:<12} {}",
             p.channel,
             p.snr_db,
             p.ber_cofdm,
+            fmt_fib(p.ber_cofdm),
+            fmt_gain(p.coding_gain_db),
             fmt_quality(p.ber_cofdm, p.coding_gain_db)
         );
     }
@@ -1322,21 +1336,23 @@ mod tests {
     #[test]
     fn print_rf_simulation_table() {
         let hdr = format!(
-            "\n{:<26} {:<7} {:<13} {}",
-            "Canal", "SNR dB", "BER COFDM", "Qualité"
+            "\n{:<26} {:<7} {:<13} {:<10} {:<12} {}",
+            "Canal", "SNR dB", "BER COFDM", "FIB OK%", "Gain", "Qualité"
         );
         println!("{hdr}");
-        println!("{}", "═".repeat(58));
+        println!("{}", "═".repeat(80));
 
         // ── AWGN reference ────────────────────────────────────────────────────
         println!("── AWGN (référence) ──");
         for &snr in &[4.0f32, 6.0, 8.0, 10.0, 12.0] {
             let p = simulate_snr_point(snr, 200, 256);
             println!(
-                "{:<26} {:<7.1} {:<13.3e} {}",
+                "{:<26} {:<7.1} {:<13.3e} {:<10} {:<12} {}",
                 "AWGN",
                 snr,
                 p.ber_cofdm,
+                fmt_fib(p.ber_cofdm),
+                fmt_gain(p.coding_gain_db),
                 fmt_quality(p.ber_cofdm, p.coding_gain_db)
             );
         }
