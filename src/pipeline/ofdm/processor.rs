@@ -21,7 +21,11 @@ use crate::pipeline::ofdm::phase_reference::PhaseReference;
 use crate::pipeline::ofdm::synchronizer::{NullState, SyncState};
 
 /// LMS step size for the decision-directed channel equalizer.
-const EQUALIZER_MU: f32 = 0.01;
+///
+/// 0.005 gives a good trade-off between convergence speed and oscillation
+/// resistance on typical indoor multipath DAB channels.  A larger value (e.g.
+/// 0.02) converges faster but risks oscillation under heavy multipath.
+const EQUALIZER_MU: f32 = 0.005;
 
 /// Acquisition / tracking detection thresholds (inclusive bounds).
 const OFDM_THRESHOLD_MIN: i16 = 2;
@@ -55,8 +59,12 @@ pub struct OfdmProcessor {
     nco: Nco,
     fft_engine: FftEngine,
     block_demod: BlockDemod,
-    /// Channel equalizer — reserved for future amplitude equalisation of the DQPSK path.
-    #[allow(dead_code)]
+    /// Decision-directed LMS channel equalizer applied per-carrier after DQPSK.
+    ///
+    /// Applied on the post-differential symbols held in `block_demod.r1_buf` so
+    /// that residual per-carrier amplitude/phase distortion from multipath is
+    /// suppressed before the soft bits are forwarded to the Viterbi decoder.
+    /// This is the primary lever for improving `fib_quality` on real channels.
     equalizer: Equalizer,
     sync_state: SyncState,
 
@@ -246,6 +254,13 @@ impl OfdmProcessor {
         let t_u = self.t_u;
         self.block_demod
             .process(&self.fft_buf, &self.freq_map, t_u, ibits);
+
+        // Apply LMS equalizer to post-differential symbols then regenerate soft
+        // bits.  Splitting borrows explicitly keeps NLL happy (equalizer and
+        // block_demod are separate struct fields).
+        let (eq, bd) = (&mut self.equalizer, &mut self.block_demod);
+        eq.equalize(bd.r1_buf_mut());
+        bd.recompute_ibits(ibits);
     }
 
     // ── Main run loop ─────────────────────────────────────────────────────────
@@ -428,8 +443,11 @@ impl OfdmProcessor {
                 }
 
                 // Fine frequency update from cyclic-prefix correlation.
+                // Gain 0.15 gives faster CFO convergence than the original 0.10 while
+                // remaining stable; the guard-interval correlation is averaged over all
+                // data symbols in the frame so the estimate is already low-variance.
                 self.fine_corrector +=
-                    0.1 * freq_corr.arg() / std::f32::consts::PI * (self.carrier_diff as f32 / 2.0);
+                    0.15 * freq_corr.arg() / std::f32::consts::PI * (self.carrier_diff as f32 / 2.0);
 
                 // ── Null symbol ────────────────────────────────────────────────
                 let phase = self.coarse_corrector + self.fine_corrector as i32;
