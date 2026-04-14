@@ -9,5 +9,6 @@ pub mod ofdm;
 pub mod prot_tables;
 pub mod protection;
 pub mod ringbuffer;
+pub mod simulation;
 pub mod subchannel_pool;
 pub mod viterbi_handler;
