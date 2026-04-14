@@ -147,4 +147,114 @@ mod tests {
             assert_eq!(*w, Complex32::new(1.0, 0.0));
         }
     }
+
+    // TEST 4.1 (DoD) — Multipath channel: MER improves after LMS convergence.
+    //
+    // Inject a per-carrier complex distortion (simulating a static multipath
+    // channel) and verify that after many LMS iterations the MER of the
+    // equalised output is measurably better than the pre-equalisation MER.
+    #[test]
+    fn equalizer_improves_mer_after_multipath_distortion() {
+        use crate::pipeline::ofdm::mer::estimate_mer;
+
+        let carriers = 16;
+        // Static multipath: carrier k has amplitude*e^(j*phase) distortion.
+        // Use a fixed per-carrier complex gain that varies across carriers.
+        let channel: Vec<Complex32> = (0..carriers)
+            .map(|k| {
+                let angle = k as f32 * 0.4; // fixed phase ramp
+                let amp = 0.5 + 0.4 * ((k as f32 * 0.7).sin().abs()); // amplitude 0.1..0.9
+                Complex32::new(amp * angle.cos(), amp * angle.sin())
+            })
+            .collect();
+
+        // Ideal QPSK symbols, one per carrier (same symbol every iteration).
+        let ideal: Vec<Complex32> = (0..carriers)
+            .map(|k| {
+                let pts = [
+                    Complex32::new(FRAC_1_SQRT_2, FRAC_1_SQRT_2),
+                    Complex32::new(-FRAC_1_SQRT_2, FRAC_1_SQRT_2),
+                    Complex32::new(FRAC_1_SQRT_2, -FRAC_1_SQRT_2),
+                    Complex32::new(-FRAC_1_SQRT_2, -FRAC_1_SQRT_2),
+                ];
+                pts[k % 4]
+            })
+            .collect();
+
+        let mut eq = Equalizer::new(carriers, 0.02);
+
+        // Measure MER before convergence (first pass through distorted signal).
+        let distorted_first: Vec<Complex32> = ideal
+            .iter()
+            .zip(channel.iter())
+            .map(|(&s, &h)| s * h)
+            .collect();
+        let mer_before = estimate_mer(&distorted_first);
+
+        // Run 500 LMS iterations with the same distorted symbols.
+        for _ in 0..500 {
+            let mut distorted: Vec<Complex32> = ideal
+                .iter()
+                .zip(channel.iter())
+                .map(|(&s, &h)| s * h)
+                .collect();
+            eq.equalize(&mut distorted);
+        }
+
+        // Measure MER after convergence (one more pass).
+        let mut distorted_last: Vec<Complex32> = ideal
+            .iter()
+            .zip(channel.iter())
+            .map(|(&s, &h)| s * h)
+            .collect();
+        eq.equalize(&mut distorted_last);
+        let mer_after = estimate_mer(&distorted_last);
+
+        assert!(
+            mer_after > mer_before + 3.0,
+            "MER should improve by ≥3 dB after LMS convergence; before={:.1} dB after={:.1} dB",
+            mer_before,
+            mer_after
+        );
+
+        // Weights must remain finite and bounded (no divergence).
+        for (i, w) in eq.weights.iter().enumerate() {
+            assert!(
+                w.norm().is_finite() && w.norm() < 100.0,
+                "weight[{}] diverged: {}",
+                i,
+                w.norm()
+            );
+        }
+    }
+
+    // TEST 4.2 (DoD) — Decision-directed: weights bounded after perturbation.
+    //
+    // Introduce sporadic large errors (simulating burst noise) and verify
+    // the LMS weights do not diverge (no auto-oscillation).
+    #[test]
+    fn equalizer_weights_stay_bounded_under_burst_noise() {
+        let carriers = 8;
+        let mut eq = Equalizer::new(carriers, 0.01);
+        let qpsk = Complex32::new(FRAC_1_SQRT_2, FRAC_1_SQRT_2);
+
+        for iteration in 0..300 {
+            let mut symbols: Vec<Complex32> = if iteration % 20 == 0 {
+                // Burst: inject a large error every 20 iterations.
+                vec![Complex32::new(5.0, 5.0); carriers]
+            } else {
+                vec![qpsk; carriers]
+            };
+            eq.equalize(&mut symbols);
+        }
+
+        for (i, w) in eq.weights.iter().enumerate() {
+            assert!(
+                w.norm().is_finite() && w.norm() < 200.0,
+                "weight[{}] diverged under burst noise: norm={}",
+                i,
+                w.norm()
+            );
+        }
+    }
 }
