@@ -953,18 +953,13 @@ mod tests {
     #[test]
     fn print_snr_ber_table() {
         println!(
-            "\n{:<10} {:<14} {:<14} {:<14} {}",
-            "SNR (dB)", "BER OFDM", "BER COFDM", "Coding Gain", "Quality"
+            "\n{:<10} {:<14} {}",
+            "SNR (dB)", "BER COFDM", "Quality"
         );
-        println!("{}", "─".repeat(70));
+        println!("{}", "─".repeat(38));
 
         for &snr in &[4.0f32, 6.0, 8.0, 10.0, 12.0] {
             let p = simulate_snr_point(snr, 200, 512);
-            let gain_str = if p.coding_gain_db.is_infinite() {
-                "+∞".to_string()
-            } else {
-                format!("{:+.1} dB", p.coding_gain_db)
-            };
             let quality = if p.ber_cofdm == 0.0 {
                 "✓ BON"
             } else if p.coding_gain_db > 3.0 {
@@ -973,8 +968,8 @@ mod tests {
                 "✗ seuil"
             };
             println!(
-                "{:<10.1} {:<14.3e} {:<14.3e} {:<14} {}",
-                snr, p.ber_ofdm, p.ber_cofdm, gain_str, quality
+                "{:<10.1} {:<14.3e} {}",
+                snr, p.ber_cofdm, quality
             );
         }
         println!();
@@ -1316,12 +1311,10 @@ mod tests {
 
     fn print_sim_row(p: &SimResult) {
         println!(
-            "{:<26} {:<7.1} {:<13.3e} {:<13.3e} {:<12} {}",
+            "{:<26} {:<7.1} {:<13.3e} {}",
             p.channel,
             p.snr_db,
-            p.ber_ofdm,
             p.ber_cofdm,
-            fmt_gain(p.coding_gain_db),
             fmt_quality(p.ber_cofdm, p.coding_gain_db)
         );
     }
@@ -1329,23 +1322,21 @@ mod tests {
     #[test]
     fn print_rf_simulation_table() {
         let hdr = format!(
-            "\n{:<26} {:<7} {:<13} {:<13} {:<12} {}",
-            "Canal", "SNR dB", "BER OFDM", "BER COFDM", "Gain", "Qualité"
+            "\n{:<26} {:<7} {:<13} {}",
+            "Canal", "SNR dB", "BER COFDM", "Qualité"
         );
         println!("{hdr}");
-        println!("{}", "═".repeat(86));
+        println!("{}", "═".repeat(58));
 
         // ── AWGN reference ────────────────────────────────────────────────────
         println!("── AWGN (référence) ──");
         for &snr in &[4.0f32, 6.0, 8.0, 10.0, 12.0] {
             let p = simulate_snr_point(snr, 200, 256);
             println!(
-                "{:<26} {:<7.1} {:<13.3e} {:<13.3e} {:<12} {}",
+                "{:<26} {:<7.1} {:<13.3e} {}",
                 "AWGN",
                 snr,
-                p.ber_ofdm,
                 p.ber_cofdm,
-                fmt_gain(p.coding_gain_db),
                 fmt_quality(p.ber_cofdm, p.coding_gain_db)
             );
         }
