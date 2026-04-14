@@ -21,12 +21,19 @@
 //   DELAY_TABLE[1] = 8 → reads 16 − 8 = 8 CIFs ago.
 
 /// Time-interleaving depth as specified by ETSI EN 300 401 §12.3.
+/// Must be a power of two so that `& (DEPTH - 1)` can replace `% DEPTH`.
 const DEPTH: usize = 16;
+
+const _: () = assert!(DEPTH.is_power_of_two(), "DEPTH must be a power of two");
 
 /// Per-position slot offset — ETSI EN 300 401 §12.3, Table 22.
 ///
 /// `slot_offset[i] = DELAY_TABLE[i % 16]`.
 /// The read slot is `(write_ptr + slot_offset) % DEPTH`.
+///
+/// These 16 values form a permutation of 0..15 derived from the DAB standard.
+/// Adding offset D to the current write pointer in a forward-filling ring reads
+/// the slot written `DEPTH − D` CIFs ago (or the current CIF when D = 0).
 const DELAY_TABLE: [usize; DEPTH] = [0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15];
 
 /// COFDM CIF-level time de-interleaver (ETSI EN 300 401 §12.3).
