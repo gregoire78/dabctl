@@ -93,9 +93,8 @@ pub struct OfdmProcessor {
     carriers: usize,
     carrier_diff: i32,
 
-    // ── Acquisition thresholds ────────────────────────────────────────────────
+    // ── Acquisition threshold ─────────────────────────────────────────────────
     threshold_1: i16,
-    threshold_2: i16,
 
     // ── Sub-modules ───────────────────────────────────────────────────────────
     phase_synchronizer: PhaseReference,
@@ -144,7 +143,7 @@ pub enum ProcessorError {
 }
 
 impl OfdmProcessor {
-    pub fn new(dab_mode: u8, threshold_1: i16, threshold_2: i16, running: Arc<AtomicBool>) -> Self {
+    pub fn new(dab_mode: u8, threshold_1: i16, running: Arc<AtomicBool>) -> Self {
         let params = DabParams::new(dab_mode);
         let t_u = params.t_u as usize;
         let t_s = params.t_s as usize;
@@ -172,7 +171,6 @@ impl OfdmProcessor {
             carriers,
             carrier_diff,
             threshold_1,
-            threshold_2,
             phase_synchronizer,
             nco: Nco::new(),
             fft_engine: FftEngine::new_forward(t_u),
@@ -587,7 +585,7 @@ mod tests {
     use std::sync::Arc;
 
     fn make_processor(mode: u8) -> OfdmProcessor {
-        OfdmProcessor::new(mode, 2, 5, Arc::new(AtomicBool::new(true)))
+        OfdmProcessor::new(mode, 2, Arc::new(AtomicBool::new(true)))
     }
 
     // ── Construction ─────────────────────────────────────────────────────────

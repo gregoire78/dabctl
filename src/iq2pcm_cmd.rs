@@ -235,7 +235,7 @@ pub fn run(args: Iq2pcmArgs) {
     let ts = time_synced.clone();
     let sn = signal_noise.clone();
     let freq_offset_hz = Arc::new(AtomicI32::new(0));
-    let mut ofdm_processor = OfdmProcessor::new(1, 2, 5, running.clone());
+    let mut ofdm_processor = OfdmProcessor::new(1, 2, running.clone());
     ofdm_processor.set_sync_signal(move |synced| {
         ts.store(synced, Ordering::SeqCst);
     });
