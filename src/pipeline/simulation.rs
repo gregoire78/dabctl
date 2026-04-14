@@ -1409,4 +1409,249 @@ mod tests {
         }
         println!();
     }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // Batch de simulation varié — balayage complet de paramètres
+    //
+    // Ce test produit ~12 sections indépendantes qui couvrent :
+    //   • Balayage SNR 0–20 dB pour chaque type de canal
+    //   • CFO normalisé combiné avec Rayleigh (lent et rapide)
+    //   • Bruit impulsif : matrice probabilité × amplitude
+    //   • Facteur K Rician sur plusieurs SNR
+    //   • Gain du désentrelaceur à plusieurs SNR nominaux
+    //   • Sensibilité bruit de phase sur plusieurs SNR
+    //   • Résumé du seuil de décodage FIB (FIB OK% ≥ 95 %)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    const BATCH_SNR_SWEEP: &[f32] = &[0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0, 20.0];
+    const BATCH_FRAMES: usize = 150;
+    const BATCH_BITS: usize = 256;
+
+    fn batch_header(title: &str) {
+        println!("\n╔══════════════════════════════════════════════════════════════════════════╗");
+        println!("║  {title:<72}║");
+        println!("╚══════════════════════════════════════════════════════════════════════════╝");
+        println!(
+            "{:<30} {:<7} {:<13} {:<10} {:<12} {}",
+            "Canal", "SNR dB", "BER COFDM", "FIB OK%", "Gain", "Qualité"
+        );
+        println!("{}", "─".repeat(85));
+    }
+
+    /// Détermine le SNR minimum où FIB OK% ≥ threshold pour un itérateur de résultats.
+    fn fib_threshold_snr(points: &[(f32, f64)], threshold_pct: f64) -> String {
+        for &(snr, ber) in points {
+            if fib_ok_pct(ber) >= threshold_pct {
+                return format!("{snr:.0} dB");
+            }
+        }
+        "> 20 dB".into()
+    }
+
+    #[test]
+    fn print_varied_batch() {
+        // ── 1. Balayage SNR : AWGN ────────────────────────────────────────────
+        batch_header("1/12  AWGN — balayage SNR 0–20 dB");
+        let mut awgn_pts: Vec<(f32, f64)> = Vec::new();
+        for &snr in BATCH_SNR_SWEEP {
+            let p = simulate_snr_point(snr, BATCH_FRAMES, BATCH_BITS);
+            println!(
+                "{:<30} {:<7.1} {:<13.3e} {:<10} {:<12} {}",
+                "AWGN",
+                snr,
+                p.ber_cofdm,
+                fmt_fib(p.ber_cofdm),
+                fmt_gain(p.coding_gain_db),
+                fmt_quality(p.ber_cofdm, p.coding_gain_db)
+            );
+            awgn_pts.push((snr, p.ber_cofdm));
+        }
+        println!(
+            "  → Seuil FIB 95% : {}",
+            fib_threshold_snr(&awgn_pts, 95.0)
+        );
+
+        // ── 2. Balayage SNR : Rayleigh lent ───────────────────────────────────
+        batch_header("2/12  Rayleigh lent — balayage SNR 0–20 dB");
+        let mut ray_slow_pts: Vec<(f32, f64)> = Vec::new();
+        for &snr in BATCH_SNR_SWEEP {
+            let p = simulate_rayleigh(snr, BATCH_FRAMES, BATCH_BITS, false);
+            print_sim_row(&p);
+            ray_slow_pts.push((snr, p.ber_cofdm));
+        }
+        println!(
+            "  → Seuil FIB 95% : {}",
+            fib_threshold_snr(&ray_slow_pts, 95.0)
+        );
+
+        // ── 3. Balayage SNR : Rayleigh rapide ─────────────────────────────────
+        batch_header("3/12  Rayleigh rapide — balayage SNR 0–20 dB");
+        let mut ray_fast_pts: Vec<(f32, f64)> = Vec::new();
+        for &snr in BATCH_SNR_SWEEP {
+            let p = simulate_rayleigh(snr, BATCH_FRAMES, BATCH_BITS, true);
+            print_sim_row(&p);
+            ray_fast_pts.push((snr, p.ber_cofdm));
+        }
+        println!(
+            "  → Seuil FIB 95% : {}",
+            fib_threshold_snr(&ray_fast_pts, 95.0)
+        );
+
+        // ── 4. Balayage SNR : Rician K=3 (canal urbain typique) ───────────────
+        batch_header("4/12  Rician K=3 (urbain) — balayage SNR 0–20 dB");
+        let mut rician_pts: Vec<(f32, f64)> = Vec::new();
+        for &snr in BATCH_SNR_SWEEP {
+            let p = simulate_rician(snr, BATCH_FRAMES, BATCH_BITS, 3.0);
+            print_sim_row(&p);
+            rician_pts.push((snr, p.ber_cofdm));
+        }
+        println!(
+            "  → Seuil FIB 95% : {}",
+            fib_threshold_snr(&rician_pts, 95.0)
+        );
+
+        // ── 5. Matrice CFO × SNR ──────────────────────────────────────────────
+        batch_header("5/12  CFO normalisé × SNR — matrice complète");
+        for &cfo in &[0.0f32, 0.10, 0.20, 0.30, 0.50, 0.70, 0.90] {
+            for &snr in &[4.0f32, 8.0, 12.0, 16.0] {
+                let p = simulate_cfo(snr, BATCH_FRAMES, BATCH_BITS, cfo);
+                print_sim_row(&p);
+            }
+            println!();
+        }
+
+        // ── 6. CFO modéré + Rayleigh lent ─────────────────────────────────────
+        // On additionne l'effet en simulant une CFO seule puis Rayleigh seul et
+        // on affiche les deux côte à côte pour comparer la dégradation cumulée.
+        batch_header("6/12  Comparaison CFO ε=0.30 vs Rayleigh lent vs AWGN (SNR 8–16 dB)");
+        for &snr in &[8.0f32, 10.0, 12.0, 14.0, 16.0] {
+            let awgn = simulate_snr_point(snr, BATCH_FRAMES, BATCH_BITS);
+            let cfo  = simulate_cfo(snr, BATCH_FRAMES, BATCH_BITS, 0.30);
+            let ray  = simulate_rayleigh(snr, BATCH_FRAMES, BATCH_BITS, false);
+            println!(
+                "SNR={snr:.0} dB │ AWGN      FIB={:<8} │ CFO 0.30  FIB={:<8} │ Rayleigh  FIB={}",
+                fmt_fib(awgn.ber_cofdm),
+                fmt_fib(cfo.ber_cofdm),
+                fmt_fib(ray.ber_cofdm)
+            );
+        }
+
+        // ── 7. Bruit de phase : matrice amplitude × SNR ───────────────────────
+        batch_header("7/12  Bruit de phase (°/sample) × SNR");
+        for &pn in &[0.0f32, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0] {
+            for &snr in &[6.0f32, 10.0, 14.0] {
+                let p = simulate_phase_noise(snr, BATCH_FRAMES, BATCH_BITS, pn);
+                print_sim_row(&p);
+            }
+            println!();
+        }
+
+        // ── 8. Bruit impulsif : matrice probabilité × amplitude ───────────────
+        batch_header("8/12  Bruit impulsif — matrice prob × amplitude (SNR=8 dB)");
+        println!(
+            "{:<16} {:<10} {:<13} {:<10} {}",
+            "Amplitude", "Prob", "BER COFDM", "FIB OK%", "Qualité"
+        );
+        println!("{}", "─".repeat(62));
+        for &amp in &[2.0f32, 4.0, 8.0, 16.0, 32.0] {
+            for &prob in &[0.01f32, 0.02, 0.05, 0.10, 0.20] {
+                let p = simulate_impulse_noise(8.0, BATCH_FRAMES, BATCH_BITS, prob, amp);
+                println!(
+                    "{:<16} {:<10.2} {:<13.3e} {:<10} {}",
+                    format!("A={amp:.0}σ"),
+                    prob,
+                    p.ber_cofdm,
+                    fmt_fib(p.ber_cofdm),
+                    fmt_quality(p.ber_cofdm, p.coding_gain_db)
+                );
+            }
+            println!();
+        }
+
+        // ── 9. Rician K : balayage K sur plusieurs SNR ───────────────────────
+        batch_header("9/12  Rician — balayage facteur K (SNR 4 / 8 / 12 / 16 dB)");
+        for &k in &[0.0f32, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0] {
+            for &snr in &[4.0f32, 8.0, 12.0, 16.0] {
+                let p = simulate_rician(snr, BATCH_FRAMES, BATCH_BITS, k);
+                print_sim_row(&p);
+            }
+            println!();
+        }
+
+        // ── 10. Gain désentrelaceur à plusieurs SNR nominaux ─────────────────
+        batch_header("10/12  Gain désentrelaceur — burst_rate × SNR nominal");
+        println!(
+            "{:<20} {:<14} {:<14} {:<14} {}",
+            "Config", "BER direct", "BER désentrelacé", "FIB direct", "Gain"
+        );
+        println!("{}", "─".repeat(75));
+        for &normal_snr in &[8.0f32, 12.0, 16.0] {
+            println!("── SNR nominal = {normal_snr:.0} dB ──");
+            for &rate in &[0.05f32, 0.10, 0.15, 0.20, 0.30] {
+                let (bd, bi) =
+                    simulate_interleaver_vs_bad_cif(rate, 0.0, normal_snr, 300, 128);
+                let gain =
+                    if bi < 1e-12 { f64::INFINITY } else { 10.0 * (bd / bi).log10() };
+                println!(
+                    "{:<20} {:<14.3e} {:<14.3e} {:<14} {}",
+                    format!("burst={rate:.2}"),
+                    bd,
+                    bi,
+                    fmt_fib(bd),
+                    fmt_gain(gain)
+                );
+            }
+            println!();
+        }
+
+        // ── 11. Sensibilité croisée CFO + bruit de phase ─────────────────────
+        batch_header("11/12  CFO + bruit de phase — sensibilité croisée (SNR=10 dB)");
+        for &cfo in &[0.0f32, 0.10, 0.20, 0.30] {
+            for &pn in &[0.0f32, 1.0, 3.0, 10.0] {
+                // Simulate the two effects individually and display side-by-side.
+                let c = simulate_cfo(10.0, BATCH_FRAMES, BATCH_BITS, cfo);
+                let p = simulate_phase_noise(10.0, BATCH_FRAMES, BATCH_BITS, pn);
+                println!(
+                    "CFO ε={cfo:.2} PN {pn:5.1}°/s │ CFO→FIB={:<8} PN→FIB={:<8} │ {} / {}",
+                    fmt_fib(c.ber_cofdm),
+                    fmt_fib(p.ber_cofdm),
+                    fmt_quality(c.ber_cofdm, c.coding_gain_db),
+                    fmt_quality(p.ber_cofdm, p.coding_gain_db)
+                );
+            }
+            println!();
+        }
+
+        // ── 12. Résumé : seuil SNR pour FIB OK% ≥ 95 % ───────────────────────
+        println!(
+            "\n╔══════════════════════════════════════════════════════════════════════════╗"
+        );
+        println!(
+            "║  12/12  Résumé — seuil SNR pour FIB OK% ≥ 95 %                         ║"
+        );
+        println!(
+            "╚══════════════════════════════════════════════════════════════════════════╝"
+        );
+        println!("{:<35} {}", "Canal / Configuration", "Seuil SNR (FIB ≥ 95%)");
+        println!("{}", "─".repeat(55));
+
+        let configs: &[(&str, Box<dyn Fn(f32) -> f64>)] = &[
+            ("AWGN", Box::new(|s| simulate_snr_point(s, 100, 256).ber_cofdm)),
+            ("Rayleigh lent", Box::new(|s| simulate_rayleigh(s, 100, 256, false).ber_cofdm)),
+            ("Rayleigh rapide", Box::new(|s| simulate_rayleigh(s, 100, 256, true).ber_cofdm)),
+            ("Rician K=3", Box::new(|s| simulate_rician(s, 100, 256, 3.0).ber_cofdm)),
+            ("CFO ε=0.10", Box::new(|s| simulate_cfo(s, 100, 256, 0.10).ber_cofdm)),
+            ("CFO ε=0.30", Box::new(|s| simulate_cfo(s, 100, 256, 0.30).ber_cofdm)),
+            ("CFO ε=0.50", Box::new(|s| simulate_cfo(s, 100, 256, 0.50).ber_cofdm)),
+            ("PhaseNoise 1°/s", Box::new(|s| simulate_phase_noise(s, 100, 256, 1.0).ber_cofdm)),
+            ("PhaseNoise 5°/s", Box::new(|s| simulate_phase_noise(s, 100, 256, 5.0).ber_cofdm)),
+            ("Impulse p=0.05 A=8", Box::new(|s| simulate_impulse_noise(s, 100, 256, 0.05, 8.0).ber_cofdm)),
+            ("Impulse p=0.10 A=8", Box::new(|s| simulate_impulse_noise(s, 100, 256, 0.10, 8.0).ber_cofdm)),
+        ];
+        for (name, f) in configs {
+            let pts: Vec<(f32, f64)> = BATCH_SNR_SWEEP.iter().map(|&s| (s, f(s))).collect();
+            println!("{:<35} {}", name, fib_threshold_snr(&pts, 95.0));
+        }
+        println!();
+    }
 }
