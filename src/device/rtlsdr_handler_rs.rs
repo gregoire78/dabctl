@@ -121,6 +121,9 @@ const SAGC_SILENCE_TICKS: u32 = 10;
 /// even when the signal later stabilises.
 /// 500 × 4 × 8192 / 2_048_000 s ≈ 8 s of stability required.
 const SAGC_HUNT_RESET_TICKS: u32 = 500;
+/// Number of SAGC evaluation ticks between compact telemetry snapshots.
+/// 125 × 4 × 8192 / 2_048_000 s ≈ 2 s between logs.
+const SAGC_TELEMETRY_TICKS: u32 = 125;
 
 #[inline]
 fn compute_clip_rate(clip_count: u32, sagc_check_interval: u32, n_pairs: usize) -> f32 {
@@ -476,6 +479,8 @@ impl RtlsdrHandler {
             // is reset to 0 so slowly-recurring fade cycles are not mistaken
             // for rapid hunting.
             let mut hunt_last_reversal_ticks: u32 = 0;
+            // Periodic SAGC telemetry counter used for low-rate observability.
+            let mut sagc_telemetry_cntr: u32 = 0;
 
             // ── DOC state ─────────────────────────────────────────────────────
             // DC Offset Correction: independent IIR estimators for I and Q.
@@ -829,6 +834,21 @@ impl RtlsdrHandler {
                         // the status thread always has an up-to-date value.
                         if sagc_enabled {
                             current_gain_tenths.store(gains[gain_idx], Ordering::Relaxed);
+                            sagc_telemetry_cntr = sagc_telemetry_cntr.wrapping_add(1);
+                            if sagc_telemetry_cntr.is_multiple_of(SAGC_TELEMETRY_TICKS) {
+                                info!(
+                                    "SAGC: gain={:.1}dB level={:.1}/{:.1}-{:.1} clip={:.2}% hold={} freeze={} hunt={} silence={}",
+                                    gains[gain_idx] as f32 / 10.0,
+                                    agc_level,
+                                    agc_level_min,
+                                    SAGC_LEVEL_MAX,
+                                    clip_rate * 100.0,
+                                    agc_hold_cntr,
+                                    hunt_freeze,
+                                    hunt_count,
+                                    sagc_silence_cntr,
+                                );
+                            }
                         }
                     }
                     Err(e) => {
