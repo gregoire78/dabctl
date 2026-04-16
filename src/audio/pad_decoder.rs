@@ -155,7 +155,7 @@ impl DgliDecoder {
                 tracing::trace!("DGLI received: len={}", len);
                 self.len = Some(len);
             } else {
-                tracing::debug!("DGLI CRC invalid");
+                tracing::trace!("DGLI CRC invalid");
             }
         }
     }
@@ -523,8 +523,8 @@ impl PadDecoder {
                         if ci.ci_type == app_type || ci.ci_type == app_type + 1 {
                             let start = ci.ci_type == app_type;
 
-                            // DGLI len is only valid for the immediate next DG
-                            if start {
+                            // DGLI len is only valid for the immediate next DG.
+                            let dgli_len = if start {
                                 let dgli_len = self.dgli_decoder.take_len();
                                 tracing::trace!(
                                     "MOT start subfield (ci_type={}, dgli_len={})",
@@ -532,9 +532,18 @@ impl PadDecoder {
                                     dgli_len
                                 );
                                 self.mot_decoder.set_len(dgli_len);
-                            }
+                                dgli_len
+                            } else {
+                                usize::MAX
+                            };
 
-                            if self.mot_decoder.process_subfield(start, subfield) {
+                            if start && dgli_len < 2 {
+                                tracing::trace!(
+                                    "Ignoring MOT start subfield without valid DGLI length (ci_type={})",
+                                    ci.ci_type
+                                );
+                                self.mot_decoder.reset();
+                            } else if self.mot_decoder.process_subfield(start, subfield) {
                                 let dg = self.mot_decoder.get_data_group();
                                 tracing::trace!(
                                     "MOT DG complete, forwarding to mot_manager (dg_len={})",
@@ -597,8 +606,7 @@ fn decode_label_text(raw: &[u8], charset: u8, mot: bool) -> String {
             String::from_utf8(cleaned).unwrap_or_else(|_| String::new())
         }
         _ => {
-            // Charset non supporté
-            tracing::warn!("DL charset={} non supporté, chaîne ignorée", charset);
+            tracing::warn!("unsupported DL charset {}; ignoring label", charset);
             String::new()
         }
     }

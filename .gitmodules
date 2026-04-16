@@ -1,0 +1,3 @@
+[submodule "vendor/old-dab-rtlsdr"]
+	path = vendor/old-dab-rtlsdr
+	url = https://github.com/old-dab/rtlsdr

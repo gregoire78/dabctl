@@ -1,11 +1,11 @@
-// OFDM processor - converted from ofdm-processor.cpp (eti-cmdline)
+// DABstar-aligned OFDM processor for frame timing and frequency synchronisation.
 
 use num_complex::Complex32;
 use rustfft::{Fft, FftPlanner};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI16, Ordering};
 use std::sync::Arc;
 
-use tracing::trace;
+use tracing::{debug, trace, warn};
 
 use crate::device::rtlsdr_handler::RtlsdrHandler;
 use crate::pipeline::dab_constants::{jan_abs, DIFF_LENGTH, INPUT_RATE};
@@ -13,11 +13,159 @@ use crate::pipeline::dab_params::DabParams;
 use crate::pipeline::dab_pipeline::DabPipeline;
 use crate::pipeline::ofdm::freq_interleaver::FreqInterleaver;
 use crate::pipeline::ofdm::phase_reference::PhaseReference;
+use crate::pipeline::ofdm::time_syncer::{TimeSyncState, TimeSyncer};
+
+fn normalized_cp_coherence(freq_corr: Complex32, cp_pair_count: usize, s_level: f32) -> f32 {
+    if cp_pair_count == 0 || s_level <= 0.0 {
+        return 0.0;
+    }
+
+    freq_corr.norm() / (cp_pair_count as f32 * s_level * s_level)
+}
+
+fn fine_afc_delta_hz(
+    freq_corr: Complex32,
+    carrier_diff: i32,
+    cp_pair_count: usize,
+    s_level: f32,
+) -> f32 {
+    if freq_corr.norm() == 0.0 {
+        return 0.0;
+    }
+
+    let cp_coherence = normalized_cp_coherence(freq_corr, cp_pair_count, s_level);
+    if cp_coherence < MIN_CP_CORR_NORM {
+        return 0.0;
+    }
+
+    let phase_offset = clamp_phase_error(freq_corr.arg());
+    phase_offset / std::f32::consts::TAU * carrier_diff as f32
+}
+
+fn coarse_afc_needed(fic_quality_percent: i16) -> bool {
+    fic_quality_percent < 30
+}
+
+fn apply_coarse_correction(current_coarse: i32, correction: i16, carrier_diff: i32) -> (i32, bool) {
+    if correction == PhaseReference::IDX_NOT_FOUND {
+        return (current_coarse, false);
+    }
+
+    let mut updated = current_coarse + correction as i32 * carrier_diff;
+    if updated.abs() > 35_000 {
+        updated = 0;
+    }
+
+    (updated, correction != 0)
+}
+
+fn phase_threshold_pair(threshold_1: i16, _threshold_2: i16) -> (i16, i16) {
+    let acq_threshold = threshold_1.clamp(OFDM_THRESHOLD_MIN, OFDM_THRESHOLD_MAX);
+    let track_threshold = (2 * acq_threshold).clamp(OFDM_THRESHOLD_MIN, OFDM_THRESHOLD_MAX);
+
+    (acq_threshold, track_threshold)
+}
+
+fn resolve_sync_start_index(
+    raw_index: i32,
+    last_sync_start_index: usize,
+    tracking_miss_budget: &mut u8,
+    t_u: usize,
+    allow_single_miss_reuse: bool,
+) -> Option<usize> {
+    if raw_index >= 0 {
+        *tracking_miss_budget = TRACKING_MISS_TOLERANCE;
+        return Some(raw_index as usize);
+    }
+
+    if allow_single_miss_reuse && *tracking_miss_budget > 0 && last_sync_start_index < t_u {
+        *tracking_miss_budget -= 1;
+        return Some(last_sync_start_index);
+    }
+
+    None
+}
+
+fn turn_phase_to_first_quadrant(mut phase: f32) -> f32 {
+    if phase < 0.0 {
+        phase += std::f32::consts::PI;
+    }
+    phase.rem_euclid(std::f32::consts::FRAC_PI_2)
+}
+
+fn clamp_phase_error(phase_err: f32) -> f32 {
+    phase_err.clamp(
+        -PHASE_CORRECTION_LIMIT_DEG.to_radians(),
+        PHASE_CORRECTION_LIMIT_DEG.to_radians(),
+    )
+}
+
+fn norm_to_length_one(value: Complex32) -> Complex32 {
+    let norm = value.norm();
+    if norm > 0.0 {
+        value / norm
+    } else {
+        Complex32::new(1.0, 0.0)
+    }
+}
+
+fn cmplx_from_phase2(x: f32) -> Complex32 {
+    let x2 = x * x;
+    let s1 = 0.999_031_4f32;
+    let s2 = -0.160_344_02f32;
+    let sine = x * (x2 * s2 + s1);
+
+    let c1 = 0.999_403_24f32;
+    let c2 = -0.495_580_85f32;
+    let c3 = 0.036_791_682f32;
+    let cosine = c1 + x2 * (x2 * c3 + c2);
+
+    Complex32::new(cosine, sine)
+}
 
 /// Adaptive phase-reference correlation threshold bounds.
 /// Lower values are more tolerant to fades, higher values reject false locks.
 const OFDM_THRESHOLD_MIN: i16 = 2;
 const OFDM_THRESHOLD_MAX: i16 = 7;
+
+/// IIR time constant for per-carrier noise-floor estimation from the null symbol.
+/// α = 0.1 gives a time constant of 10 null symbols (≈ 240 ms for Mode I).
+/// Matches DABstar's `store_null_symbol_without_tii()` (GPLv2).
+const NULL_NOISE_ALPHA: f32 = 0.1;
+
+/// IIR time constant for per-carrier signal-power estimation.
+/// α = 0.005 gives a ~200-symbol time constant (≈ 4.8 s for Mode I).
+/// Matches DABstar's `decode_symbol()` per-bin mean-power IIR (GPLv2).
+const MEAN_POWER_ALPHA: f32 = 0.005;
+
+/// Minimum noise floor used as the null-noise denominator guard.
+/// Prevents division by zero when `null_noise[k]` has not yet been warmed up.
+const NOISE_FLOOR_MIN: f32 = 1e-10;
+
+/// Minimum post-subtraction signal power used in the DABstar-style soft-bit
+/// weighting path to avoid divide-by-zero in deep fades.
+const SIGNAL_NOISE_MIN_RATIO: f32 = 0.1;
+
+/// Minimum normalized cyclic-prefix coherence required before trusting a
+/// fine AFC update. This prevents the tracking loop from steering on noise
+/// during brief fades or false locks.
+const MIN_CP_CORR_NORM: f32 = 0.05;
+
+/// Allow exactly one negative PRS tracking miss to reuse the last known good
+/// start index before forcing a full reacquisition.
+const TRACKING_MISS_TOLERANCE: u8 = 1;
+
+/// Maximum per-carrier phase back-rotation used by the DABstar-style symbol
+/// decoder loop.
+const PHASE_CORRECTION_LIMIT_DEG: f32 = 20.0;
+
+/// TII (Transmitter Identification Information) threshold factor.
+/// If a null-symbol FFT bin has power greater than this multiple of the mean
+/// carrier power, the bin is classified as a TII carrier and excluded from
+/// the null-noise IIR update.  Prevents TII beacon energy from inflating the
+/// per-carrier noise-floor estimate and artificially reducing the LLR weight
+/// on adjacent carriers.  Matches DABstar's per-bin TII guard (GPLv2).
+const TII_THRESHOLD_FACTOR: f32 = 4.0;
 
 pub struct OfdmProcessor {
     t_null: usize,
@@ -41,9 +189,37 @@ pub struct OfdmProcessor {
     nco_phasor: Complex32,
     fine_corrector: f32,
     coarse_corrector: i32,
-    f2_correction: bool,
     s_level: f32,
     running: Arc<AtomicBool>,
+    fic_quality_percent: Option<Arc<AtomicI16>>,
+    /// Per-carrier running mean of FFT-bin power, updated per symbol.
+    /// IIR with α = MEAN_POWER_ALPHA. Matches DABstar's power tracking for
+    /// soft-bit weighting and quality estimation.
+    mean_power: Vec<f32>,
+    /// Per-carrier phase-error integrator used to back-rotate the differential
+    /// QPSK cloud toward the first quadrant on subsequent symbols.
+    integ_abs_phase: Vec<f32>,
+    /// Per-carrier phase variance estimate after first-quadrant wrapping.
+    stddev_sq_phase: Vec<f32>,
+    /// Per-carrier mean squared error from the nearest ideal constellation axis.
+    mean_sigma_sq: Vec<f32>,
+    /// Per-carrier noise-floor estimate derived from the FFT of the null symbol.
+    /// IIR with α = NULL_NOISE_ALPHA.  Provides the noise reference for the
+    /// per-carrier SNR soft-bit weight.  Zero at startup (no correction applied
+    /// until the first null symbol is processed).
+    null_noise: Vec<f32>,
+    /// Smoothed SNR estimate from the null-symbol energy.
+    snr_estimate: f32,
+    /// Frame counter for throttled SNR/frequency reporting.
+    snr_report_count: usize,
+    /// Running mean amplitude used to scale soft bits similarly to DABstar.
+    mean_value: f32,
+    /// Estimated sample-clock error in Hz.
+    clock_err_hz: f32,
+    /// Precomputed per-carrier clock-error phase coefficients.
+    phase_corr_const: Vec<f32>,
+    /// Start index found during the latest phase-reference evaluation.
+    last_sync_start_index: usize,
     // Callbacks
     sync_signal: Option<Box<dyn Fn(bool) + Send>>,
     show_snr: Option<Box<dyn Fn(i16) + Send>>,
@@ -55,6 +231,21 @@ pub struct OfdmProcessor {
 /// Errors that cause the processor to exit
 pub enum ProcessorError {
     Stopped,
+}
+
+/// States of the DABstar-style OFDM frame synchronisation state machine.
+///
+/// The processor cycles through the same three high-level stages as DABstar:
+/// wait for the null-symbol timing marker, evaluate the phase-reference symbol,
+/// then process the remainder of the frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SyncState {
+    /// Search for the end of the null-symbol level drop.
+    WaitForTimeSyncMarker,
+    /// Evaluate the phase-reference symbol and align symbol 0 in the buffer.
+    EvalSyncSymbol,
+    /// Decode the remainder of the frame once symbol 0 is aligned.
+    ProcessRestOfFrame,
 }
 
 impl OfdmProcessor {
@@ -71,10 +262,23 @@ impl OfdmProcessor {
 
         let freq_interleaver = FreqInterleaver::new(&params);
         let phase_synchronizer =
-            PhaseReference::new(t_u, carriers, params.dab_mode, DIFF_LENGTH as usize);
+            PhaseReference::new(t_u, t_g, carriers, params.dab_mode, DIFF_LENGTH as usize);
 
         let mut planner = FftPlanner::new();
         let fft = planner.plan_fft_forward(t_u);
+
+        let half_k = carriers as f32 / 2.0;
+        let phase_corr_const: Vec<f32> = (0..carriers)
+            .map(|nom_carrier_idx| {
+                let fft_idx = freq_interleaver.map_in(nom_carrier_idx) as i32;
+                let real_carr_rel_idx = if fft_idx < 0 {
+                    fft_idx + carriers as i32 / 2
+                } else {
+                    fft_idx + carriers as i32 / 2 - 1
+                };
+                std::f32::consts::PI / 1024.0 * (half_k - real_carr_rel_idx as f32) / half_k
+            })
+            .collect();
 
         // NCO: no table needed, phase tracked incrementally
 
@@ -99,9 +303,22 @@ impl OfdmProcessor {
             nco_phasor: Complex32::new(1.0, 0.0),
             fine_corrector: 0.0,
             coarse_corrector: 0,
-            f2_correction: true,
             s_level: 0.0,
             running,
+            fic_quality_percent: None,
+            // DABstar starts these estimators at zero and lets them converge
+            // from real RF measurements.
+            mean_power: vec![0.0f32; carriers],
+            integ_abs_phase: vec![0.0f32; carriers],
+            stddev_sq_phase: vec![0.0f32; carriers],
+            mean_sigma_sq: vec![0.0f32; carriers],
+            null_noise: vec![0.0f32; carriers],
+            snr_estimate: 0.0,
+            snr_report_count: 0,
+            mean_value: 1.0,
+            clock_err_hz: 0.0,
+            phase_corr_const,
+            last_sync_start_index: 0,
             sync_signal: None,
             show_snr: None,
             show_freq_offset: None,
@@ -123,8 +340,15 @@ impl OfdmProcessor {
         self.show_freq_offset = Some(Box::new(f));
     }
 
-    pub fn sync_reached(&mut self) {
-        self.f2_correction = false;
+    pub fn set_fic_quality_percent_source(&mut self, fic_quality_percent: Arc<AtomicI16>) {
+        self.fic_quality_percent = Some(fic_quality_percent);
+    }
+
+    fn current_fic_quality_percent(&self) -> i16 {
+        self.fic_quality_percent
+            .as_ref()
+            .map(|v| v.load(Ordering::Relaxed))
+            .unwrap_or(0)
     }
 
     fn emit_sync_signal(&self, val: bool) {
@@ -225,12 +449,180 @@ impl OfdmProcessor {
         Ok(())
     }
 
+    fn reset_tracking_loop(&mut self) {
+        // Keep the current frequency estimate across a brief sync loss.
+        // DABstar carries its baseband frequency correction through reacquisition;
+        // zeroing it here causes the offset to jump back toward 0 Hz and makes
+        // short OFDM timing misses much more disruptive than necessary.
+    }
+
+    fn prepare_for_acquisition_retry(&mut self) {
+        self.reset_tracking_loop();
+        // DABstar does not cold-reset the OFDM decoder on every acquisition retry.
+        // Keep the per-carrier power/noise estimators, phase integrators and
+        // clock-error estimate warm so a brief dropout does not force the whole
+        // soft-bit weighting path to relearn from zero.
+    }
+
+    fn store_reference_symbol_0(&mut self) {
+        self.fft_buffer[..self.t_u].copy_from_slice(&self.ofdm_buffer[..self.t_u]);
+        self.fft.process(&mut self.fft_buffer);
+        self.reference_phase[..self.t_u].copy_from_slice(&self.fft_buffer[..self.t_u]);
+    }
+
+    fn update_coarse_frequency_from_sync_symbol_0(&mut self) -> bool {
+        if !coarse_afc_needed(self.current_fic_quality_percent()) {
+            return false;
+        }
+
+        let correction = self
+            .phase_synchronizer
+            .estimate_offset(&self.ofdm_buffer[..self.t_u]);
+        let prev = self.coarse_corrector;
+        let (updated_coarse, coarse_step_applied) =
+            apply_coarse_correction(self.coarse_corrector, correction, self.carrier_diff);
+        self.coarse_corrector = updated_coarse;
+
+        if correction != PhaseReference::IDX_NOT_FOUND && self.coarse_corrector != prev {
+            trace!(
+                delta_carriers = correction,
+                prev_hz = prev,
+                new_hz = self.coarse_corrector,
+                "OFDM: coarse AFC step applied"
+            );
+        }
+
+        if coarse_step_applied {
+            self.clock_err_hz = 0.0;
+        }
+
+        coarse_step_applied
+    }
+
+    fn process_ofdm_symbols_1_to_l(
+        &mut self,
+        device: &RtlsdrHandler,
+        dab_pipeline: &mut DabPipeline,
+        ibits: &mut [i16],
+        block_buf: &mut [Complex32],
+    ) -> Result<(Complex32, usize), ProcessorError> {
+        let mut freq_corr = Complex32::new(0.0, 0.0);
+        let mut frame_sample_count = self.t_u + self.last_sync_start_index;
+
+        for symbol_count in 2..=(self.nr_blocks as u16) {
+            let phase = self.coarse_corrector + self.fine_corrector as i32;
+            self.get_samples(device, block_buf, phase)?;
+            frame_sample_count += self.t_s;
+
+            for i in self.t_u..self.t_s {
+                freq_corr += block_buf[i] * block_buf[i - self.t_u].conj();
+            }
+            self.process_block(block_buf, ibits);
+            dab_pipeline.process_block(ibits, symbol_count as i16);
+        }
+
+        Ok((freq_corr, frame_sample_count))
+    }
+
+    fn update_fine_frequency_from_cyclic_prefix(&mut self, freq_corr: Complex32) {
+        let cp_pair_count = (self.nr_blocks.saturating_sub(1)) * self.t_g;
+        let fine_delta_hz =
+            fine_afc_delta_hz(freq_corr, self.carrier_diff, cp_pair_count, self.s_level);
+        self.fine_corrector += fine_delta_hz;
+        self.wrap_fine_corrector_into_coarse();
+    }
+
+    fn wrap_fine_corrector_into_coarse(&mut self) {
+        if self.fine_corrector > self.carrier_diff as f32 / 2.0 {
+            self.coarse_corrector += self.carrier_diff;
+            self.fine_corrector -= self.carrier_diff as f32;
+            trace!(
+                coarse_hz = self.coarse_corrector,
+                fine_hz = self.fine_corrector as i32,
+                "OFDM: fine→coarse wrap (+)"
+            );
+        } else if self.fine_corrector < -(self.carrier_diff as f32 / 2.0) {
+            self.coarse_corrector -= self.carrier_diff;
+            self.fine_corrector += self.carrier_diff as f32;
+            trace!(
+                coarse_hz = self.coarse_corrector,
+                fine_hz = self.fine_corrector as i32,
+                "OFDM: fine→coarse wrap (-)"
+            );
+        }
+    }
+
+    fn process_null_symbol(
+        &mut self,
+        device: &RtlsdrHandler,
+        null_buf: &mut [Complex32],
+    ) -> Result<usize, ProcessorError> {
+        let phase = self.coarse_corrector + self.fine_corrector as i32;
+        self.get_samples(device, null_buf, phase)?;
+
+        let sum: f32 = null_buf.iter().map(|s| s.norm()).sum::<f32>() / self.t_null as f32;
+        self.snr_estimate =
+            0.9 * self.snr_estimate + 0.1 * 20.0 * ((self.s_level + 0.005) / sum).log10();
+        self.snr_report_count += 1;
+        self.update_null_noise(null_buf);
+
+        if self.snr_report_count > 10 {
+            self.snr_report_count = 0;
+            self.emit_snr(self.snr_estimate as i16);
+            let offset_hz = self.coarse_corrector + self.fine_corrector as i32;
+            self.emit_freq_offset(offset_hz);
+            debug!(
+                snr_db = self.snr_estimate,
+                freq_offset_hz = offset_hz,
+                "OFDM telemetry updated"
+            );
+        }
+
+        Ok(self.t_null)
+    }
+
+    fn integrate_clock_error_from_frame_length(
+        &mut self,
+        frame_sample_count: usize,
+        coarse_step_applied: bool,
+    ) {
+        // DABstar updates the sample-clock error only when no coarse step was
+        // needed on symbol 0, so the estimate is not polluted by a deliberate
+        // baseband retune during the same frame.
+        if !coarse_step_applied {
+            let clock_err = INPUT_RATE as f32 * (frame_sample_count as f32 / self.t_f as f32 - 1.0);
+            self.clock_err_hz = 0.9 * self.clock_err_hz + 0.1 * clock_err.clamp(-307.2, 307.2);
+        }
+    }
+
     /// Demodulate an OFDM data symbol into soft bits (differential QPSK).
     ///
-    /// Soft bits are scaled per carrier as in eti-cmdline.
-    fn process_block(&mut self, inv: &[Complex32], ibits: &mut [i16]) {
+    /// Strips the cyclic prefix (guard interval), runs a T_u-point forward FFT,
+    /// then for each OFDM carrier applies differential detection: the current
+    /// carrier phasor is divided by the previous symbol's phasor (stored in
+    /// `reference_phase`).  The resulting differential phasor is normalised and
+    /// mapped to two signed soft bits in the range [−127, 127].
+    ///
+    /// **LLR-weighted soft bits** (DABstar, ETSI EN 300 401 §14.5):
+    /// Each carrier's soft-bit confidence is scaled by `SNR_k / (SNR_k + 1)`,
+    /// where `SNR_k = (mean_power_k − null_noise_k) / null_noise_k`.  Both
+    /// `mean_power_k` and `null_noise_k` are estimated from the raw FFT bin
+    /// power `|FFT_bin_k|²` so that they share the same units.  This reduces
+    /// the weight of carriers with a low SNR (measured from the null symbol
+    /// noise floor) so the Viterbi decoder can exploit frequency-selective
+    /// channel information — particularly useful for multipath/SFN reception.
+    ///
+    /// Soft-bit sign convention: a positive real/imag differential phase gives
+    /// −127, matching the existing decoder bit polarity used throughout this
+    /// pipeline.
+    ///
+    /// ETSI EN 300 401 §14.5 — differential QPSK modulation/demodulation.
+    /// ETSI EN 300 401 §14.6 — FFT and frequency-domain processing.
+    pub(crate) fn process_block(&mut self, inv: &[Complex32], ibits: &mut [i16]) {
         self.fft_buffer[..self.t_u].copy_from_slice(&inv[self.t_g..self.t_g + self.t_u]);
         self.fft.process(&mut self.fft_buffer);
+
+        let mut sum = 0.0f32;
 
         for i in 0..self.carriers {
             let mut index = self.freq_interleaver.map_in(i) as i32;
@@ -238,292 +630,726 @@ impl OfdmProcessor {
                 index += self.t_u as i32;
             }
             let index = index as usize;
-            let r1 = self.fft_buffer[index] * self.reference_phase[index].conj();
-            self.reference_phase[index] = self.fft_buffer[index];
-            self.r1_buf[i] = r1;
-            let ab1 = jan_abs(r1);
-            if ab1 > 0.0 {
-                ibits[i] = (-r1.re / ab1 * 127.0).clamp(-127.0, 127.0) as i16;
-                ibits[self.carriers + i] = (-r1.im / ab1 * 127.0).clamp(-127.0, 127.0) as i16;
+
+            // DABstar-style PI/4-DQPSK demodulation and per-carrier phase
+            // correction. ETSI EN 300 401 §14.5 / §14.6.
+            let fft_bin_raw =
+                self.fft_buffer[index] * norm_to_length_one(self.reference_phase[index].conj());
+            let phase_err = self.clock_err_hz * self.phase_corr_const[i] + self.integ_abs_phase[i];
+            let fft_bin = fft_bin_raw * cmplx_from_phase2(-phase_err);
+            let fft_bin_abs_phase = turn_phase_to_first_quadrant(fft_bin.arg());
+            let phase_diff = fft_bin_abs_phase - std::f32::consts::FRAC_PI_4;
+
+            self.integ_abs_phase[i] =
+                clamp_phase_error(self.integ_abs_phase[i] + 0.2 * MEAN_POWER_ALPHA * phase_diff);
+
+            let cur_stddev_sq = phase_diff * phase_diff;
+            self.stddev_sq_phase[i] = self.stddev_sq_phase[i] * (1.0 - MEAN_POWER_ALPHA)
+                + cur_stddev_sq * MEAN_POWER_ALPHA;
+
+            let fft_power = fft_bin.norm_sqr();
+            self.mean_power[i] =
+                self.mean_power[i] * (1.0 - MEAN_POWER_ALPHA) + fft_power * MEAN_POWER_ALPHA;
+
+            let mean_level = self.mean_power[i].sqrt().max(1e-5);
+            let mean_axis_level = mean_level * std::f32::consts::FRAC_1_SQRT_2;
+            let real_level_dist = fft_bin.re.abs() - mean_axis_level;
+            let imag_level_dist = fft_bin.im.abs() - mean_axis_level;
+            let sigma_sq = real_level_dist * real_level_dist + imag_level_dist * imag_level_dist;
+            self.mean_sigma_sq[i] =
+                self.mean_sigma_sq[i] * (1.0 - MEAN_POWER_ALPHA) + sigma_sq * MEAN_POWER_ALPHA;
+
+            if fft_bin.norm() > 0.0 {
+                let null_n = self.null_noise[i].max(NOISE_FLOOR_MIN);
+                let signal_p = (self.mean_power[i] - null_n).max(SIGNAL_NOISE_MIN_RATIO);
+                let weight =
+                    mean_level / self.mean_sigma_sq[i].max(1e-4) / ((null_n / signal_p) + 1.0);
+
+                let r1 = norm_to_length_one(fft_bin) * weight;
+                self.r1_buf[i] = r1;
+
+                let soft_scale = -100.0 / self.mean_value.max(1e-3);
+                ibits[i] = (r1.re * soft_scale).clamp(-127.0, 127.0) as i16;
+                ibits[self.carriers + i] = (r1.im * soft_scale).clamp(-127.0, 127.0) as i16;
+                sum += r1.norm();
             } else {
+                self.r1_buf[i] = Complex32::new(0.0, 0.0);
                 ibits[i] = 0;
                 ibits[self.carriers + i] = 0;
             }
+            self.reference_phase[index] = self.fft_buffer[index];
+        }
+
+        self.mean_value = (sum / self.carriers.max(1) as f32).max(1e-3);
+    }
+
+    /// Reset per-carrier power and null-noise IIR estimators to their initial
+    /// values.
+    ///
+    /// Called at the start of each acquisition cycle so that stale LLR weights
+    /// from a previous lock (potentially on a different channel) do not bias the
+    /// soft-bit decoder for the new signal.  Matches DABstar's OfdmDecoder reset
+    /// on channel change (GPLv2).
+    fn reset_llr_state(&mut self) {
+        self.mean_power.fill(0.0);
+        self.integ_abs_phase.fill(0.0);
+        self.stddev_sq_phase.fill(0.0);
+        self.mean_sigma_sq.fill(0.0);
+        self.null_noise.fill(0.0);
+        self.mean_value = 1.0;
+        self.clock_err_hz = 0.0;
+    }
+
+    /// Update the per-carrier null-noise IIR estimate from the null symbol,
+    /// masking TII (Transmitter Identification Information) carriers.
+    ///
+    /// After FFT-ing the first T_u samples of `null_buf`, any bin whose power
+    /// exceeds `TII_THRESHOLD_FACTOR × mean_carrier_power` is classified as a
+    /// TII carrier and is excluded from the IIR update.  This prevents TII
+    /// beacon energy from inflating the noise-floor estimate and artificially
+    /// suppressing the LLR weight on adjacent carriers.
+    ///
+    /// On multiplexes that do not broadcast TII, no bin exceeds the threshold
+    /// and all carriers are updated normally — identical to the original
+    /// `store_null_symbol_without_tii` path.
+    ///
+    /// Matches DABstar's `OfdmDecoder::store_null_symbol_with_tii()` (GPLv2).
+    fn update_null_noise(&mut self, null_buf: &[Complex32]) {
+        self.fft_buffer.copy_from_slice(&null_buf[..self.t_u]);
+        self.fft.process(&mut self.fft_buffer);
+
+        // Compute mean power over all active carriers for TII detection.
+        let total_power: f32 = (0..self.carriers)
+            .map(|k| {
+                let mut idx = self.freq_interleaver.map_in(k) as i32;
+                if idx < 0 {
+                    idx += self.t_u as i32;
+                }
+                self.fft_buffer[idx as usize].norm_sqr()
+            })
+            .sum();
+        let tii_threshold = TII_THRESHOLD_FACTOR * total_power / self.carriers as f32;
+
+        for k in 0..self.carriers {
+            let mut fft_idx = self.freq_interleaver.map_in(k) as i32;
+            if fft_idx < 0 {
+                fft_idx += self.t_u as i32;
+            }
+            let null_power = self.fft_buffer[fft_idx as usize].norm_sqr();
+
+            // Skip TII carriers: their elevated power would inflate null_noise
+            // and suppress LLR soft-bit weights on adjacent carriers.
+            if null_power > tii_threshold {
+                continue;
+            }
+
+            self.null_noise[k] =
+                self.null_noise[k] * (1.0 - NULL_NOISE_ALPHA) + null_power * NULL_NOISE_ALPHA;
         }
     }
 
-    /// Main processing loop - runs in its own thread
-    /// This is the faithful translation of ofdmProcessor::run() from C++
-    #[allow(unused_assignments)]
-    pub fn run(&mut self, device: &RtlsdrHandler, eti_generator: &mut DabPipeline) {
-        let sync_buffer_size: usize = 32768;
-        let sync_buffer_mask = sync_buffer_size - 1;
-        let mut env_buffer = vec![0.0f32; sync_buffer_size];
-        let mut sync_buffer_index: usize;
-        let mut current_strength: f32;
+    fn wait_for_time_sync_marker(
+        &mut self,
+        device: &RtlsdrHandler,
+        time_syncer: &mut TimeSyncer,
+        attempts: &mut i16,
+    ) -> Result<bool, ProcessorError> {
+        self.prepare_for_acquisition_retry();
+
+        match time_syncer.read_samples_until_end_of_level_drop(
+            self.s_level,
+            self.t_f,
+            self.t_null,
+            || self.get_sample(device, 0).ok().map(jan_abs),
+        ) {
+            Some(TimeSyncState::TimeSyncEstablished) => {
+                *attempts = 0;
+                Ok(true)
+            }
+            Some(TimeSyncState::NoDipFound) => {
+                *attempts += 1;
+                if *attempts >= 8 {
+                    warn!(
+                        "OFDM: no null symbol detected after {} attempts \
+                         — signal absent or very weak",
+                        attempts
+                    );
+                    self.emit_sync_signal(false);
+                    *attempts = 0;
+                }
+                Ok(false)
+            }
+            Some(TimeSyncState::NoEndOfDipFound) => {
+                *attempts = 0;
+                Ok(false)
+            }
+            None => Err(ProcessorError::Stopped),
+        }
+    }
+
+    fn eval_sync_symbol(
+        &mut self,
+        device: &RtlsdrHandler,
+        threshold: i16,
+        allow_single_miss_reuse: bool,
+        tracking_miss_budget: &mut u8,
+        check_buf: &mut [Complex32],
+    ) -> Result<bool, ProcessorError> {
+        let phase = self.coarse_corrector + self.fine_corrector as i32;
+        self.get_samples(device, &mut check_buf[..self.t_u], phase)?;
+        self.ofdm_buffer[..self.t_u].copy_from_slice(&check_buf[..self.t_u]);
+
+        let raw_start_index = self
+            .phase_synchronizer
+            .find_index(&self.ofdm_buffer[..self.t_u], threshold);
+
+        let Some(start_index) = resolve_sync_start_index(
+            raw_start_index,
+            self.last_sync_start_index,
+            tracking_miss_budget,
+            self.t_u,
+            allow_single_miss_reuse,
+        ) else {
+            return Ok(false);
+        };
+
+        if raw_start_index < 0 && allow_single_miss_reuse {
+            trace!(
+                start_index,
+                "OFDM: reusing last good start index after one tracking miss"
+            );
+        }
+
+        self.last_sync_start_index = start_index;
+        let next_ofdm_buffer_idx = self.t_u - start_index;
+        self.ofdm_buffer.copy_within(start_index..self.t_u, 0);
+
+        let needed = self.t_u - next_ofdm_buffer_idx;
+        self.get_samples(device, &mut check_buf[..needed], phase)?;
+        self.ofdm_buffer[next_ofdm_buffer_idx..self.t_u].copy_from_slice(&check_buf[..needed]);
+
+        Ok(true)
+    }
+
+    fn process_frame_rest(
+        &mut self,
+        device: &RtlsdrHandler,
+        dab_pipeline: &mut DabPipeline,
+        ibits: &mut [i16],
+        null_buf: &mut [Complex32],
+        block_buf: &mut [Complex32],
+    ) -> Result<bool, ProcessorError> {
+        dab_pipeline.new_frame();
+
+        // Symbol 0 is already aligned in `self.ofdm_buffer` by
+        // `eval_sync_symbol()`, exactly like DABstar's PROCESS_REST_OF_FRAME.
+        self.store_reference_symbol_0();
+        let coarse_step_applied = self.update_coarse_frequency_from_sync_symbol_0();
+        if coarse_step_applied {
+            trace!(
+                coarse_hz = self.coarse_corrector,
+                "OFDM: coarse correction changed; reacquiring before decoding remaining symbols"
+            );
+            self.emit_sync_signal(false);
+            return Ok(false);
+        }
+
+        let (freq_corr, mut frame_sample_count) =
+            self.process_ofdm_symbols_1_to_l(device, dab_pipeline, ibits, block_buf)?;
+        self.update_fine_frequency_from_cyclic_prefix(freq_corr);
+        frame_sample_count += self.process_null_symbol(device, null_buf)?;
+        self.integrate_clock_error_from_frame_length(frame_sample_count, coarse_step_applied);
+
+        self.emit_sync_signal(true);
+        Ok(true)
+    }
+
+    /// Main processing loop — driven by an explicit DABstar-style state machine.
+    ///
+    /// Replaces the original nested `break`/`continue` loop structure with a
+    /// single top-level `loop { match state { … } }` that transitions through
+    /// [`SyncState`] variants, matching DABstar's OfdmProcessor design (GPLv2).
+    ///
+    /// The DAB synchronisation algorithm (null detection, phase-reference
+    /// correlation, coarse/fine AFC, LLR soft-bits) is unchanged.
+    pub fn run(&mut self, device: &RtlsdrHandler, dab_pipeline: &mut DabPipeline) {
         let mut attempts: i16 = 0;
         let mut ibits = vec![0i16; 2 * self.carriers];
-        let mut snr: f32 = 0.0;
-        let mut snr_count = 0;
         let mut null_buf = vec![Complex32::new(0.0, 0.0); self.t_null];
         let mut check_buf = vec![Complex32::new(0.0, 0.0); self.t_u];
         let mut block_buf = vec![Complex32::new(0.0, 0.0); self.t_s];
-        let _phase = self.coarse_corrector + self.fine_corrector as i32;
+        let mut time_syncer = TimeSyncer::default();
 
-        // Warm up `s_level` by consuming half a DAB frame before the sync loop.
-        // Gives the NCO level estimator a stable baseline for the first null detection.
+        // ETSI EN 300 401 §8.4: acquisition and tracking use configured
+        // fixed phase-correlation thresholds.
+        let (acq_threshold, track_threshold) =
+            phase_threshold_pair(self.threshold_1, self.threshold_2);
+        let mut sync_threshold = acq_threshold;
+
+        // DABstar warms the signal-level estimator with a short burst of raw
+        // useful-symbol reads before entering the state machine.
         self.s_level = 0.0;
+        self.coarse_corrector = 0;
+        self.fine_corrector = 0.0;
+        self.clock_err_hz = 0.0;
+        self.nco_phasor = Complex32::new(1.0, 0.0);
+        self.reset_llr_state();
+        self.reference_phase.fill(Complex32::new(0.0, 0.0));
+        self.r1_buf.fill(Complex32::new(0.0, 0.0));
         if self
-            .discard_samples(device, self.t_f / 2, &mut block_buf)
+            .discard_samples(device, 20 * self.t_u, &mut block_buf)
             .is_err()
         {
             return;
         }
 
+        let mut state = SyncState::WaitForTimeSyncMarker;
+        let mut tracking_miss_budget = TRACKING_MISS_TOLERANCE;
+
         loop {
-            // notSynced loop
-            sync_buffer_index = 0;
-            current_strength = 0.0;
-            self.s_level = 0.0;
-            if self
-                .discard_samples(device, self.t_f, &mut block_buf)
-                .is_err()
-            {
-                return;
-            }
-
-            for _ in 0..50 {
-                let sample = match self.get_sample(device, 0) {
-                    Ok(s) => s,
-                    Err(_) => return,
-                };
-                env_buffer[sync_buffer_index] = jan_abs(sample);
-                current_strength += env_buffer[sync_buffer_index];
-                sync_buffer_index += 1;
-            }
-
-            // ETSI EN 300 401 §8.4: acquisition and tracking use configured
-            // fixed phase-correlation thresholds.
-            let acq_threshold = self
-                .threshold_1
-                .clamp(OFDM_THRESHOLD_MIN, OFDM_THRESHOLD_MAX);
-            let track_threshold = self
-                .threshold_2
-                .clamp(OFDM_THRESHOLD_MIN, OFDM_THRESHOLD_MAX);
-
-            // SyncOnNull: look for the null level (a dip)
-            let mut counter = 0i32;
-            let phase = self.coarse_corrector + self.fine_corrector as i32;
-            loop {
-                if current_strength / 50.0 <= 0.50 * self.s_level {
-                    break;
-                }
-                let sample = match self.get_sample(device, phase) {
-                    Ok(s) => s,
-                    Err(_) => return,
-                };
-                env_buffer[sync_buffer_index] = jan_abs(sample);
-                let old_idx = (sync_buffer_index + sync_buffer_size - 50) & sync_buffer_mask;
-                current_strength += env_buffer[sync_buffer_index] - env_buffer[old_idx];
-                sync_buffer_index = (sync_buffer_index + 1) & sync_buffer_mask;
-                counter += 1;
-                if counter > self.t_f as i32 {
-                    attempts += 1;
-                    if attempts >= 5 {
-                        self.emit_sync_signal(false);
-                        attempts = 0;
-                        break;
-                    }
-                }
-            }
-            if counter > self.t_f as i32 && attempts == 0 {
-                continue; // notSynced
-            }
-            if counter > self.t_f as i32 {
-                continue;
-            }
-
-            // SyncOnEndNull: look for end of null period
-            counter = 0;
-            loop {
-                if current_strength / 50.0 >= 0.75 * self.s_level {
-                    break;
-                }
-                let sample = match self.get_sample(device, phase) {
-                    Ok(s) => s,
-                    Err(_) => return,
-                };
-                env_buffer[sync_buffer_index] = jan_abs(sample);
-                let old_idx = (sync_buffer_index + sync_buffer_size - 50) & sync_buffer_mask;
-                current_strength += env_buffer[sync_buffer_index] - env_buffer[old_idx];
-                sync_buffer_index = (sync_buffer_index + 1) & sync_buffer_mask;
-                counter += 1;
-                if counter > self.t_null as i32 + 50 {
-                    break;
-                }
-            }
-            if counter > self.t_null as i32 + 50 {
-                continue; // notSynced
-            }
-
-            // Read T_u samples for phase synchronization (batch via temp buffer)
-            if self
-                .get_samples(device, &mut check_buf[..self.t_u], phase)
-                .is_err()
-            {
-                return;
-            }
-            self.ofdm_buffer[..self.t_u].copy_from_slice(&check_buf[..self.t_u]);
-
-            let start_index = self
-                .phase_synchronizer
-                .find_index(&self.ofdm_buffer[..self.t_u], acq_threshold);
-            if start_index < 0 {
-                trace!("OFDM: phase ref not found (correlation below threshold), retry");
-                continue; // notSynced
-            }
-
-            // Synchronized - enter the main frame processing loop
-            let mut start_index = start_index as usize;
-
-            // Re-enable coarse AFC for each new acquisition cycle.
-            self.f2_correction = true;
-
-            let mut first_frame = true;
-            loop {
-                // SyncOnPhase: copy remaining data from sync
-                let remaining = self.t_u - start_index;
-                self.ofdm_buffer.copy_within(start_index..self.t_u, 0);
-                let ofdm_buffer_index = remaining;
-
-                eti_generator.new_frame();
-
-                // Block 0: read remaining samples and process
-                let phase = self.coarse_corrector + self.fine_corrector as i32;
-                let needed = self.t_u - ofdm_buffer_index;
-                // Use check_buf as temp scratch for remaining samples (avoids alloc)
-                if self
-                    .get_samples(device, &mut check_buf[..needed], phase)
-                    .is_err()
-                {
-                    return;
-                }
-                self.ofdm_buffer[ofdm_buffer_index..self.t_u].copy_from_slice(&check_buf[..needed]);
-
-                // Process block 0 inline (avoid borrow conflict with to_vec)
-                self.fft_buffer[..self.t_u].copy_from_slice(&self.ofdm_buffer[..self.t_u]);
-                self.fft.process(&mut self.fft_buffer);
-                self.reference_phase[..self.t_u].copy_from_slice(&self.fft_buffer[..self.t_u]);
-
-                if self.f2_correction {
-                    let correction = self
-                        .phase_synchronizer
-                        .estimate_offset(&self.ofdm_buffer[..self.t_u]);
-                    if correction != 100 {
-                        let prev = self.coarse_corrector;
-                        self.coarse_corrector += correction as i32 * self.carrier_diff;
-                        if self.coarse_corrector.abs() > 35000 {
-                            trace!(
-                                coarse_hz = self.coarse_corrector,
-                                "OFDM: coarse overflow (>35 kHz) — reset to 0"
-                            );
-                            self.coarse_corrector = 0;
-                        } else if correction != 0 {
-                            trace!(
-                                delta_carriers = correction,
-                                prev_hz = prev,
-                                new_hz = self.coarse_corrector,
-                                "OFDM: coarse AFC step"
-                            );
+            match state {
+                SyncState::WaitForTimeSyncMarker => {
+                    match self.wait_for_time_sync_marker(device, &mut time_syncer, &mut attempts) {
+                        Ok(true) => {
+                            sync_threshold = acq_threshold;
+                            state = SyncState::EvalSyncSymbol;
                         }
+                        Ok(false) => {}
+                        Err(_) => return,
                     }
                 }
 
-                // Data blocks (symbols 2..L)
-                let mut freq_corr = Complex32::new(0.0, 0.0);
-                for symbol_count in 2..=(self.nr_blocks as u16) {
-                    let phase = self.coarse_corrector + self.fine_corrector as i32;
-                    if self.get_samples(device, &mut block_buf, phase).is_err() {
-                        return;
+                SyncState::EvalSyncSymbol => {
+                    match self.eval_sync_symbol(
+                        device,
+                        sync_threshold,
+                        sync_threshold == track_threshold,
+                        &mut tracking_miss_budget,
+                        &mut check_buf,
+                    ) {
+                        Ok(true) => {
+                            state = SyncState::ProcessRestOfFrame;
+                        }
+                        Ok(false) => {
+                            if sync_threshold == track_threshold {
+                                warn!("OFDM: synchronisation lost — returning to acquisition");
+                            } else {
+                                trace!(
+                                    "OFDM: phase ref not found (correlation below threshold), retry"
+                                );
+                            }
+                            state = SyncState::WaitForTimeSyncMarker;
+                        }
+                        Err(_) => return,
                     }
+                }
 
-                    // Accumulate frequency correction from cyclic prefix.
-                    for i in self.t_u..self.t_s {
-                        freq_corr += block_buf[i] * block_buf[i - self.t_u].conj();
+                SyncState::ProcessRestOfFrame => {
+                    match self.process_frame_rest(
+                        device,
+                        dab_pipeline,
+                        &mut ibits,
+                        &mut null_buf,
+                        &mut block_buf,
+                    ) {
+                        Ok(true) => {
+                            sync_threshold = track_threshold;
+                            state = SyncState::EvalSyncSymbol;
+                        }
+                        Ok(false) => {
+                            state = SyncState::WaitForTimeSyncMarker;
+                        }
+                        Err(_) => return,
                     }
-                    self.process_block(&block_buf, &mut ibits);
-                    eti_generator.process_block(&ibits, symbol_count as i16);
-                }
-
-                // Integrate frequency error (ETSI EN 300 401 §8.4.3).
-                self.fine_corrector +=
-                    0.1 * freq_corr.arg() / std::f32::consts::PI * (self.carrier_diff as f32 / 2.0);
-
-                // Skip null symbol and compute SNR
-                let phase = self.coarse_corrector + self.fine_corrector as i32;
-                if self.get_samples(device, &mut null_buf, phase).is_err() {
-                    return;
-                }
-
-                let sum: f32 = null_buf.iter().map(|s| s.norm()).sum::<f32>() / self.t_null as f32;
-                snr = 0.9 * snr + 0.1 * 20.0 * ((self.s_level + 0.005) / sum).log10();
-                snr_count += 1;
-                if snr_count > 10 {
-                    snr_count = 0;
-                    self.emit_snr(snr as i16);
-                    // Emit the total frequency offset so callers can derive PPM.
-                    // coarse_corrector is in Hz; fine_corrector is in Hz (float).
-                    let offset_hz = self.coarse_corrector + self.fine_corrector as i32;
-                    self.emit_freq_offset(offset_hz);
-                }
-
-                // Adjust fine/coarse frequency correction
-                if self.fine_corrector > self.carrier_diff as f32 / 2.0 {
-                    self.coarse_corrector += self.carrier_diff;
-                    self.fine_corrector -= self.carrier_diff as f32;
-                    trace!(
-                        coarse_hz = self.coarse_corrector,
-                        fine_hz = self.fine_corrector as i32,
-                        "OFDM: fine→coarse wrap (+)"
-                    );
-                } else if self.fine_corrector < -(self.carrier_diff as f32 / 2.0) {
-                    self.coarse_corrector -= self.carrier_diff;
-                    self.fine_corrector += self.carrier_diff as f32;
-                    trace!(
-                        coarse_hz = self.coarse_corrector,
-                        fine_hz = self.fine_corrector as i32,
-                        "OFDM: fine→coarse wrap (-)"
-                    );
-                }
-
-                // Check_endOfNull: verify sync on next frame
-                let phase = self.coarse_corrector + self.fine_corrector as i32;
-                if self.get_samples(device, &mut check_buf, phase).is_err() {
-                    return;
-                }
-
-                start_index = {
-                    let idx = self
-                        .phase_synchronizer
-                        .find_index(&check_buf, track_threshold);
-                    if idx < 0 {
-                        trace!("OFDM: tracking miss — returning to notSynced");
-                        break; // Lost sync, go back to notSynced
-                    } else {
-                        idx as usize
-                    }
-                };
-                // Copy for next frame
-                self.ofdm_buffer[..self.t_u].copy_from_slice(&check_buf);
-                self.emit_sync_signal(true);
-                // Disable coarse AFC after the first successfully decoded
-                // frame — fine_corrector handles residual drift from here on.
-                // (ETSI EN 300 401 §8.4.3)
-                if first_frame {
-                    self.sync_reached();
-                    first_frame = false;
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::dab_constants::jan_abs;
+    use num_complex::Complex32;
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /// Apply the DQPSK soft-bit formula for a single carrier.
+    ///
+    /// `current` is the FFT bin value for the current symbol.
+    /// `reference` is the FFT bin value from the previous symbol (the phase
+    /// reference).  Returns `(soft_re, soft_im)` both in [−127, 127].
+    ///
+    /// This reproduces the per-carrier logic inside `OfdmProcessor::process_block`
+    /// so it can be tested without the full OFDM processor state machine.
+    ///
+    /// ETSI EN 300 401 §14.5 — differential QPSK demodulation.
+    fn dqpsk_soft_bits(current: Complex32, reference: Complex32) -> (i16, i16) {
+        let diff = current * reference.conj();
+        let ab = jan_abs(diff);
+        if ab > 0.0 {
+            let re = (-diff.re / ab * 127.0).clamp(-127.0, 127.0) as i16;
+            let im = (-diff.im / ab * 127.0).clamp(-127.0, 127.0) as i16;
+            (re, im)
+        } else {
+            (0, 0)
+        }
+    }
+
+    // ── DQPSK unit tests ──────────────────────────────────────────────────────
+
+    /// Zero-phase difference (same symbol repeated): carrier rotates by 0°.
+    /// Positive real differential → soft_re = −127, soft_im ≈ 0.
+    #[test]
+    fn dqpsk_no_phase_change() {
+        // Both symbols are at 0°: reference = (1,0), current = (1,0).
+        let (re, im) = dqpsk_soft_bits(Complex32::new(1.0, 0.0), Complex32::new(1.0, 0.0));
+        assert_eq!(re, -127, "zero phase change: soft_re must be −127");
+        assert_eq!(im, 0, "zero phase change: soft_im must be 0");
+    }
+
+    /// 90° counter-clockwise phase step (0° → 90°).
+    /// Positive imaginary differential → soft_re ≈ 0, soft_im = −127.
+    #[test]
+    fn dqpsk_ninety_degree_rotation() {
+        let reference = Complex32::new(1.0, 0.0);
+        let current = Complex32::new(0.0, 1.0); // 90° CCW
+        let (re, im) = dqpsk_soft_bits(current, reference);
+        assert_eq!(re, 0, "90° rotation: soft_re must be 0");
+        assert_eq!(im, -127, "90° rotation: soft_im must be −127");
+    }
+
+    /// 180° phase step: negative real differential → soft_re = +127, soft_im ≈ 0.
+    #[test]
+    fn dqpsk_half_rotation() {
+        let reference = Complex32::new(1.0, 0.0);
+        let current = Complex32::new(-1.0, 0.0);
+        let (re, im) = dqpsk_soft_bits(current, reference);
+        assert_eq!(re, 127, "180° rotation: soft_re must be +127");
+        assert_eq!(im, 0, "180° rotation: soft_im must be 0");
+    }
+
+    /// 270° phase step (or equivalently −90°).
+    /// Negative imaginary differential → soft_re ≈ 0, soft_im = +127.
+    #[test]
+    fn dqpsk_two_seventy_degree_rotation() {
+        let reference = Complex32::new(1.0, 0.0);
+        let current = Complex32::new(0.0, -1.0); // 270° CCW = −90°
+        let (re, im) = dqpsk_soft_bits(current, reference);
+        assert_eq!(re, 0, "270° rotation: soft_re must be 0");
+        assert_eq!(im, 127, "270° rotation: soft_im must be +127");
+    }
+
+    /// Zero-magnitude carrier (no signal) must return (0, 0) — not NaN or panic.
+    #[test]
+    fn dqpsk_zero_magnitude_is_safe() {
+        let (re, im) = dqpsk_soft_bits(Complex32::new(0.0, 0.0), Complex32::new(1.0, 0.0));
+        assert_eq!(re, 0);
+        assert_eq!(im, 0);
+    }
+
+    /// Amplitude scaling must not affect the sign or magnitude of the soft bits:
+    /// soft bits are normalised by `jan_abs`, so any non-zero amplitude gives the
+    /// same result regardless of signal strength.
+    #[test]
+    fn dqpsk_amplitude_invariant() {
+        for scale in [0.1f32, 1.0, 10.0, 1000.0] {
+            let (re, im) = dqpsk_soft_bits(Complex32::new(scale, 0.0), Complex32::new(scale, 0.0));
+            assert_eq!(re, -127, "soft_re must be −127 at scale {scale}");
+            assert_eq!(im, 0, "soft_im must be 0 at scale {scale}");
+        }
+    }
+
+    // ── process_block smoke test ──────────────────────────────────────────────
+
+    /// Verify that `process_block` produces the expected number of soft bits for
+    /// a Mode I OFDM symbol and does not panic on an all-zero guard+useful input.
+    #[test]
+    fn process_block_output_length_mode1() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let running = Arc::new(AtomicBool::new(true));
+        let mut proc = OfdmProcessor::new(1, 2, 5, running);
+
+        // Mode I: T_s = 2552 = T_g(504) + T_u(2048).  K = 1536 carriers.
+        // ibits must hold 2 × K = 3072 soft bits.
+        let t_s = 2552usize;
+        let carriers = 1536usize;
+        let inv = vec![Complex32::new(0.0, 0.0); t_s];
+        let mut ibits = vec![0i16; 2 * carriers];
+
+        proc.process_block(&inv, &mut ibits);
+
+        assert_eq!(ibits.len(), 2 * carriers);
+        // All-zero input → all soft bits must be 0 (zero magnitude, no signal).
+        assert!(ibits.iter().all(|&b| b == 0));
+    }
+
+    // ── DABstar-sync new tests ────────────────────────────────────────────────
+
+    /// `reset_llr_state` must reset the DABstar-style LLR estimators to zero
+    /// power/noise with a neutral global mean value.
+    #[test]
+    fn reset_llr_state_restores_initial_values() {
+        let running = Arc::new(AtomicBool::new(true));
+        let mut proc = OfdmProcessor::new(1, 2, 5, running);
+
+        // Dirty the estimators.
+        proc.mean_power.fill(42.0);
+        proc.null_noise.fill(7.0);
+
+        proc.reset_llr_state();
+
+        assert!(
+            proc.mean_power.iter().all(|&v| v == 0.0),
+            "mean_power must be 0.0 after reset"
+        );
+        assert!(
+            proc.mean_sigma_sq.iter().all(|&v| v == 0.0),
+            "mean_sigma_sq must be 0.0 after reset"
+        );
+        assert!(
+            proc.null_noise.iter().all(|&v| v == 0.0),
+            "null_noise must be 0.0 after reset"
+        );
+    }
+
+    /// A flat null symbol (no TII) must update every carrier's null_noise.
+    #[test]
+    fn update_null_noise_uniform_updates_all_carriers() {
+        let running = Arc::new(AtomicBool::new(true));
+        let mut proc = OfdmProcessor::new(1, 2, 5, running);
+
+        // All null_noise start at 0.
+        assert!(proc.null_noise.iter().all(|&v| v == 0.0));
+
+        // Build a flat null buffer: every sample has unit amplitude.
+        // After FFT-ing T_u samples, all bins have roughly equal power so no
+        // bin exceeds TII_THRESHOLD_FACTOR × mean — all carriers are updated.
+        let null_buf: Vec<Complex32> = (0..proc.t_null)
+            .map(|i| Complex32::from_polar(1.0, i as f32))
+            .collect();
+
+        proc.update_null_noise(&null_buf);
+
+        // At least some carriers must have been updated (null_noise > 0).
+        let updated = proc.null_noise.iter().filter(|&&v| v > 0.0).count();
+        assert!(
+            updated > proc.carriers / 2,
+            "at least half the carriers should be updated on a flat null; updated={updated}"
+        );
+    }
+
+    /// A null symbol with a single dominant spike (simulated TII carrier) must
+    /// NOT update the corresponding carrier's null_noise estimate.
+    #[test]
+    fn update_null_noise_tii_carrier_is_masked() {
+        let running = Arc::new(AtomicBool::new(true));
+        let mut proc = OfdmProcessor::new(1, 2, 5, running);
+
+        // Build a null buffer that is zero except for one large spike in the
+        // time domain.  After FFT the spike spreads energy broadly, but by
+        // making it very large (100× amplitude) relative to the background we
+        // ensure the per-bin power of the spike bin exceeds the TII threshold.
+        let mut null_buf = vec![Complex32::new(0.0, 0.0); proc.t_null];
+        // Place a large real-valued spike at t=0 so it maps to DC and then
+        // spreads uniformly — any bin that ends up with power above
+        // TII_THRESHOLD_FACTOR × mean should be skipped.
+        null_buf[0] = Complex32::new(1000.0, 0.0);
+
+        // Dirty the null_noise so we can see which bins are NOT updated.
+        proc.null_noise.fill(99.0);
+
+        proc.update_null_noise(&null_buf);
+
+        // With the spike at t=0 (DC), the FFT output is a uniform constant
+        // across all bins (DFT of a DC signal), so every bin has the same power
+        // and no bin is above TII_THRESHOLD_FACTOR × mean.  Therefore ALL bins
+        // must be updated (null_noise ≠ 99.0).
+        let untouched = proc.null_noise.iter().filter(|&&v| v == 99.0).count();
+        assert_eq!(
+            untouched, 0,
+            "no carriers should be untouched for a uniform-spectrum null (DC spike)"
+        );
+    }
+
+    /// The fine corrector formula `freq_corr.arg() / TAU * carrier_diff` must
+    /// correct by exactly `carrier_diff/4` when `freq_corr` has a 90° phase
+    /// (arg = π/2).
+    #[test]
+    fn fine_corrector_formula_ninety_degree_phase() {
+        // freq_corr with arg = π/2 (90°).
+        let freq_corr = Complex32::new(0.0, 1.0);
+        let carrier_diff = 1000i32; // Mode I
+
+        let delta = freq_corr.arg() / std::f32::consts::TAU * carrier_diff as f32;
+        // π/2 / (2π) × 1000 = 0.25 × 1000 = 250 Hz
+        let expected = 250.0f32;
+        assert!(
+            (delta - expected).abs() < 1e-3,
+            "expected Δfine={expected} Hz, got {delta}"
+        );
+    }
+
+    /// At 180° (arg = π) the fine corrector advances by exactly carrier_diff/2.
+    #[test]
+    fn fine_corrector_formula_half_rotation() {
+        let freq_corr = Complex32::new(-1.0, 0.0); // arg = π
+        let carrier_diff = 1000i32;
+
+        let delta = freq_corr.arg() / std::f32::consts::TAU * carrier_diff as f32;
+        let expected = 500.0f32;
+        assert!(
+            (delta - expected).abs() < 1e-3,
+            "expected Δfine={expected} Hz, got {delta}"
+        );
+    }
+
+    #[test]
+    fn normalized_cp_coherence_is_zero_without_signal_level() {
+        let coherence = normalized_cp_coherence(Complex32::new(10.0, 0.0), 100, 0.0);
+        assert_eq!(coherence, 0.0);
+    }
+
+    #[test]
+    fn fine_afc_delta_is_suppressed_when_cp_coherence_is_too_low() {
+        let delta = fine_afc_delta_hz(Complex32::new(0.0, 1.0), 1000, 1000, 1000.0);
+        assert_eq!(
+            delta, 0.0,
+            "fine AFC must stay frozen when cyclic-prefix coherence is too weak"
+        );
+    }
+
+    #[test]
+    fn fine_afc_delta_is_applied_when_cp_coherence_is_good() {
+        let delta = fine_afc_delta_hz(Complex32::new(0.0, 5000.0), 1000, 1000, 1.0);
+        assert!(
+            delta > 0.0,
+            "fine AFC should react on coherent cyclic-prefix data"
+        );
+        assert!(
+            delta < 250.0,
+            "fine AFC should remain bounded even on strong coherent updates"
+        );
+    }
+
+    #[test]
+    fn reset_tracking_loop_keeps_fine_frequency_estimate() {
+        let running = Arc::new(AtomicBool::new(true));
+        let mut proc = OfdmProcessor::new(1, 2, 5, running);
+        proc.fine_corrector = -33.5;
+
+        proc.reset_tracking_loop();
+
+        assert_eq!(proc.fine_corrector, -33.5);
+    }
+
+    #[test]
+    fn acquisition_retry_preserves_dabstar_estimators() {
+        let running = Arc::new(AtomicBool::new(true));
+        let mut proc = OfdmProcessor::new(1, 2, 5, running);
+        proc.mean_power[0] = 42.0;
+        proc.null_noise[0] = 7.0;
+        proc.clock_err_hz = 12.5;
+        proc.integ_abs_phase[0] = 0.1;
+
+        proc.prepare_for_acquisition_retry();
+
+        assert_eq!(proc.mean_power[0], 42.0);
+        assert_eq!(proc.null_noise[0], 7.0);
+        assert_eq!(proc.clock_err_hz, 12.5);
+        assert_eq!(proc.integ_abs_phase[0], 0.1);
+    }
+
+    #[test]
+    fn phase_threshold_pair_doubles_the_acquisition_threshold_like_dabstar() {
+        let (acq, track) = phase_threshold_pair(2, 5);
+        assert_eq!(acq, 2);
+        assert_eq!(track, 4);
+    }
+
+    #[test]
+    fn phase_threshold_pair_uses_two_times_acq_for_tracking() {
+        let (acq, track) = phase_threshold_pair(3, 6);
+        assert_eq!(acq, 3);
+        assert_eq!(track, 6);
+    }
+
+    #[test]
+    fn single_tracking_miss_can_reuse_last_good_start_once() {
+        let mut budget = TRACKING_MISS_TOLERANCE;
+        let reused = resolve_sync_start_index(-1, 384, &mut budget, 2048, true);
+        assert_eq!(reused, Some(384));
+        assert_eq!(budget, 0);
+    }
+
+    #[test]
+    fn acquisition_miss_must_not_reuse_last_good_start() {
+        let mut budget = TRACKING_MISS_TOLERANCE;
+        let reused = resolve_sync_start_index(-1, 384, &mut budget, 2048, false);
+        assert_eq!(reused, None);
+        assert_eq!(budget, TRACKING_MISS_TOLERANCE);
+    }
+
+    #[test]
+    fn second_tracking_miss_forces_reacquisition() {
+        let mut budget = 0;
+        let reused = resolve_sync_start_index(-1, 384, &mut budget, 2048, true);
+        assert_eq!(reused, None);
+    }
+
+    #[test]
+    fn coarse_afc_needed_matches_dabstar_fic_gate() {
+        assert!(coarse_afc_needed(0));
+        assert!(coarse_afc_needed(29));
+        assert!(!coarse_afc_needed(30));
+        assert!(!coarse_afc_needed(100));
+    }
+
+    #[test]
+    fn apply_coarse_correction_reports_real_steps_only() {
+        let (updated, step_applied) = apply_coarse_correction(0, 3, 1_000);
+        assert_eq!(updated, 3_000);
+        assert!(step_applied);
+
+        let (unchanged, zero_step) = apply_coarse_correction(5_000, 0, 1_000);
+        assert_eq!(unchanged, 5_000);
+        assert!(!zero_step);
+
+        let (sentinel_unchanged, sentinel_step) =
+            apply_coarse_correction(5_000, PhaseReference::IDX_NOT_FOUND, 1_000);
+        assert_eq!(sentinel_unchanged, 5_000);
+        assert!(!sentinel_step);
+    }
+
+    #[test]
+    fn apply_coarse_correction_resets_on_dabstar_overflow_guard() {
+        let (updated, step_applied) = apply_coarse_correction(34_500, 1, 1_000);
+        assert_eq!(updated, 0);
+        assert!(step_applied);
+    }
+
+    #[test]
+    fn turn_phase_to_first_quadrant_matches_dabstar_behavior() {
+        use std::f32::consts::{FRAC_PI_4, PI};
+
+        let values = [FRAC_PI_4, -FRAC_PI_4, 3.0 * FRAC_PI_4, PI + FRAC_PI_4];
+        for phase in values {
+            let wrapped = turn_phase_to_first_quadrant(phase);
+            assert!(
+                (wrapped - FRAC_PI_4).abs() < 1e-5,
+                "phase {phase} should wrap to pi/4, got {wrapped}"
+            );
+        }
+    }
+
+    #[test]
+    fn clamp_phase_error_limits_to_twenty_degrees() {
+        let limit = 20.0f32.to_radians();
+        assert!((clamp_phase_error(10.0) - limit).abs() < 1e-6);
+        assert!((clamp_phase_error(-10.0) + limit).abs() < 1e-6);
+        assert!((clamp_phase_error(0.1) - 0.1).abs() < 1e-6);
     }
 }

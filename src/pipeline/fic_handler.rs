@@ -9,6 +9,25 @@ use crate::pipeline::viterbi_handler::ViterbiSpiral;
 /// Size of the depunctured Viterbi input buffer for FIC decoding.
 /// = 24 puncture groups × 128 bits/group + 24 tail bits (ETSI EN 300 401 §11.1)
 const FIC_VITERBI_BUF_SIZE: usize = 3072 + 24;
+/// DABstar keeps a bounded 0..10 success ratio rather than trusting the last
+/// frame's raw 0/33/66/100 percent directly.
+const DABSTAR_FIC_RATIO_MAX: i16 = 10;
+
+#[inline]
+fn update_decode_ratio_step(current_steps: i16, crc_ok: bool) -> i16 {
+    let delta = if crc_ok { 1 } else { -1 };
+    (current_steps + delta).clamp(0, DABSTAR_FIC_RATIO_MAX)
+}
+
+fn update_decode_ratio_steps(mut current_steps: i16, success: i16, total: i16) -> i16 {
+    for _ in 0..success.max(0) as usize {
+        current_steps = update_decode_ratio_step(current_steps, true);
+    }
+    for _ in 0..total.saturating_sub(success) as usize {
+        current_steps = update_decode_ratio_step(current_steps, false);
+    }
+    current_steps
+}
 
 pub struct FicHandler {
     bits_per_block: usize,
@@ -22,6 +41,7 @@ pub struct FicHandler {
     pub fib_processor: FibProcessor,
     fic_errors: i32,
     fic_success: i32,
+    fic_decode_ratio_steps: i16,
 }
 
 impl FicHandler {
@@ -83,11 +103,13 @@ impl FicHandler {
             fib_processor: FibProcessor::new(),
             fic_errors: 0,
             fic_success: 0,
+            fic_decode_ratio_steps: 0,
         }
     }
 
-    /// Process 3 FIC blocks (blocks 2,3,4) of BitsperBlock soft bits each.
-    /// Returns (fib_bytes: [4*768 bits], valid: [4 bools])
+    /// Process the three FIC OFDM blocks (blocks 2, 3 and 4) for one DAB frame.
+    /// The output buffer holds one decoded FIC payload of 768 hard bits
+    /// (3 FIBs × 256 bits), which the caller may then reuse across the four CIFs.
     pub fn process_fic_block(&mut self, data: &[i16], out: &mut [u8], valid: &mut [bool]) {
         let mut index = 0usize;
         let mut ficno = 0usize;
@@ -132,16 +154,21 @@ impl FicHandler {
 
         // CRC check on each of the 3 FIBs in this ficno
         *valid = true;
+        let mut frame_success = 0i16;
         for fib_idx in 0..3 {
             let p = &self.bit_buffer_out[fib_idx * 256..(fib_idx + 1) * 256];
-            if !check_crc_bits(p, 256) {
+            let crc_ok = check_crc_bits(p, 256);
+            if !crc_ok {
                 *valid = false;
                 self.fic_errors += 1;
                 continue;
             }
             self.fic_success += 1;
+            frame_success += 1;
             self.fib_processor.process_fib(p, ficno as u16);
         }
+        self.fic_decode_ratio_steps =
+            update_decode_ratio_steps(self.fic_decode_ratio_steps, frame_success, 3);
 
         // Copy bits to output
         let offset = ficno * 768;
@@ -187,6 +214,11 @@ impl FicHandler {
         } else {
             0
         }
+    }
+
+    /// DABstar-style smoothed decode ratio in percent (0, 10, …, 100).
+    pub fn get_fic_decode_ratio_percent(&self) -> i16 {
+        self.fic_decode_ratio_steps * 10
     }
 }
 
@@ -269,5 +301,27 @@ mod tests {
             "Pre-allocated buffer must be zeroed before each use"
         );
         assert_eq!(valid1, valid2);
+    }
+
+    #[test]
+    fn decode_ratio_steps_match_dabstar_leaky_behavior() {
+        assert_eq!(update_decode_ratio_steps(0, 3, 3), 3);
+        assert_eq!(update_decode_ratio_steps(3, 0, 3), 0);
+        assert_eq!(update_decode_ratio_steps(9, 3, 3), 10);
+        assert_eq!(update_decode_ratio_steps(5, 2, 3), 6);
+    }
+
+    #[test]
+    fn process_fic_block_accepts_four_slot_valid_buffer() {
+        let params = DabParams::new(1);
+        let mut fh = FicHandler::new(&params);
+        let bits_per_block = 2 * params.k as usize;
+        let data = vec![0i16; bits_per_block * 3];
+        let mut out = vec![0u8; 768];
+        let mut valid = [false; 4];
+
+        fh.process_fic_block(&data, &mut out, &mut valid);
+
+        assert_eq!(valid.len(), 4);
     }
 }

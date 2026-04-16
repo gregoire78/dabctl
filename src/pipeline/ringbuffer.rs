@@ -53,6 +53,26 @@ impl<T: Clone> RingBuffer<T> {
         self.capacity.saturating_sub(buf.len())
     }
 
+    /// Drop up to `count` oldest buffered items.
+    ///
+    /// Mirrors DABstar's skip-data helper for consumers that need to fast-forward
+    /// without copying samples out first.
+    pub fn skip_data(&self, count: usize) -> usize {
+        let mut buf = self.inner.lock().unwrap();
+        let skipped = count.min(buf.len());
+        buf.drain(..skipped);
+        skipped
+    }
+
+    /// Return the current fill state as a percentage of the configured capacity.
+    pub fn fill_state_in_percent(&self) -> f32 {
+        if self.capacity == 0 {
+            return 0.0;
+        }
+        let buf = self.inner.lock().unwrap();
+        buf.len() as f32 * 100.0 / self.capacity as f32
+    }
+
     pub fn flush(&self) {
         self.inner.lock().unwrap().clear();
     }
@@ -103,5 +123,26 @@ mod tests {
         assert_eq!(rb.available_read(), 3);
         rb.flush();
         assert_eq!(rb.available_read(), 0);
+    }
+
+    #[test]
+    fn skip_data_discards_oldest_items() {
+        let rb: RingBuffer<u8> = RingBuffer::new(8);
+        rb.put_data(&[10, 11, 12, 13, 14]);
+
+        assert_eq!(rb.skip_data(2), 2);
+        assert_eq!(rb.available_read(), 3);
+
+        let mut out = [0u8; 3];
+        assert_eq!(rb.get_data(&mut out), 3);
+        assert_eq!(out, [12, 13, 14]);
+    }
+
+    #[test]
+    fn fill_state_percent_reflects_capacity_usage() {
+        let rb: RingBuffer<u8> = RingBuffer::new(4);
+        assert_eq!(rb.fill_state_in_percent(), 0.0);
+        rb.put_data(&[1, 2]);
+        assert!((rb.fill_state_in_percent() - 50.0).abs() < f32::EPSILON);
     }
 }
