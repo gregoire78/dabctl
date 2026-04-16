@@ -21,19 +21,22 @@ jobs:
           - '{ "name": "linux_amd64",     "runner": "ubuntu-latest",    "cargo_args": "--target x86_64-unknown-linux-gnu",                    "artifact": "target/x86_64-unknown-linux-gnu/release/dabctl", "fdk": false }'
           - '{ "name": "linux_arm64",     "runner": "ubuntu-24.04-arm", "cargo_args": "",                                                     "artifact": "target/release/dabctl",                          "fdk": false }'
           - '{ "name": "linux_amd64_fdk", "runner": "ubuntu-latest",    "cargo_args": "--target x86_64-unknown-linux-gnu --features fdk-aac", "artifact": "target/x86_64-unknown-linux-gnu/release/dabctl", "fdk": true  }'
-          - '{ "name": "linux_arm64_fdk", "runner": "ubuntu-24.04-arm", "cargo_args": "--features fdk-aac",                                    "artifact": "target/release/dabctl",                          "fdk": true  }'
+          - '{ "name": "linux_arm64_fdk", "runner": "ubuntu-24.04-arm", "cargo_args": "--features fdk-aac",                                   "artifact": "target/release/dabctl",                          "fdk": true  }'
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Install system dependencies
         run: |
           sudo add-apt-repository universe -y
           sudo apt-get update
           sudo apt-get install -y \
-            pkg-config libusb-1.0-0-dev \
+            pkg-config libusb-1.0-0-dev librtlsdr-dev \
             libfaad-dev libmpg123-dev \
-            clang libclang-dev
+            clang libclang-dev \
+            jq cmake
 
       - name: Install libfdk-aac-dev
         if: fromJSON(matrix.info).fdk

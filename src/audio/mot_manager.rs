@@ -5,7 +5,7 @@
 ///
 /// Reference: ETSI EN 301 234 (MOT), ETSI TS 101 756 (content types).
 use crate::audio::crc::crc16_ccitt;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 // --- Content types ---
 
@@ -17,6 +17,7 @@ pub const CONTENT_SUB_TYPE_PNG: u16 = 0x003;
 pub const CONTENT_SUB_TYPE_HEADER_UPDATE: u16 = 0x000;
 
 const CRC_LEN: usize = 2;
+const MAX_OBJECT_CACHE: usize = 15;
 
 /// A completed MOT file (slideshow image or other object).
 #[derive(Debug, Clone)]
@@ -347,8 +348,8 @@ impl MotObject {
 /// MOT Manager: routes incoming Data Groups to MOT objects,
 /// emits completed files.
 pub struct MotManager {
-    object: MotObject,
-    current_transport_id: i32,
+    objects: BTreeMap<u16, MotObject>,
+    object_order: VecDeque<u16>,
     crc: crate::audio::crc::CrcCalculator,
 }
 
@@ -361,15 +362,40 @@ impl Default for MotManager {
 impl MotManager {
     pub fn new() -> Self {
         MotManager {
-            object: MotObject::new(),
-            current_transport_id: -1,
+            objects: BTreeMap::new(),
+            object_order: VecDeque::new(),
             crc: crc16_ccitt(),
         }
     }
 
     pub fn reset(&mut self) {
-        self.object = MotObject::new();
-        self.current_transport_id = -1;
+        self.objects.clear();
+        self.object_order.clear();
+    }
+
+    fn touch_transport(&mut self, transport_id: u16) {
+        if let Some(pos) = self.object_order.iter().position(|&id| id == transport_id) {
+            self.object_order.remove(pos);
+        }
+        self.object_order.push_back(transport_id);
+
+        while self.object_order.len() > MAX_OBJECT_CACHE {
+            if let Some(evicted) = self.object_order.pop_front() {
+                self.objects.remove(&evicted);
+            }
+        }
+    }
+
+    fn object_for_transport(&mut self, transport_id: u16) -> &mut MotObject {
+        self.touch_transport(transport_id);
+        self.objects
+            .entry(transport_id)
+            .or_insert_with(MotObject::new)
+    }
+
+    fn reset_transport(&mut self, transport_id: u16) {
+        self.touch_transport(transport_id);
+        self.objects.insert(transport_id, MotObject::new());
     }
 
     /// Process a completed MOT Data Group. Returns Some(MotFile) if object is complete and displayable.
@@ -418,52 +444,56 @@ impl MotManager {
             seg_size
         );
 
-        // Reset object on transport ID change
-        if self.current_transport_id != transport_id as i32 {
-            tracing::trace!(
-                "MOT new transport_id={} (was {})",
-                transport_id,
-                self.current_transport_id
-            );
-            self.current_transport_id = transport_id as i32;
-            self.object = MotObject::new();
-        }
-
+        // DABstar keeps multiple MOT objects alive by transport ID instead of
+        // resetting the whole slideshow state whenever another object arrives.
+        // This prevents interleaved header/body delivery from dropping pending
+        // slides on real multiplexes. ETSI EN 301 234 §5.3 allows concurrent
+        // MOT transport contexts distinguished by transportId.
+        let transport_id = transport_id as u16;
         let is_header = dg_type == 3;
-        self.object.add_segment(
-            is_header,
-            seg_number,
-            last_seg,
-            &dg[offset..offset + seg_size],
-        );
 
-        // ETSI EN 301 234: body size comes from the header core.
-        // If accumulated body bytes exceed the declared size, the current
-        // object is irrecoverably malformed for this transport context.
-        if self.object.header_received()
-            && self.object.total_body_size() > 0
-            && self.object.current_body_size() > self.object.total_body_size()
-        {
-            tracing::debug!(
-                "MOT body overflow: received {} > declared {}, resetting current object",
-                self.object.current_body_size(),
-                self.object.total_body_size()
+        let (display, fraction, file, overflowed) = {
+            let object = self.object_for_transport(transport_id);
+            object.add_segment(
+                is_header,
+                seg_number,
+                last_seg,
+                &dg[offset..offset + seg_size],
             );
-            self.object = MotObject::new();
+
+            let overflowed = object.header_received()
+                && object.total_body_size() > 0
+                && object.current_body_size() > object.total_body_size();
+
+            if overflowed {
+                (false, -1.0, None, true)
+            } else {
+                let display = object.is_to_be_shown();
+                let fraction = if object.total_body_size() > 0 {
+                    object.current_body_size() as f64 / object.total_body_size() as f64
+                } else {
+                    -1.0
+                };
+                let file = if display {
+                    Some(object.result_file.clone())
+                } else {
+                    None
+                };
+                (display, fraction, file, false)
+            }
+        };
+
+        if overflowed {
+            tracing::debug!(
+                "MOT body overflow on transport {}: resetting current object",
+                transport_id
+            );
+            self.reset_transport(transport_id);
             return (None, -1.0);
         }
 
-        let display = self.object.is_to_be_shown();
-
-        let fraction = if self.object.total_body_size() > 0 {
-            self.object.current_body_size() as f64 / self.object.total_body_size() as f64
-        } else {
-            -1.0
-        };
-
         if display {
-            let file = self.object.result_file.clone();
-            (Some(file), fraction)
+            (file, fraction)
         } else {
             (None, fraction)
         }
@@ -811,6 +841,46 @@ mod tests {
         let (result, _) = mgr.handle_data_group(&dg3);
 
         assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_mot_manager_interleaved_transport_ids_keep_pending_objects() {
+        let mut mgr = MotManager::new();
+
+        let body_a = vec![0x11, 0x22, 0x33];
+        let body_b = vec![0x44, 0x55];
+        let header_a = build_mot_header(
+            body_a.len(),
+            CONTENT_TYPE_IMAGE,
+            CONTENT_SUB_TYPE_JFIF,
+            true,
+        );
+        let header_b =
+            build_mot_header(body_b.len(), CONTENT_TYPE_IMAGE, CONTENT_SUB_TYPE_PNG, true);
+
+        let dg_header_a = build_mot_dg(3, 0, true, 100, &header_a);
+        let dg_header_b = build_mot_dg(3, 0, true, 200, &header_b);
+        let dg_body_a = build_mot_dg(4, 0, true, 100, &body_a);
+        let dg_body_b = build_mot_dg(4, 0, true, 200, &body_b);
+
+        let (result, _) = mgr.handle_data_group(&dg_header_a);
+        assert!(result.is_none());
+        let (result, _) = mgr.handle_data_group(&dg_header_b);
+        assert!(result.is_none());
+
+        let (result_a, _) = mgr.handle_data_group(&dg_body_a);
+        assert!(
+            result_a.is_some(),
+            "transport 100 should still complete after transport 200 interleaves"
+        );
+        assert_eq!(result_a.unwrap().data, body_a);
+
+        let (result_b, _) = mgr.handle_data_group(&dg_body_b);
+        assert!(
+            result_b.is_some(),
+            "transport 200 should also remain decodable"
+        );
+        assert_eq!(result_b.unwrap().data, body_b);
     }
 
     #[test]
