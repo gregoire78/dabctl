@@ -46,17 +46,23 @@ fn coarse_afc_needed(fic_quality_percent: i16) -> bool {
     fic_quality_percent < 30
 }
 
-fn apply_coarse_correction(current_coarse: i32, correction: i16, carrier_diff: i32) -> (i32, bool) {
-    if correction == PhaseReference::IDX_NOT_FOUND {
+fn continue_after_coarse_step(_coarse_step_applied: bool) -> bool {
+    // DABstar applies the updated baseband frequency estimate and continues
+    // decoding the current frame instead of declaring sync loss immediately.
+    true
+}
+
+fn apply_coarse_correction(current_coarse: i32, correction_hz: i32) -> (i32, bool) {
+    if correction_hz == PhaseReference::IDX_NOT_FOUND {
         return (current_coarse, false);
     }
 
-    let mut updated = current_coarse + correction as i32 * carrier_diff;
+    let mut updated = current_coarse + correction_hz;
     if updated.abs() > 35_000 {
         updated = 0;
     }
 
-    (updated, correction != 0)
+    (updated, correction_hz != 0)
 }
 
 fn phase_threshold_pair(threshold_1: i16, _threshold_2: i16) -> (i16, i16) {
@@ -261,8 +267,14 @@ impl OfdmProcessor {
         let carrier_diff = params.carrier_diff;
 
         let freq_interleaver = FreqInterleaver::new(&params);
-        let phase_synchronizer =
-            PhaseReference::new(t_u, t_g, carriers, params.dab_mode, DIFF_LENGTH as usize);
+        let phase_synchronizer = PhaseReference::new(
+            t_u,
+            t_g,
+            carriers,
+            carrier_diff,
+            params.dab_mode,
+            DIFF_LENGTH as usize,
+        );
 
         let mut planner = FftPlanner::new();
         let fft = planner.plan_fft_forward(t_u);
@@ -450,18 +462,22 @@ impl OfdmProcessor {
     }
 
     fn reset_tracking_loop(&mut self) {
-        // Keep the current frequency estimate across a brief sync loss.
-        // DABstar carries its baseband frequency correction through reacquisition;
-        // zeroing it here causes the offset to jump back toward 0 Hz and makes
-        // short OFDM timing misses much more disruptive than necessary.
+        // DABstar keeps the already-estimated coarse/fine frequency offset when
+        // returning to acquisition, but clears the frame-length clock estimate
+        // before searching for the next valid null + PRS alignment.
+        self.clock_err_hz = 0.0;
     }
 
     fn prepare_for_acquisition_retry(&mut self) {
         self.reset_tracking_loop();
-        // DABstar does not cold-reset the OFDM decoder on every acquisition retry.
-        // Keep the per-carrier power/noise estimators, phase integrators and
-        // clock-error estimate warm so a brief dropout does not force the whole
-        // soft-bit weighting path to relearn from zero.
+        // DABstar resets the OFDM decoder state when re-entering
+        // WAIT_FOR_TIME_SYNC_MARKER, so stale reference carriers and per-bin
+        // soft-bit statistics from the failed lock do not poison the next
+        // acquisition attempt. ETSI EN 300 401 §14.8 acquisition/tracking.
+        self.reset_llr_state();
+        self.reference_phase.fill(Complex32::new(0.0, 0.0));
+        self.r1_buf.fill(Complex32::new(0.0, 0.0));
+        self.last_sync_start_index = 0;
     }
 
     fn store_reference_symbol_0(&mut self) {
@@ -480,12 +496,12 @@ impl OfdmProcessor {
             .estimate_offset(&self.ofdm_buffer[..self.t_u]);
         let prev = self.coarse_corrector;
         let (updated_coarse, coarse_step_applied) =
-            apply_coarse_correction(self.coarse_corrector, correction, self.carrier_diff);
+            apply_coarse_correction(self.coarse_corrector, correction);
         self.coarse_corrector = updated_coarse;
 
         if correction != PhaseReference::IDX_NOT_FOUND && self.coarse_corrector != prev {
             trace!(
-                delta_carriers = correction,
+                delta_hz = correction,
                 prev_hz = prev,
                 new_hz = self.coarse_corrector,
                 "OFDM: coarse AFC step applied"
@@ -848,8 +864,11 @@ impl OfdmProcessor {
         if coarse_step_applied {
             trace!(
                 coarse_hz = self.coarse_corrector,
-                "OFDM: coarse correction changed; reacquiring before decoding remaining symbols"
+                "OFDM: coarse correction changed; continuing current frame like DABstar"
             );
+        }
+
+        if !continue_after_coarse_step(coarse_step_applied) {
             self.emit_sync_signal(false);
             return Ok(false);
         }
@@ -1236,31 +1255,45 @@ mod tests {
     }
 
     #[test]
-    fn reset_tracking_loop_keeps_fine_frequency_estimate() {
+    fn reset_tracking_loop_keeps_frequency_offset_but_clears_clock_error() {
         let running = Arc::new(AtomicBool::new(true));
         let mut proc = OfdmProcessor::new(1, 2, 5, running);
         proc.fine_corrector = -33.5;
+        proc.coarse_corrector = 2_000;
+        proc.clock_err_hz = 12.5;
 
         proc.reset_tracking_loop();
 
         assert_eq!(proc.fine_corrector, -33.5);
+        assert_eq!(proc.coarse_corrector, 2_000);
+        assert_eq!(proc.clock_err_hz, 0.0);
     }
 
     #[test]
-    fn acquisition_retry_preserves_dabstar_estimators() {
+    fn acquisition_retry_resets_dabstar_decoder_state() {
         let running = Arc::new(AtomicBool::new(true));
         let mut proc = OfdmProcessor::new(1, 2, 5, running);
         proc.mean_power[0] = 42.0;
         proc.null_noise[0] = 7.0;
         proc.clock_err_hz = 12.5;
         proc.integ_abs_phase[0] = 0.1;
+        proc.reference_phase[0] = Complex32::new(1.0, 2.0);
+        proc.r1_buf[0] = Complex32::new(3.0, 4.0);
+        proc.last_sync_start_index = 384;
+        proc.fine_corrector = -33.5;
+        proc.coarse_corrector = 2_000;
 
         proc.prepare_for_acquisition_retry();
 
-        assert_eq!(proc.mean_power[0], 42.0);
-        assert_eq!(proc.null_noise[0], 7.0);
-        assert_eq!(proc.clock_err_hz, 12.5);
-        assert_eq!(proc.integ_abs_phase[0], 0.1);
+        assert_eq!(proc.fine_corrector, -33.5);
+        assert_eq!(proc.coarse_corrector, 2_000);
+        assert_eq!(proc.clock_err_hz, 0.0);
+        assert_eq!(proc.mean_power[0], 0.0);
+        assert_eq!(proc.null_noise[0], 0.0);
+        assert_eq!(proc.integ_abs_phase[0], 0.0);
+        assert_eq!(proc.reference_phase[0], Complex32::new(0.0, 0.0));
+        assert_eq!(proc.r1_buf[0], Complex32::new(0.0, 0.0));
+        assert_eq!(proc.last_sync_start_index, 0);
     }
 
     #[test]
@@ -1309,24 +1342,34 @@ mod tests {
     }
 
     #[test]
+    fn coarse_step_does_not_force_reacquisition_like_dabstar() {
+        assert!(continue_after_coarse_step(false));
+        assert!(continue_after_coarse_step(true));
+    }
+
+    #[test]
     fn apply_coarse_correction_reports_real_steps_only() {
-        let (updated, step_applied) = apply_coarse_correction(0, 3, 1_000);
+        let (updated, step_applied) = apply_coarse_correction(0, 3_000);
         assert_eq!(updated, 3_000);
         assert!(step_applied);
 
-        let (unchanged, zero_step) = apply_coarse_correction(5_000, 0, 1_000);
+        let (subbin_updated, subbin_step) = apply_coarse_correction(100, 550);
+        assert_eq!(subbin_updated, 650);
+        assert!(subbin_step);
+
+        let (unchanged, zero_step) = apply_coarse_correction(5_000, 0);
         assert_eq!(unchanged, 5_000);
         assert!(!zero_step);
 
         let (sentinel_unchanged, sentinel_step) =
-            apply_coarse_correction(5_000, PhaseReference::IDX_NOT_FOUND, 1_000);
+            apply_coarse_correction(5_000, PhaseReference::IDX_NOT_FOUND);
         assert_eq!(sentinel_unchanged, 5_000);
         assert!(!sentinel_step);
     }
 
     #[test]
     fn apply_coarse_correction_resets_on_dabstar_overflow_guard() {
-        let (updated, step_applied) = apply_coarse_correction(34_500, 1, 1_000);
+        let (updated, step_applied) = apply_coarse_correction(34_500, 1_000);
         assert_eq!(updated, 0);
         assert!(step_applied);
     }

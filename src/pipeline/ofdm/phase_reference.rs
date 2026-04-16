@@ -43,6 +43,7 @@ const SEARCH_RANGE: usize = 2 * 70;
 pub struct PhaseReference {
     t_u: usize,
     t_g: usize,
+    carrier_diff: i32,
     ref_table: Vec<Complex32>,
     coarse_ref_arg: Vec<Complex32>,
     fft: Arc<dyn Fft<f32>>,
@@ -111,9 +112,16 @@ fn peak_index_in_window(
 }
 
 impl PhaseReference {
-    pub const IDX_NOT_FOUND: i16 = 100;
+    pub const IDX_NOT_FOUND: i32 = 100_000;
 
-    pub fn new(t_u: usize, t_g: usize, carriers: usize, mode: i16, _diff_length: usize) -> Self {
+    pub fn new(
+        t_u: usize,
+        t_g: usize,
+        carriers: usize,
+        carrier_diff: i32,
+        mode: i16,
+        _diff_length: usize,
+    ) -> Self {
         let phase_table = PhaseTable::new(mode);
         let mut planner = FftPlanner::new();
         let fft = planner.plan_fft_forward(t_u);
@@ -138,6 +146,7 @@ impl PhaseReference {
         PhaseReference {
             t_u,
             t_g,
+            carrier_diff,
             ref_table,
             coarse_ref_arg,
             fft,
@@ -196,7 +205,7 @@ impl PhaseReference {
     /// 2. form relative phase products between adjacent FFT bins
     /// 3. IFFT to time domain, multiply by the precomputed reference response
     /// 4. FFT back and pick the strongest peak in the ±70-bin coarse window
-    pub fn estimate_offset(&self, v: &[Complex32]) -> i16 {
+    pub fn estimate_offset(&self, v: &[Complex32]) -> i32 {
         let mut fft_buffer = v[..self.t_u].to_vec();
         self.fft.process(&mut fft_buffer);
 
@@ -243,7 +252,7 @@ impl PhaseReference {
             index as f32
         };
 
-        offset.round() as i16
+        (offset * self.carrier_diff as f32) as i32
     }
 }
 
@@ -254,7 +263,14 @@ mod tests {
 
     fn make_phase_ref(mode: u8) -> PhaseReference {
         let p = DabParams::new(mode);
-        PhaseReference::new(p.t_u as usize, p.t_g as usize, p.k as usize, p.dab_mode, 50)
+        PhaseReference::new(
+            p.t_u as usize,
+            p.t_g as usize,
+            p.k as usize,
+            p.carrier_diff,
+            p.dab_mode,
+            50,
+        )
     }
 
     // ── find_index window ─────────────────────────────────────────────────────
@@ -304,16 +320,20 @@ mod tests {
     // ── estimate_offset confidence + sub-bin ──────────────────────────────────
 
     /// With an all-zero input there is no useful signal; the confidence check
-    /// should fire and return the IDX_NOT_FOUND sentinel (100).
+    /// should fire and return the IDX_NOT_FOUND sentinel (100000).
     #[test]
     fn estimate_offset_all_zero_returns_not_found() {
         let pr = make_phase_ref(1);
         let t_u = DabParams::new(1).t_u as usize;
         let v = vec![Complex32::new(0.0, 0.0); t_u];
-        assert_eq!(pr.estimate_offset(&v), 100, "all-zero → IDX_NOT_FOUND");
+        assert_eq!(
+            pr.estimate_offset(&v),
+            PhaseReference::IDX_NOT_FOUND,
+            "all-zero → IDX_NOT_FOUND"
+        );
     }
 
-    /// The return value must always be in [−70, 70] or equal to the sentinel 100.
+    /// The return value must always be in [−70 kHz, 70 kHz] or equal to the sentinel 100000.
     #[test]
     fn estimate_offset_return_range() {
         use std::f32::consts::PI;
@@ -325,7 +345,7 @@ mod tests {
             .collect();
         let r = pr.estimate_offset(&v);
         assert!(
-            r == 100 || (-70..=70).contains(&r),
+            r == PhaseReference::IDX_NOT_FOUND || (-70_000..=70_000).contains(&r),
             "result {r} out of expected range"
         );
     }
@@ -355,9 +375,10 @@ mod tests {
             estimated != 100,
             "large but valid coarse shift should be detected"
         );
+        let expected_hz = shift as i32 * DabParams::new(1).carrier_diff;
         assert!(
-            (estimated - shift as i16).abs() <= 2,
-            "expected coarse shift about {shift}, got {estimated}"
+            (estimated - expected_hz).abs() <= 2_000,
+            "expected coarse shift about {expected_hz} Hz, got {estimated}"
         );
     }
 

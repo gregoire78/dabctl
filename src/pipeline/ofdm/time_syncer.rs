@@ -150,4 +150,17 @@ mod tests {
 
         assert_eq!(state, Some(TimeSyncState::NoEndOfDipFound));
     }
+
+    #[test]
+    fn time_syncer_uses_direct_threshold_crossing_like_dabstar() {
+        let mut syncer = TimeSyncer::new(4096, 50);
+        let mut levels = vec![1.0f32; 64];
+        levels.extend(std::iter::repeat_n(0.0f32, 24));
+        levels.extend(std::iter::repeat_n(1.0f32, 128));
+        let mut iter = levels.into_iter();
+
+        let state = syncer.read_samples_until_end_of_level_drop(1.0, 100, 80, || iter.next());
+
+        assert_eq!(state, Some(TimeSyncState::TimeSyncEstablished));
+    }
 }
