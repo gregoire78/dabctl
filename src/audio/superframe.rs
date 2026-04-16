@@ -212,13 +212,9 @@ impl SuperframeFilter {
             let dst = i * self.frame_len..(i + 1) * self.frame_len;
             self.sf[dst].copy_from_slice(&self.sf_raw[src]);
         }
-        let (corr, uncorr) = self.rs_dec.decode_superframe(&mut self.sf);
-        if corr > 0 || uncorr {
-            trace!(
-                rs_corrected = corr,
-                rs_uncorrectable = uncorr,
-                "SUPERFRAME: RS decode"
-            );
+        let (rs_corrected, rs_uncorrectable) = self.rs_dec.decode_superframe(&mut self.sf);
+        if rs_corrected > 0 || rs_uncorrectable {
+            trace!(rs_corrected, rs_uncorrectable, "SUPERFRAME: RS decode");
         }
 
         // Check fire code sync
@@ -236,6 +232,8 @@ impl SuperframeFilter {
             self.frame_count = 4;
             return SuperframeResult {
                 sync_fail: true,
+                rs_corrected,
+                rs_uncorrectable,
                 ..SuperframeResult::default()
             };
         }
@@ -257,6 +255,7 @@ impl SuperframeFilter {
         // Decode each AU
         let mut access_units = Vec::with_capacity(num_aus);
         let mut pad_data = Vec::new();
+        let mut au_crc_fail: usize = 0;
 
         for i in 0..num_aus {
             let start = au_start[i];
@@ -275,6 +274,7 @@ impl SuperframeFilter {
             let crc_stored = (au_data[au_len - 2] as u16) << 8 | au_data[au_len - 1] as u16;
             let crc_calced = self.crc_ccitt.calc(&au_data[..au_len - 2]);
             if crc_stored != crc_calced {
+                au_crc_fail += 1;
                 continue;
             }
 
@@ -313,6 +313,9 @@ impl SuperframeFilter {
             },
             sync_ok: true,
             sync_fail: false,
+            rs_corrected,
+            rs_uncorrectable,
+            au_crc_fail,
         }
     }
 
@@ -426,6 +429,12 @@ pub struct SuperframeResult {
     pub sync_ok: bool,
     /// A superframe sync was attempted and failed (fire code CRC)
     pub sync_fail: bool,
+    /// Total RS byte-corrections applied across all RS blocks in this superframe
+    pub rs_corrected: usize,
+    /// True if at least one RS block was uncorrectable (> 5 errors)
+    pub rs_uncorrectable: bool,
+    /// Number of Access Units discarded due to AU CRC-16 mismatch
+    pub au_crc_fail: usize,
 }
 
 /// Extract PAD data from an AAC AU (embedded in Data Stream Element)

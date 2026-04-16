@@ -1,5 +1,5 @@
 // Frequency interleaver - converted from freq-interleaver.cpp (eti-cmdline)
-// Section 14.6 of the DAB standard
+// ETSI EN 300 401 §14.6.2 — frequency interleaving of OFDM sub-carriers.
 
 use crate::pipeline::dab_params::DabParams;
 

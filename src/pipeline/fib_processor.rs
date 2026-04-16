@@ -1,6 +1,7 @@
 // FIB processor - converted from fib-processor.cpp (eti-cmdline)
 
 use crate::pipeline::dab_constants::*;
+use std::collections::HashMap;
 
 /// Returns `true` when `label` is a plausible human-readable service label.
 ///
@@ -112,11 +113,19 @@ struct ServiceLabel {
     label: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AudioService {
+    pub subchid: u8,
+    pub dab_plus: bool,
+}
+
 #[derive(Clone, Default)]
 struct ServiceId {
     in_use: bool,
     service_id: i32,
     service_label: ServiceLabel,
+    primary_subchid: Option<u8>,
+    audio_components: HashMap<u8, AudioService>,
 }
 
 #[allow(clippy::type_complexity)]
@@ -182,6 +191,7 @@ impl FibProcessor {
         match extension {
             0 => self.fig0_extension0(d, base),
             1 => self.fig0_extension1(d, base),
+            2 => self.fig0_extension2(d, base),
             _ => {}
         }
     }
@@ -197,6 +207,59 @@ impl FibProcessor {
         let pd_bit = get_bits_1(d, base + 8 + 2);
         while used < length.saturating_sub(1) {
             used = self.handle_fig0_ext1(d, base, used, pd_bit as u8);
+        }
+    }
+
+    fn fig0_extension2(&mut self, d: &[u8], base: usize) {
+        let length = get_bits_5(d, base + 3) as usize;
+        let pd_bit = get_bits_1(d, base + 8 + 2) == 1;
+        let end_bit = base + (length + 1) * 8;
+        let mut bit_offset = base + 16;
+
+        while bit_offset + if pd_bit { 40 } else { 24 } <= end_bit {
+            let sid = if pd_bit {
+                get_lbits(d, bit_offset, 32) as i32
+            } else {
+                get_bits(d, bit_offset, 16) as i32
+            };
+            bit_offset += if pd_bit { 32 } else { 16 };
+
+            if bit_offset + 8 > end_bit {
+                break;
+            }
+
+            let num_components = get_bits_4(d, bit_offset + 4) as usize;
+            bit_offset += 8;
+
+            let svc_idx = self.find_service_id(sid);
+            for _ in 0..num_components {
+                if bit_offset + 16 > end_bit {
+                    return;
+                }
+
+                let tmid = get_bits_2(d, bit_offset);
+                if tmid == 0b00 {
+                    let ascty = get_bits_6(d, bit_offset + 2) as u8;
+                    let subchid = get_bits_6(d, bit_offset + 8) as u8;
+                    let is_primary = get_bits_1(d, bit_offset + 14) == 1;
+                    let ca_flag = get_bits_1(d, bit_offset + 15) == 1;
+
+                    if !ca_flag && (ascty == 0 || ascty == 63) {
+                        self.list_of_services[svc_idx].audio_components.insert(
+                            subchid,
+                            AudioService {
+                                subchid,
+                                dab_plus: ascty == 63,
+                            },
+                        );
+                        if is_primary || self.list_of_services[svc_idx].primary_subchid.is_none() {
+                            self.list_of_services[svc_idx].primary_subchid = Some(subchid);
+                        }
+                    }
+                }
+
+                bit_offset += 16;
+            }
         }
     }
 
@@ -362,6 +425,9 @@ impl FibProcessor {
                 self.list_of_services[i].in_use = true;
                 self.list_of_services[i].service_id = service_id;
                 self.list_of_services[i].service_label.has_name = false;
+                self.list_of_services[i].service_label.label.clear();
+                self.list_of_services[i].primary_subchid = None;
+                self.list_of_services[i].audio_components.clear();
                 return i;
             }
         }
@@ -381,6 +447,17 @@ impl FibProcessor {
         }
     }
 
+    pub fn find_audio_service(&self, service_id: i32) -> Option<AudioService> {
+        let svc = self
+            .list_of_services
+            .iter()
+            .find(|svc| svc.in_use && svc.service_id == service_id)?;
+        if let Some(primary) = svc.primary_subchid {
+            return svc.audio_components.get(&primary).copied();
+        }
+        svc.audio_components.values().next().copied()
+    }
+
     pub fn get_cif_count(&self) -> (i16, i16) {
         (self.cif_count_hi, self.cif_count_lo)
     }
@@ -392,6 +469,9 @@ impl FibProcessor {
         for svc in self.list_of_services.iter_mut() {
             *svc = ServiceId::default();
         }
+        self.cif_count_hi = -1;
+        self.cif_count_lo = -1;
+        self.is_synced = false;
     }
 }
 
@@ -703,5 +783,45 @@ mod tests {
         let (name, sid) = r.as_ref().expect("program_name_cb was not invoked");
         assert_eq!(name, "NRJ", "decoded service name mismatch");
         assert_eq!(*sid, 0xF2F8_u32 as i32, "decoded SId mismatch");
+    }
+
+    #[test]
+    fn process_fib_fig0_2_maps_primary_audio_service() {
+        // FIG 0/2, PD=0, SId=0xF201, one MSC audio component (DAB+), SubChId=5.
+        let fib = bytes_to_fib(&[
+            0x06, // FIG type 0, length 6
+            0x02, // CN=0, OE=0, PD=0, extension=2
+            0xF2, 0x01, // SId
+            0x01, // one service component
+            0x3F, // TMId=00, ASCTy=63 (DAB+)
+            0x16, // SubChId=5, primary=true, CA=false
+            0xE0, // end marker
+        ]);
+
+        let mut p = FibProcessor::new();
+        p.process_fib(&fib, 0);
+
+        let audio = p
+            .find_audio_service(0xF201)
+            .expect("service mapping must be available after FIG 0/2");
+        assert_eq!(audio.subchid, 5);
+        assert!(audio.dab_plus);
+    }
+
+    #[test]
+    fn clear_ensemble_resets_runtime_state() {
+        let mut p = FibProcessor::new();
+        p.cif_count_hi = 7;
+        p.cif_count_lo = 42;
+        p.is_synced = true;
+        p.list_of_services[0].in_use = true;
+        p.sub_channels[0].in_use = true;
+
+        p.clear_ensemble();
+
+        assert_eq!(p.get_cif_count(), (-1, -1));
+        assert!(!p.is_synced);
+        assert!(!p.get_channel_info(0).in_use);
+        assert!(!p.list_of_services[0].in_use);
     }
 }

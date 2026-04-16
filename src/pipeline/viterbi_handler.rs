@@ -239,6 +239,57 @@ impl ViterbiSpiral {
             *out = (self.data[byte_idx] >> bit_pos) & 1;
         }
     }
+
+    /// Compare a decoded hard-bit sequence against the original soft symbols and
+    /// puncturing pattern, returning `(checked_bits, bit_errors)`.
+    ///
+    /// This mirrors DABstar's BER helper and is useful when instrumenting live
+    /// FIC/MSC quality without changing the decoder path itself.
+    pub fn calculate_ber(
+        &self,
+        input: &[i16],
+        puncture_table: &[bool],
+        output: &[u8],
+    ) -> (usize, usize) {
+        let mut bits = 0usize;
+        let mut errors = 0usize;
+        let mut shift_reg = 0usize;
+        let nbits = self.frame_bits.min(output.len());
+
+        for (i, bit) in output.iter().copied().enumerate().take(nbits) {
+            shift_reg = ((shift_reg << 1) | (bit as usize & 1)) & 0xff;
+            for (j, poly) in POLYS.iter().enumerate() {
+                let idx = i * RATE + j;
+                if idx >= input.len() || idx >= puncture_table.len() || !puncture_table[idx] {
+                    continue;
+                }
+                bits += 1;
+                let expected = parity(shift_reg as i32 & *poly) != 0;
+                let observed = input[idx] > 0;
+                if observed != expected {
+                    errors += 1;
+                }
+            }
+        }
+
+        for i in nbits..(nbits + K - 1) {
+            shift_reg = (shift_reg << 1) & 0xff;
+            for (j, poly) in POLYS.iter().enumerate() {
+                let idx = i * RATE + j;
+                if idx >= input.len() || idx >= puncture_table.len() || !puncture_table[idx] {
+                    continue;
+                }
+                bits += 1;
+                let expected = parity(shift_reg as i32 & *poly) != 0;
+                let observed = input[idx] > 0;
+                if observed != expected {
+                    errors += 1;
+                }
+            }
+        }
+
+        (bits, errors)
+    }
 }
 
 #[cfg(test)]
@@ -436,6 +487,21 @@ mod tests {
     /// State convention: `new_state = (old_state << 1 | input_bit) & (NUM_STATES − 1)`.
     /// This is consistent with the butterfly formula `(2 * state + input) & (NUM_STATES − 1)`
     /// used to build `branchtab`.
+    #[test]
+    fn calculate_ber_reports_zero_errors_on_clean_codeword() {
+        let original = vec![0u8; 32];
+        let soft = test_encode(&original);
+        let puncture = vec![true; soft.len()];
+
+        let mut v = ViterbiSpiral::new(32);
+        let mut decoded = vec![0u8; 32];
+        v.deconvolve(&soft, &mut decoded);
+
+        let (bits, errors) = v.calculate_ber(&soft, &puncture, &decoded);
+        assert!(bits > 0);
+        assert_eq!(errors, 0);
+    }
+
     fn test_encode(bits: &[u8]) -> Vec<i16> {
         let total = bits.len() + K - 1; // data bits + K-1 zero tail bits to flush the register
         let mut out = Vec::with_capacity(total * RATE);

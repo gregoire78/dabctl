@@ -41,13 +41,27 @@ impl MotDecoder {
     /// Set the expected Data Group length (from DGLI).
     /// Must be called before the start subfield of a new Data Group.
     pub fn set_len(&mut self, len: usize) {
-        self.size_needed = len;
+        // ETSI EN 301 234 §5.1: the X-PAD Data Group Length Indicator (DGLI)
+        // announces the exact size of the following MOT Data Group.
+        // Missing or malformed DGLI must not leave stale partial bytes in the
+        // reassembler, otherwise later valid slideshow objects can be poisoned.
+        if (CRC_LEN..=MOT_DG_SIZE_MAX).contains(&len) {
+            self.size = 0;
+            self.size_needed = len;
+        } else {
+            tracing::debug!("Ignoring MOT Data Group with invalid DGLI length: {}", len);
+            self.reset();
+        }
     }
 
     /// Process a data subfield. Returns true when a complete valid Data Group is available.
     pub fn process_subfield(&mut self, start: bool, data: &[u8]) -> bool {
         if start {
             self.size = 0;
+            if self.size_needed < CRC_LEN {
+                tracing::trace!("Ignoring MOT start subfield without a valid pending DGLI");
+                return false;
+            }
         } else if self.size == 0 {
             // Ignore continuation without a start
             return false;
@@ -227,5 +241,22 @@ mod tests {
         dec.set_len(dg2.len());
         assert!(dec.process_subfield(true, &dg2));
         assert_eq!(dec.get_data_group(), dg2);
+    }
+
+    #[test]
+    fn test_mot_decoder_zero_length_start_is_ignored_without_poisoning_state() {
+        let mut dec = MotDecoder::new();
+
+        dec.set_len(0);
+        assert!(!dec.process_subfield(true, &[0x01, 0x02, 0x03]));
+        assert_eq!(
+            dec.size, 0,
+            "missing DGLI must not leave partial stale MOT data behind"
+        );
+
+        let dg = build_dg_with_crc(&[0x10, 0x20, 0x30]);
+        dec.set_len(dg.len());
+        assert!(dec.process_subfield(true, &dg));
+        assert_eq!(dec.get_data_group(), dg);
     }
 }

@@ -37,6 +37,15 @@ use dabctl::pipeline::ofdm::ofdm_processor::OfdmProcessor;
 /// Bounded channel capacity in frames (~24 ms per frame → ~100 ms back-pressure).
 const CHANNEL_CAPACITY: usize = 4;
 
+/// DABstar-inspired OFDM phase-correlation thresholds.
+///
+/// Tom Neda's receiver uses a base threshold of 3.0 and a stricter symbol
+/// sync evaluation once lock is established. Using 3 / 6 here keeps startup
+/// tolerant enough to acquire while making steady tracking less likely to
+/// follow a weak false peak during SFN or fading.
+const OFDM_ACQ_THRESHOLD: i16 = 3;
+const OFDM_TRACK_THRESHOLD: i16 = 6;
+
 #[inline]
 fn is_metadata_blackout_during_dropout(
     sync_ok: i32,
@@ -54,13 +63,33 @@ pub struct Iq2pcmArgs {
     channel: String,
 
     /// Gain as percentage (0..100). If omitted, software AGC (SAGC) is used.
-    #[arg(short = 'G', long = "gain", conflicts_with = "hardware_agc")]
+    #[arg(
+        short = 'G',
+        long = "gain",
+        conflicts_with_all = ["hardware_agc", "driver_agc", "software_agc"]
+    )]
     gain: Option<i16>,
 
     /// Use the RTL-SDR chip's built-in hardware AGC.
-    /// By default, software AGC (SAGC) is used. Mutually exclusive with -G.
-    #[arg(long = "hardware-agc", conflicts_with = "gain")]
+    #[arg(
+        long = "hardware-agc",
+        conflicts_with_all = ["gain", "driver_agc", "software_agc"]
+    )]
     hardware_agc: bool,
+
+    /// Use the old-dab driver's AGC mode when that backend is available.
+    #[arg(
+        long = "driver-agc",
+        conflicts_with_all = ["gain", "hardware_agc", "software_agc"]
+    )]
+    driver_agc: bool,
+
+    /// Use the application software SAGC loop explicitly.
+    #[arg(
+        long = "software-agc",
+        conflicts_with_all = ["gain", "hardware_agc", "driver_agc"]
+    )]
+    software_agc: bool,
 
     /// PPM frequency correction
     #[arg(short = 'p', long = "ppm", default_value_t = 0)]
@@ -110,6 +139,19 @@ pub struct Iq2pcmArgs {
     /// RTL-SDR device index
     #[arg(long = "device-index", default_value_t = 0)]
     device_index: u32,
+
+    /// Enable offset tuning: tunes the hardware +512 kHz above the DAB channel
+    /// and applies a compensating digital frequency rotation, moving the RTL-SDR
+    /// LO leakthrough spike away from the low-index OFDM subcarriers.
+    #[arg(long = "offset-tuning")]
+    offset_tuning: bool,
+
+    /// Disable IQ imbalance correction.
+    /// By default, a second-order IIR estimator tracks and corrects ADC phase and
+    /// amplitude mismatch between the I and Q branches.  Pass this flag to disable
+    /// the correction (e.g., when using a pre-corrected SDR or for benchmarking).
+    #[arg(long = "no-iq-correction")]
+    no_iq_correction: bool,
 
     /// AAC decoder backend: faad2 or fdk-aac.
     /// Only available when built with `--features fdk-aac`.
@@ -164,7 +206,7 @@ pub fn run(args: Iq2pcmArgs) {
     let running_ctrlc = running.clone();
     let run_ctrlc = run.clone();
     ctrlc::set_handler(move || {
-        warn!("Signal caught, terminating!");
+        info!("shutdown requested; stopping pipeline");
         running_ctrlc.store(false, Ordering::SeqCst);
         run_ctrlc.store(false, Ordering::SeqCst);
     })
@@ -181,24 +223,32 @@ pub fn run(args: Iq2pcmArgs) {
             std::process::exit(4);
         }
     };
-    debug!("tunedFrequency = {}", freq as u32);
+    debug!(channel = %channel, freq_hz = freq as u32, "resolved DAB channel frequency");
 
     let gain_mode = if args.hardware_agc {
         GainMode::Hardware
+    } else if args.driver_agc {
+        GainMode::Driver
     } else if let Some(pct) = args.gain {
         GainMode::Manual(pct)
     } else {
         GainMode::Software
     };
 
-    let mut input_device =
-        match RtlsdrHandler::new(freq as u32, args.ppm, gain_mode, args.device_index) {
-            Ok(dev) => dev,
-            Err(e) => {
-                error!("Installing device failed: {}", e);
-                std::process::exit(3);
-            }
-        };
+    let mut input_device = match RtlsdrHandler::new(
+        freq as u32,
+        args.ppm,
+        gain_mode,
+        args.device_index,
+        args.offset_tuning,
+        !args.no_iq_correction,
+    ) {
+        Ok(dev) => dev,
+        Err(e) => {
+            error!("failed to initialize RTL-SDR device: {}", e);
+            std::process::exit(3);
+        }
+    };
 
     // ── Build the in-memory DabFrame channel ──────────────────────────────────
     // Capacity 4: ~100 ms of back-pressure before the OFDM thread blocks.
@@ -208,20 +258,32 @@ pub fn run(args: Iq2pcmArgs) {
     let ensemble_cb: Option<std::sync::Arc<dyn Fn(&str, u32) + Send + Sync>> =
         Some(std::sync::Arc::new(move |name: &str, _eid: u32| {
             if !er.load(Ordering::SeqCst) {
-                info!("ensemble {} detected", name);
+                info!("ensemble detected: {}", name.trim());
                 er.store(true, Ordering::SeqCst);
             }
         }));
     let program_cb: Option<std::sync::Arc<dyn Fn(&str, i32) + Send + Sync>> =
         Some(std::sync::Arc::new(move |name: &str, sid: i32| {
-            debug!("program {} (0x{:X}) is in the list", name.trim(), sid);
+            debug!("service listed: {} (0x{:04X})", name.trim(), sid);
         }));
+    let current_fic_quality_percent = Arc::new(AtomicI16::new(0));
+    let fic_quality_steps = Arc::new(AtomicI16::new(0));
     let fok = fic_ok.clone();
     let ftot = fic_total.clone();
+    let ficq = current_fic_quality_percent.clone();
+    let fqsteps = fic_quality_steps.clone();
     let fic_quality_cb: Option<std::sync::Arc<dyn Fn(i16, i16) + Send + Sync>> =
         Some(std::sync::Arc::new(move |success: i16, total: i16| {
             fok.fetch_add(i32::from(success), Ordering::Relaxed);
             ftot.fetch_add(i32::from(total), Ordering::Relaxed);
+
+            // DABstar-style leaky FIC ratio for OFDM control: increment on valid
+            // FIB CRCs, decrement on failures, clamp to 0..10 then scale to %.
+            let prev = fqsteps.load(Ordering::Relaxed);
+            let failures = total.saturating_sub(success);
+            let next = (prev + success - failures).clamp(0, 10);
+            fqsteps.store(next, Ordering::Relaxed);
+            ficq.store(next * 10, Ordering::Relaxed);
         }));
 
     let pipeline = DabPipeline::new(1, frame_tx, ensemble_cb, program_cb, fic_quality_cb);
@@ -230,7 +292,8 @@ pub fn run(args: Iq2pcmArgs) {
     let ts = time_synced.clone();
     let sn = signal_noise.clone();
     let freq_offset_hz = Arc::new(AtomicI32::new(0));
-    let mut ofdm_processor = OfdmProcessor::new(1, 2, 5, running.clone());
+    let mut ofdm_processor =
+        OfdmProcessor::new(1, OFDM_ACQ_THRESHOLD, OFDM_TRACK_THRESHOLD, running.clone());
     ofdm_processor.set_sync_signal(move |synced| {
         ts.store(synced, Ordering::SeqCst);
     });
@@ -241,6 +304,7 @@ pub fn run(args: Iq2pcmArgs) {
     ofdm_processor.set_show_freq_offset(move |offset_hz| {
         fo.store(offset_hz, Ordering::Relaxed);
     });
+    ofdm_processor.set_fic_quality_percent_source(current_fic_quality_percent.clone());
 
     if !input_device.restart_reader() {
         error!("Failed to start RTL-SDR reader");
@@ -269,7 +333,7 @@ pub fn run(args: Iq2pcmArgs) {
         time_sync_time -= 1;
     }
     if !time_synced.load(Ordering::SeqCst) {
-        warn!("There does not seem to be a DAB signal here");
+        warn!(channel = %channel, "no usable DAB signal detected");
         // 1. Disconnect the frame channel so DabPipeline::run_loop unblocks.
         drop(frame_rx);
         // 2. Signal the OFDM processor to stop reading samples.
@@ -281,12 +345,15 @@ pub fn run(args: Iq2pcmArgs) {
         let _ = ofdm_thread.join();
         std::process::exit(1);
     }
-    info!("there might be a DAB signal here");
+    info!("OFDM synchronized; waiting for ensemble detection");
 
     // ── Wait for ensemble detection ───────────────────────────────────────────
     let mut freq_sync_time = args.detect_time;
     while freq_sync_time > 0 {
-        debug!("still at most {} seconds to wait", freq_sync_time);
+        debug!(
+            remaining_s = freq_sync_time,
+            "waiting for ensemble detection"
+        );
         thread::sleep(std::time::Duration::from_secs(1));
         freq_sync_time -= 1;
         if ensemble_recognized.load(Ordering::SeqCst) {
@@ -294,7 +361,7 @@ pub fn run(args: Iq2pcmArgs) {
         }
     }
 
-    info!("Starting audio processing...");
+    info!("audio pipeline started");
     pipeline_processing_flag.store(true, Ordering::SeqCst);
     run.store(true, Ordering::SeqCst);
 
@@ -308,12 +375,6 @@ pub fn run(args: Iq2pcmArgs) {
     let mut pad_output = PadOutput::new(slide_dir, args.slide_base64);
     let mut superframe = SuperframeFilter::new();
     let mut aac_decoder: Option<dabctl::audio::aac_decoder::AacDecoder> = None;
-    // Silence fill: once we have decoded at least one AU, store a zero-filled
-    // frame of the same size so we can substitute silence during radio fades
-    // instead of emitting nothing (which causes buffer underruns downstream).
-    // Rate-limited to one superframe period (~120 ms) so we never emit faster
-    // than real-time even when sync_fail fires on every CIF frame.
-    let mut au_silence: Option<Vec<i16>> = None;
     let mut au_count: usize = 0;
     // Tracks the deadline for the next silence superframe.
     // Initialised lazily on the first real AU output.
@@ -352,6 +413,10 @@ pub fn run(args: Iq2pcmArgs) {
     let service_events = Arc::new(AtomicI32::new(0));
     let dls_events = Arc::new(AtomicI32::new(0));
     let slide_events = Arc::new(AtomicI32::new(0));
+    // RS and AU CRC quality counters.
+    let rs_corrected = Arc::new(AtomicI32::new(0));
+    let rs_uncorrectable = Arc::new(AtomicI32::new(0));
+    let au_crc_fail = Arc::new(AtomicI32::new(0));
 
     // Monitor thread to log status and respect record_time
     let status_run = run.clone();
@@ -368,6 +433,9 @@ pub fn run(args: Iq2pcmArgs) {
     let c_srv = service_events.clone();
     let c_dls = dls_events.clone();
     let c_sld = slide_events.clone();
+    let c_rsc = rs_corrected.clone();
+    let c_rsu = rs_uncorrectable.clone();
+    let c_aucrc = au_crc_fail.clone();
     thread::spawn(move || {
         // Counts consecutive 1-second intervals where reception is degraded
         // (sfail > sok: majority of OFDM frames failed that second).
@@ -388,6 +456,9 @@ pub fn run(args: Iq2pcmArgs) {
             let srv = c_srv.swap(0, Ordering::SeqCst);
             let dls = c_dls.swap(0, Ordering::SeqCst);
             let sld = c_sld.swap(0, Ordering::SeqCst);
+            let rsc = c_rsc.swap(0, Ordering::SeqCst);
+            let rsu = c_rsu.swap(0, Ordering::SeqCst);
+            let aucrc = c_aucrc.swap(0, Ordering::SeqCst);
             let fib_ok = fs2_ok.swap(0, Ordering::SeqCst);
             let fib_tot = fs2_total.swap(0, Ordering::SeqCst);
             let fib_quality = if fib_tot > 0 {
@@ -427,6 +498,9 @@ pub fn run(args: Iq2pcmArgs) {
                 sync_fail = sfail,
                 aus = au,
                 silence_aus = sil,
+                rs_corrected = rsc,
+                rs_uncorrectable = rsu,
+                au_crc_fail = aucrc,
                 service_events = srv,
                 dls_events = dls,
                 slide_events = sld,
@@ -498,7 +572,7 @@ pub fn run(args: Iq2pcmArgs) {
             if let Some(ref ens) = fic_decoder.ensemble {
                 if !ens.label.is_empty() {
                     pad_output.write_ensemble(&ens.label, &ens.short_label, ens.eid);
-                    info!("Ensemble: {} (0x{:04X})", ens.label.trim(), ens.eid);
+                    info!("ensemble ready: {} (0x{:04X})", ens.label.trim(), ens.eid);
                     ensemble_announced = true;
                 }
             }
@@ -517,7 +591,7 @@ pub fn run(args: Iq2pcmArgs) {
                     continue;
                 }
                 current_subchid = Some(audio.subchid);
-                info!("Playing sub-channel {} (DAB+)", audio.subchid);
+                info!("selected DAB+ sub-channel {}", audio.subchid);
             }
         }
 
@@ -527,7 +601,7 @@ pub fn run(args: Iq2pcmArgs) {
                 if !svc.label.is_empty() {
                     pad_output.write_service(&svc.label, &svc.short_label, svc.sid);
                     service_events.fetch_add(1, Ordering::Relaxed);
-                    info!("Service: {} (0x{:04X})", svc.label.trim(), svc.sid);
+                    info!("service ready: {} (0x{:04X})", svc.label.trim(), svc.sid);
                     service_announced = true;
                 }
             }
@@ -567,12 +641,21 @@ pub fn run(args: Iq2pcmArgs) {
             if result.sync_fail {
                 sync_fail.fetch_add(1, Ordering::Relaxed);
             }
+            if result.rs_corrected > 0 {
+                rs_corrected.fetch_add(result.rs_corrected as i32, Ordering::Relaxed);
+            }
+            if result.rs_uncorrectable {
+                rs_uncorrectable.fetch_add(1, Ordering::Relaxed);
+            }
+            if result.au_crc_fail > 0 {
+                au_crc_fail.fetch_add(result.au_crc_fail as i32, Ordering::Relaxed);
+            }
 
             if let Some(ref fmt) = result.format {
                 au_count = fmt.number_of_access_units();
                 let asc = fmt.build_asc();
                 info!(
-                    "Format: {} {}kHz {}ch",
+                    "audio format detected: {} {} kHz {} ch",
                     fmt.codec_name(),
                     fmt.sample_rate() / 1000,
                     fmt.channels()
@@ -600,7 +683,7 @@ pub fn run(args: Iq2pcmArgs) {
                             // parsed from the DAB+ superframe header instead, which are
                             // already available and authoritative at this point.
                             info!(
-                                "AAC decoder ready: {}Hz {}ch",
+                                "aac decoder ready: {} Hz {} ch",
                                 fmt.sample_rate(),
                                 fmt.channels()
                             );
@@ -629,10 +712,6 @@ pub fn run(args: Iq2pcmArgs) {
                     if let Some(pcm) = dec.decode_frame(&au.data) {
                         decoded_this_frame += 1;
                         aus_decoded.fetch_add(1, Ordering::Relaxed);
-                        // Capture the silence frame shape from the first successful decode.
-                        if au_silence.is_none() {
-                            au_silence = Some(vec![0i16; pcm.len()]);
-                        }
                         pcm_out.push(pcm);
                         silence_next = silence_deadline_after_good_au(std::time::Instant::now());
                     }
@@ -645,22 +724,18 @@ pub fn run(args: Iq2pcmArgs) {
                 // with SBR. Injecting silence immediately preserves the total PCM
                 // duration and keeps ffmpeg speed ≥ 1.0×.
                 //
-                // The silence frames are pushed AFTER the good AUs from this
-                // superframe: the exact positions of failed AUs within the superframe
-                // are not recoverable once the CRC-failed AUs have been discarded by
-                // the superframe decoder.
+                // Silence frames are produced by the AAC decoder via decode_or_silence
+                // so the frame size is always correct without inline Vec allocation.
                 //
                 // Note: no rate-limiting is needed here. The number of silence frames
                 // is bounded by au_count per superframe (~3 every 120 ms = real-time).
                 // ETSI TS 102 563 §5.1 — one DAB+ superframe = 5 CIF × ~24 ms.
                 if result.sync_ok && !args.no_silence_fill {
                     let missing = au_count.saturating_sub(decoded_this_frame);
-                    if missing > 0 {
-                        if let Some(ref silence) = au_silence {
-                            for _ in 0..missing {
-                                if pcm_out.push(silence.clone()) {
-                                    silence_aus.fetch_add(1, Ordering::Relaxed);
-                                }
+                    for _ in 0..missing {
+                        if let Some(sil) = dec.decode_or_silence(None) {
+                            if pcm_out.push(sil) {
+                                silence_aus.fetch_add(1, Ordering::Relaxed);
                             }
                         }
                     }
@@ -671,14 +746,15 @@ pub fn run(args: Iq2pcmArgs) {
                 // boundary to anchor fill rate. Rate-limit to one superframe period
                 // (120 ms) to match real-time, deferred via SilenceBuffer so a
                 // brief sync_ok recovery does not interleave silence with real audio.
+                // Silence frames are produced by the AAC decoder via decode_or_silence.
                 // ETSI TS 102 563 §5.1.
                 if result.sync_fail && !args.no_silence_fill {
                     let now = std::time::Instant::now();
                     if now >= silence_next {
-                        if let Some(ref silence) = au_silence {
-                            let n = au_count.max(1);
-                            for _ in 0..n {
-                                silence_buffer.push(silence.clone());
+                        let n = au_count.max(1);
+                        for _ in 0..n {
+                            if let Some(sil) = dec.decode_or_silence(None) {
+                                silence_buffer.push(sil);
                             }
                         }
                         silence_next = advance_silence_deadline(silence_next, now);
@@ -701,7 +777,7 @@ pub fn run(args: Iq2pcmArgs) {
                     pad_output.write_dl(&label.text);
                     dls_events.fetch_add(1, Ordering::Relaxed);
                     if !args.disable_dyn_fic {
-                        debug!("DLS: {}", label.text);
+                        debug!("dynamic label: {}", label.text);
                     }
                 }
                 if let Some(ref slide) = pad_result.slide {
@@ -709,7 +785,7 @@ pub fn run(args: Iq2pcmArgs) {
                     slide_events.fetch_add(1, Ordering::Relaxed);
                     if !args.disable_dyn_fic {
                         debug!(
-                            "Slide: {} ({}, {} bytes)",
+                            "slideshow image: {} ({}, {} bytes)",
                             slide.content_name,
                             slide.mime_type(),
                             slide.data.len()
@@ -723,7 +799,7 @@ pub fn run(args: Iq2pcmArgs) {
     running.store(false, Ordering::SeqCst);
     // Unblock the USB worker so RtlsdrHandler::drop does not stall on read_sync.
     rtlsdr_running.store(false, Ordering::SeqCst);
-    info!("terminating");
+    info!("pipeline stopped");
 
     let result = ofdm_thread.join();
     if let Ok((mut dev, _pl)) = result {
@@ -741,7 +817,7 @@ pub fn parse_sid(s: &str) -> u16 {
         .or_else(|| s.strip_prefix("0X"))
         .unwrap_or(s);
     u16::from_str_radix(hex_str, 16).unwrap_or_else(|_| {
-        error!("Invalid SID: {}", s);
+        error!("invalid SID: {}", s);
         std::process::exit(1);
     })
 }
@@ -897,6 +973,29 @@ mod tests {
         assert!(
             result.is_err(),
             "clap must reject -G and --hardware-agc together"
+        );
+    }
+
+    #[test]
+    fn driver_and_software_agc_are_mutually_exclusive() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Wrapper {
+            #[command(flatten)]
+            inner: Iq2pcmArgs,
+        }
+        let result = Wrapper::try_parse_from([
+            "test",
+            "-C",
+            "6C",
+            "-s",
+            "0xF2F8",
+            "--driver-agc",
+            "--software-agc",
+        ]);
+        assert!(
+            result.is_err(),
+            "clap must reject --driver-agc and --software-agc together"
         );
     }
 

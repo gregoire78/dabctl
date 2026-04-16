@@ -272,7 +272,8 @@ impl DabPipeline {
         my_fic_handler.fib_processor.ensemble_name_cb = ensemble_cb;
         my_fic_handler.fib_processor.program_name_cb = program_cb;
 
-        // Scratch buffer for raw FIB bits (4 FIBs × 768 soft-bits each).
+        // Scratch buffer for four decoded FIC payloads:
+        // 4 × 768 hard bits = one 96-byte FIC image per CIF slot.
         let mut fibs_bytes = vec![0u8; 4 * 768];
 
         while let Ok((blkno, bdata)) = rx.recv() {
@@ -307,20 +308,18 @@ impl DabPipeline {
                 fib_input[offset..offset + copy_len].copy_from_slice(&bdata[..copy_len]);
 
                 if blkno == 4 {
+                    // `process_fic_block` iterates over the three FIC OFDM blocks and
+                    // may complete one decoded FIC payload; keep a 4-slot validity buffer
+                    // like the original code path to avoid any out-of-bounds access.
                     let mut valid = [false; 4];
                     fibs_bytes.fill(0);
                     my_fic_handler.process_fic_block(&fib_input, &mut fibs_bytes, &mut valid);
 
-                    // Pack FIB soft-bits into packed bytes and store in the
-                    // circular history buffer — one slot per FIB.
-                    for i in 0..4 {
-                        let slot = &mut fib_vector[(index_out + i) & 0x0F];
-                        for (j, s) in slot.iter_mut().enumerate().take(96) {
-                            let base = i * 768 + 8 * j;
-                            *s = fibs_bytes[base..base + 8]
-                                .iter()
-                                .fold(0u8, |acc, &b| (acc << 1) | (b & 1));
-                        }
+                    // The three FIC OFDM blocks decode into four consecutive
+                    // 96-byte FIC payloads, one for each CIF slot in the frame.
+                    let fic_slots = replicate_fic_across_cifs(&fibs_bytes);
+                    for (i, slot_data) in fic_slots.into_iter().enumerate() {
+                        fib_vector[(index_out + i) & 0x0F] = slot_data;
                     }
                     minor = 0;
                     let (hi, lo) = my_fic_handler.get_cif_count();
@@ -521,6 +520,20 @@ fn pack_bits(bits: &[u8], out: &mut [u8]) {
     }
 }
 
+/// Pack the four decoded 768-bit FIC chunks into the four 96-byte CIF slots of
+/// the current DAB frame.
+fn replicate_fic_across_cifs(bits: &[u8]) -> [[u8; 96]; 4] {
+    let mut slots = [[0u8; 96]; 4];
+    for (slot_idx, slot) in slots.iter_mut().enumerate() {
+        let start = slot_idx * 768;
+        let end = ((slot_idx + 1) * 768).min(bits.len());
+        if end > start {
+            pack_bits(&bits[start..end], slot);
+        }
+    }
+    slots
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -614,6 +627,26 @@ mod tests {
         let bits: Vec<u8> = vec![];
         let mut out = [0u8; 0];
         pack_bits(&bits, &mut out); // must not panic
+    }
+
+    #[test]
+    fn decoded_fic_four_chunks_are_preserved_per_cif_slot() {
+        let mut bits = vec![0u8; 768 * 4];
+        for (i, bit) in bits[0..768].iter_mut().enumerate() {
+            *bit = (i % 2) as u8;
+        }
+        for (i, bit) in bits[768..1536].iter_mut().enumerate() {
+            *bit = ((i / 2) % 2) as u8;
+        }
+        for bit in &mut bits[1536..2304] {
+            *bit = 1;
+        }
+        // last quarter intentionally stays at 0
+
+        let slots = replicate_fic_across_cifs(&bits);
+        assert_ne!(slots[0], slots[1]);
+        assert_ne!(slots[1], slots[2]);
+        assert_ne!(slots[2], slots[3]);
     }
 
     // ── OfdmFrameSync ────────────────────────────────────────────────────────

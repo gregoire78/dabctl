@@ -4,10 +4,9 @@
 
 **RTL-SDR → PCM audio pipeline for DAB+ radio, written in Rust**
 
-Adapted from [eti-cmdline](https://github.com/JvanKatwijk/eti-stuff/tree/master/eti-cmdline),
-[dablin](https://github.com/Opendigitalradio/dablin),
-and [AbracaDABra](https://github.com/KejPi/AbracaDABra) —
-unified into a single **direct** RTL-SDR → PCM pipeline.
+Current OFDM synchronization and reacquisition behavior is aligned with
+[DABstar](https://github.com/tomneda/DABstar), with a direct
+**RTL-SDR → PCM** runtime pipeline and metadata output.
 
 [![Rust](https://img.shields.io/badge/Rust-2021-orange)](https://www.rust-lang.org/)
 [![License: GPL-2.0](https://img.shields.io/badge/License-GPL%202.0-blue.svg)](LICENSE)
@@ -20,12 +19,15 @@ unified into a single **direct** RTL-SDR → PCM pipeline.
 
 ```bash
 # 1. Install dependencies (Debian/Ubuntu)
-sudo apt install -y libusb-1.0-0-dev pkg-config build-essential libfaad-dev
+sudo apt install -y cmake git libusb-1.0-0-dev pkg-config build-essential libfaad-dev
 
-# 2. Build
+# 2. Fetch the vendored RTL-SDR submodule
+git submodule update --init vendor/old-dab-rtlsdr
+
+# 3. Build (old-dab/rtlsdr backend compiled automatically)
 cargo build --release
 
-# 3. Listen — channel 6C, service NRJ (SID 0xF2F8)
+# 4. Listen — channel 6C, service NRJ (SID 0xF2F8)
 sudo ./target/release/dabctl -C 6C -s 0xF2F8 \
   | ffplay -f s16le -ar 48000 -ac 2 -nodisp -i -
 ```
@@ -41,9 +43,10 @@ Only **DAB+** services (HE-AAC) are decoded; classic DAB (MP2) is not supported.
 
 | Package | Role |
 |---|---|
+| `cmake`, `git` | Build the vendored old-dab/rtlsdr library |
 | `libusb-1.0-0-dev` | USB backend for RTL-SDR |
 | `pkg-config` | Library discovery |
-| `build-essential` | C compiler (required by libfaad2 / libfdk-aac) |
+| `build-essential` | C compiler (required by libfaad2 / libfdk-aac and CMake builds) |
 | `libfaad-dev` | AAC decoder for DAB+ (default backend) |
 | `libfdk-aac-dev` | Alternative AAC decoder — Fraunhofer FDK (optional, `fdk-aac` feature) |
 
@@ -51,12 +54,15 @@ Only **DAB+** services (HE-AAC) are decoded; classic DAB (MP2) is not supported.
 > Use the default **faad2** backend unless FDK-AAC quality is specifically required.
 
 ```bash
-# faad2 backend (default)
-sudo apt install -y libusb-1.0-0-dev pkg-config build-essential libfaad-dev
+# Common deps (all RTL-SDR backends)
+sudo apt install -y cmake git libusb-1.0-0-dev pkg-config build-essential libfaad-dev
 
 # fdk-aac backend — enable non-free first on Debian Trixie
 sudo sed -i 's/Components: main$/Components: main non-free/' /etc/apt/sources.list.d/debian.sources
-sudo apt update && sudo apt install -y libusb-1.0-0-dev pkg-config build-essential libfdk-aac-dev
+sudo apt update && sudo apt install -y libfdk-aac-dev
+
+# osmocom system librtlsdr-dev (only needed for the rtl-sdr-osmocom feature)
+sudo apt install -y librtlsdr-dev
 ```
 
 ### Hardware
@@ -74,17 +80,46 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 ## Building
 
-The RTL-SDR driver is handled entirely by the
-[`rtl-sdr-rs`](https://github.com/ccostes/rtl-sdr-rs) crate (pure Rust, no CMake or
-`libclang` required). Only `libusb-1.0` must be present.
+### RTL-SDR backend
+
+Three RTL-SDR driver backends are available, selected at compile time via Cargo features.
+Exactly one backend must be active.
+
+| Feature | Type | How to build |
+|---|---|---|
+| `rtl-sdr-old-dab` *(default)* | Vendored C — [old-dab/rtlsdr](https://github.com/old-dab/rtlsdr) built from source via CMake, linked statically. No install step; just run `git submodule update --init vendor/old-dab-rtlsdr` first. | `cargo build --release` |
+| `rtl-sdr-osmocom` | System C — links against the installed `librtlsdr-dev` (osmocom fork). Requires `sudo apt install librtlsdr-dev`. | `cargo build --release --no-default-features --features rtl-sdr-osmocom` |
+| `rtl-sdr-rs` | Pure Rust — [`rtl-sdr-rs`](https://github.com/ccostes/rtl-sdr-rs) crate via `rusb`. No `libclang` or CMake required. | `cargo build --release --no-default-features --features rtl-sdr-rs` |
+
+> The old-dab and osmocom forks expose the same C API (`rtlsdr_open`, `rtlsdr_read_sync`, …)
+> and share the same Rust FFI handler. The `rtl-sdr-rs` backend uses a different handler
+> built on the `rtl-sdr-rs` crate.
+
+### AAC decoder backend
 
 ```bash
-cargo build --release                        # faad2 backend (default)
-cargo build --release --features fdk-aac    # Fraunhofer FDK-AAC backend
+cargo build --release                        # faad2 (default)
+cargo build --release --features fdk-aac    # Fraunhofer FDK-AAC
 ```
 
 With `--features fdk-aac`, both libraries are linked and the backend is selected at
 runtime via `--aac-decoder`.
+
+### Combined examples
+
+```bash
+# Default: old-dab/rtlsdr + faad2
+cargo build --release
+
+# old-dab/rtlsdr + fdk-aac
+cargo build --release --features fdk-aac
+
+# osmocom system librtlsdr + faad2
+cargo build --release --no-default-features --features rtl-sdr-osmocom
+
+# Pure-Rust rtl-sdr-rs + faad2
+cargo build --release --no-default-features --features rtl-sdr-rs
+```
 
 ### Dev Container
 
@@ -107,8 +142,10 @@ dabctl -C <channel> -s <sid> [options]
 |---|---|---|---|
 | `--channel` | `-C` | DAB channel (e.g. `5A`, `6C`, `11C`) | **required** |
 | `--sid` | `-s` | Service ID in hex (e.g. `0xF2F8`) | **required** |
-| `--gain` | `-G` | Tuner gain in % (0–100), mutually exclusive with `--hardware-agc` | software AGC |
-| `--hardware-agc` | | Use the RTL-SDR chip's built-in hardware AGC, mutually exclusive with `-G` | off |
+| `--gain` | `-G` | Manual tuner gain in % (0–100), mutually exclusive with all AGC modes | — |
+| `--hardware-agc` | | Use the RTL-SDR chip's built-in hardware AGC | off |
+| `--driver-agc` | | Use the old-dab driver AGC when the selected backend supports it | off |
+| `--software-agc` | | Force the application software SAGC loop explicitly | off |
 | `--ppm` | `-p` | Frequency correction in PPM | `0` |
 | `--sync-time` | `-d` | Sync timeout in seconds | `5` |
 | `--detect-time` | `-D` | Ensemble detection timeout in seconds | `10` |
@@ -118,8 +155,11 @@ dabctl -C <channel> -s <sid> [options]
 | `--slide-base64` | | Include slideshow images as base64 in JSON output | off |
 | `--no-silence-fill` | | Emit nothing instead of silence during radio fades | off |
 | `--silent` | | No log output on stderr | off |
+| `--trace-ofdm` | | Emit dedicated OFDM sync, correlation and AFC trace logs | off |
 | `--device-index` | | RTL-SDR dongle index | `0` |
-| `--aac-decoder` | | AAC backend: `faad2` or `fdk-aac` (requires `fdk-aac` feature). When the feature is enabled, defaults to `fdk-aac`. | `faad2` |
+| `--offset-tuning` | | Tune the hardware above the DAB channel and digitally rotate back to move LO spur energy away from low subcarriers | off |
+| `--no-iq-correction` | | Disable the default IQ imbalance correction loop | off |
+| `--aac-decoder` | | AAC backend: `faad2` or `fdk-aac` (requires the `fdk-aac` feature) | `faad2` |
 
 Band III channels span **5A–13F** (174.928–239.200 MHz).
 L-Band channels (LA–LP, 1452–1478 MHz) are also supported.
@@ -142,8 +182,16 @@ Redirect with: `3>metadata.json`
 ## Examples
 
 ```bash
-# Software AGC (default)
+# Software AGC (default runtime behavior)
 sudo ./target/release/dabctl -C 6C -s 0xF2F8 \
+  | ffplay -f s16le -ar 48000 -ac 2 -nodisp -i -
+
+# Force application software SAGC explicitly
+sudo ./target/release/dabctl -C 6C -s 0xF2F8 --software-agc \
+  | ffplay -f s16le -ar 48000 -ac 2 -nodisp -i -
+
+# Driver AGC on supported old-dab / osmocom style backends
+sudo ./target/release/dabctl -C 6C -s 0xF2F8 --driver-agc \
   | ffplay -f s16le -ar 48000 -ac 2 -nodisp -i -
 
 # Manual gain + frequency correction
@@ -171,16 +219,31 @@ sudo ./target/release/dabctl -C 6C -s 0xF2F8 -G 20 \
 
 ## Architecture
 
+### Synchronization reference
+
+The active synchronization path is intentionally modeled on DABstar and the ETSI DAB specification:
+
+- null-symbol timing detection via a sliding short-term level window
+- phase-reference correlation for symbol-0 alignment
+- sync-symbol coarse frequency correction gated by FIC quality
+- cyclic-prefix fine frequency tracking and per-carrier phase correction
+
+Normative reference: ETSI EN 300 401, especially sections 8.4 and 14.5 to 14.8.
+
 ### Source tree
 
 ```
-build.rs                        Linker directives for faad2 / fdk-aac
+build.rs                        RTL-SDR backend selection (cmake / bindgen / link) + faad2 / fdk-aac
+vendor/
+  old-dab-rtlsdr/               Vendored old-dab/rtlsdr C library (git submodule)
 src/
   main.rs                       CLI entry point (clap) → pipeline
   lib.rs                        Module declarations
   iq2pcm_cmd.rs                 Main pipeline: RTL-SDR → PCM
   device/
-    rtlsdr_handler.rs           RTL-SDR via rtl-sdr-rs
+    mod.rs                      Backend selection via #[cfg(feature)]
+    rtlsdr_handler_osmocom.rs   FFI handler shared by old-dab and osmocom backends
+    rtlsdr_handler_rs.rs        Handler for the pure-Rust rtl-sdr-rs backend
   pipeline/
     dab_constants.rs            Constants, CRC helpers, bit utilities
     dab_frame.rs                DabFrame — in-process FIC + subchannel transport
@@ -194,12 +257,12 @@ src/
     viterbi_handler.rs          Viterbi decoder {0155,0117,0123,0155}
     prot_tables.rs              24 puncturing tables (ETSI EN 300 401 §11)
     protection.rs               EEP + UEP deconvolution
-    cif_interleaver.rs          CIF 16-frame time interleaving
     ofdm/
       phase_table.rs            Mode I phase reference table
-      phase_reference.rs        Sync correlation + coarse frequency offset
+      time_syncer.rs            DABstar-style null-symbol timing detector
+      phase_reference.rs        DABstar-style sync correlation + coarse offset
       freq_interleaver.rs       Carrier frequency interleaving
-      ofdm_processor.rs         Main OFDM demodulation loop
+      ofdm_processor.rs         DABstar-style OFDM synchronization and demodulation loop
   audio/
     fic_decoder.rs              FIC/FIG service discovery (FIG 0/0, 0/1, 0/2, 1/0, 1/1)
     superframe.rs               DAB+ superframe: 5 CIFs → Reed-Solomon FEC → AUs
@@ -226,7 +289,7 @@ flowchart TD
     HW(["RTL-SDR dongle\n2.048 Msps IQ (USB)"])
 
     subgraph T1["Thread 1 — USB Worker (RtlsdrHandler)"]
-        USB["USB bulk read\nrtl-sdr-rs"]
+        USB["USB bulk read\nold-dab / osmocom / rtl-sdr-rs"]
         DOC["DC offset correction\nf32 normalisation"]
         SAGC["Software AGC\nfast-attack / slow-release IIR"]
         USB --> DOC --> SAGC
@@ -490,8 +553,9 @@ man dabctl
 | [eti-cmdline](https://github.com/JvanKatwijk/eti-stuff/tree/master/eti-cmdline) | Reference C++ IQ → ETI implementation — base for the signal processing chain |
 | [dablin](https://github.com/Opendigitalradio/dablin) | Reference C++ ETI → audio decoder — base for the audio pipeline |
 | [AbracaDABra](https://github.com/KejPi/AbracaDABra) | Software AGC and AAC backend selection strategy (MIT licence) |
+| [old-dab/rtlsdr](https://github.com/old-dab/rtlsdr) | Enhanced RTL-SDR C library — default vendored backend (GPL-2.0) |
 | [rtl-sdr-rs](https://github.com/ccostes/rtl-sdr-rs) | Pure-Rust RTL-SDR driver (via `rusb`) |
-| [osmocom/rtl-sdr](https://github.com/osmocom/rtl-sdr) | Original RTL-SDR C library |
+| [osmocom/rtl-sdr](https://github.com/osmocom/rtl-sdr) | Original RTL-SDR C library — available as `rtl-sdr-osmocom` feature |
 
 ### ETSI standards
 
@@ -520,6 +584,7 @@ See the [LICENSE](LICENSE) file for the full licence text.
 | [eti-cmdline](https://github.com/JvanKatwijk/eti-stuff/tree/master/eti-cmdline) | GPL-2.0 |
 | [dablin](https://github.com/Opendigitalradio/dablin) | GPL-2.0 |
 | [AbracaDABra](https://github.com/KejPi/AbracaDABra) (software AGC) | MIT |
+| [old-dab/rtlsdr](https://github.com/old-dab/rtlsdr) (default backend, vendored) | GPL-2.0 |
 | [rtl-sdr-rs](https://github.com/ccostes/rtl-sdr-rs) | MIT |
 | [osmocom/rtl-sdr](https://github.com/osmocom/rtl-sdr) | GPL-2.0 |
 | libfaad2 | GPL-2.0 |

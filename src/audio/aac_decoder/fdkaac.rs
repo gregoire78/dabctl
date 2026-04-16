@@ -259,6 +259,23 @@ impl AacDecoder {
             channels: self.channels,
         }
     }
+
+    /// Decode one Access Unit, or produce a zero-filled silence frame when no
+    /// AU data is available (`au_data = None`) or when decoding fails fatally.
+    ///
+    /// Returns `None` only when the frame size is not yet known (no successful
+    /// decode has occurred yet), so no silence frame can be sized correctly.
+    pub fn decode_or_silence(&mut self, au_data: Option<&[u8]>) -> Option<Vec<i16>> {
+        if let Some(data) = au_data {
+            if let Some(pcm) = self.decode_frame(data) {
+                return Some(pcm);
+            }
+        }
+        if self.last_frame_samples == 0 {
+            return None;
+        }
+        Some(vec![0i16; self.last_frame_samples])
+    }
 }
 
 impl Drop for AacDecoder {
