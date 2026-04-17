@@ -1,4 +1,4 @@
-// Viterbi decoder — converted from viterbi-spiral.cpp (eti-cmdline)
+// DABstar-aligned Viterbi spiral decoder.
 //
 // Rate 1/4, constraint length K=7 convolutional decoder used for both FIC and MSC.
 // Polynomials: {0155, 0117, 0123, 0155} (octal).
@@ -8,7 +8,10 @@ const K: usize = 7;
 const RATE: usize = 4;
 const NUM_STATES: usize = 1 << (K - 1); // 64
 const POLYS: [i32; RATE] = [0o155, 0o117, 0o123, 0o155];
-const RENORMALIZE_THRESHOLD: u32 = 137;
+/// DABstar seeds all non-zero paths with a large initial metric and only
+/// renormalises when survivors have drifted far enough upward.
+const INITIAL_PATH_METRIC: u32 = 1_000;
+const RENORMALIZE_THRESHOLD: u32 = 30_000;
 /// Bias applied when mapping signed soft bits (−127..127) to unsigned symbols (0..254).
 const SOFT_DECISION_BIAS: i32 = 127;
 /// Neutral soft symbol used when input is truncated (0-confidence midpoint).
@@ -51,6 +54,38 @@ fn decision_words_per_step() -> usize {
 }
 
 #[inline]
+fn branch_table_index(rate_idx: usize, state: usize) -> usize {
+    rate_idx * (NUM_STATES / 2) + state
+}
+
+#[inline]
+fn compute_branch_metric(branchtab: &[u8], symbols: &[u8], sym_base: usize, state: usize) -> u32 {
+    let mut metric = 0u32;
+    for rate_idx in 0..RATE {
+        metric +=
+            (branchtab[branch_table_index(rate_idx, state)] ^ symbols[sym_base + rate_idx]) as u32;
+    }
+    metric
+}
+
+#[inline]
+fn store_survivor_pair(decisions: &mut [u32], dec_offset: usize, state: usize, d0: u32, d1: u32) {
+    let word_idx = state / 16;
+    let bit_pos = (2 * state) % 32;
+    decisions[dec_offset + word_idx] |= (d0 | (d1 << 1)) << bit_pos;
+}
+
+#[inline]
+fn traceback_decision_bit(decisions: &[u32], dec_offset: usize, endstate: u32) -> u32 {
+    let bit_idx = (endstate >> ADD_SHIFT) as usize;
+    let word_idx = bit_idx / 32;
+    let bit_pos = bit_idx % 32;
+    decisions
+        .get(dec_offset + word_idx)
+        .map_or(0, |word| (word >> bit_pos) & 1)
+}
+
+#[inline]
 fn should_renormalize(min_metric: u32) -> bool {
     min_metric > RENORMALIZE_THRESHOLD
 }
@@ -70,11 +105,12 @@ pub struct ViterbiSpiral {
 impl ViterbiSpiral {
     pub fn new(word_length: usize) -> Self {
         let mut branchtab = vec![0u8; RATE * NUM_STATES / 2];
-        // Layout: [state * RATE + rate_idx] — sequential per-state access for better cache usage.
+        // DABstar/Karn spiral layout: the branch table is grouped by coder rate,
+        // so the scalar butterfly reads Branchtab[i], Branchtab[32+i], ...
         for state in 0..NUM_STATES / 2 {
-            for i in 0..RATE {
-                branchtab[state * RATE + i] = if (POLYS[i] < 0) as u8
-                    ^ parity((2 * state as i32) & POLYS[i].abs()) as u8
+            for rate_idx in 0..RATE {
+                branchtab[branch_table_index(rate_idx, state)] = if (POLYS[rate_idx] < 0) as u8
+                    ^ parity((2 * state as i32) & POLYS[rate_idx].abs()) as u8
                     != 0
                 {
                     255
@@ -99,7 +135,7 @@ impl ViterbiSpiral {
     }
 
     fn init_viterbi(&mut self) {
-        self.metrics1.fill(63);
+        self.metrics1.fill(INITIAL_PATH_METRIC);
         self.metrics1[0] = 0;
         // Also reset metrics2: on the first trellis step it is the write buffer,
         // but all 64 entries are overwritten before being read, so this is defensive.
@@ -128,7 +164,7 @@ impl ViterbiSpiral {
         // update_viterbi safe even if called without a preceding init_viterbi.
         self.decisions.fill(0);
 
-        let max = RATE as u32 * 255;
+        let max_branch_metric = RATE as u32 * 255;
         let mut use_metrics1_as_old = true;
         for s in 0..nbits {
             let sym_base = s * RATE;
@@ -153,15 +189,14 @@ impl ViterbiSpiral {
             // Batch butterfly: process all NUM_STATES/2 states
             // Written as a tight loop for auto-vectorization
             for i in 0..NUM_STATES / 2 {
-                // Compute branch metric — sequential access: branchtab[i*RATE .. i*RATE+RATE]
-                let mut metric: u32 = 0;
-                for j in 0..RATE {
-                    metric += (branchtab[i * RATE + j] ^ symbols[sym_base + j]) as u32;
-                }
+                // DABstar scalar butterfly: metric = Branchtab[i] ^ sym0 +
+                // Branchtab[32+i] ^ sym1 + Branchtab[64+i] ^ sym2 + Branchtab[96+i] ^ sym3.
+                let metric = compute_branch_metric(branchtab, symbols, sym_base, i);
+                let complement_metric = max_branch_metric - metric;
 
                 let m0 = old[i].wrapping_add(metric);
-                let m1 = old[i + NUM_STATES / 2].wrapping_add(max - metric);
-                let m2 = old[i].wrapping_add(max - metric);
+                let m1 = old[i + NUM_STATES / 2].wrapping_add(complement_metric);
+                let m2 = old[i].wrapping_add(complement_metric);
                 let m3 = old[i + NUM_STATES / 2].wrapping_add(metric);
 
                 // Branchless select (helps auto-vectorization)
@@ -173,10 +208,9 @@ impl ViterbiSpiral {
                 new[2 * i] = m0 ^ ((m0 ^ m1) & (0u32.wrapping_sub(d0)));
                 new[2 * i + 1] = m2 ^ ((m2 ^ m3) & (0u32.wrapping_sub(d1)));
 
-                // Pack decisions
-                let word_idx = i / 16;
-                let bit_pos = (2 * i) % 32;
-                decisions[dec_offset + word_idx] |= (d0 | (d1 << 1)) << bit_pos;
+                // Pack decisions in the same two-word-per-step shape used by
+                // DABstar's `decision_t` storage.
+                store_survivor_pair(decisions, dec_offset, i, d0, d1);
             }
 
             // Renormalize
@@ -204,14 +238,7 @@ impl ViterbiSpiral {
             nbits_remaining -= 1;
             let s = d_offset + nbits_remaining as usize;
             let dec_offset = s * words_per_decision;
-            let bit_idx = (endstate >> ADD_SHIFT) as usize;
-            let word_idx = bit_idx / 32;
-            let bit_pos = bit_idx % 32;
-            let k = if dec_offset + word_idx < self.decisions.len() {
-                (self.decisions[dec_offset + word_idx] >> bit_pos) & 1
-            } else {
-                0
-            };
+            let k = traceback_decision_bit(&self.decisions, dec_offset, endstate);
             endstate = (endstate >> 1) | (k << (K as u32 - 2 + ADD_SHIFT as u32));
             self.data[nbits_remaining as usize >> 3] = (endstate >> SUB_SHIFT) as u8;
         }
@@ -338,6 +365,32 @@ mod tests {
     }
 
     #[test]
+    fn branch_table_index_is_rate_major_like_dabstar() {
+        assert_eq!(branch_table_index(0, 5), 5);
+        assert_eq!(branch_table_index(1, 5), 32 + 5);
+        assert_eq!(branch_table_index(2, 5), 64 + 5);
+        assert_eq!(branch_table_index(3, 5), 96 + 5);
+    }
+
+    #[test]
+    fn traceback_decision_bit_reads_packed_survivor_state() {
+        let mut decisions = vec![0u32; decision_words_per_step()];
+        store_survivor_pair(&mut decisions, 0, 17, 1, 0);
+
+        let endstate_for_even_branch = ((17usize * 2) as u32) << ADD_SHIFT;
+        let endstate_for_odd_branch = ((17usize * 2 + 1) as u32) << ADD_SHIFT;
+
+        assert_eq!(
+            traceback_decision_bit(&decisions, 0, endstate_for_even_branch),
+            1
+        );
+        assert_eq!(
+            traceback_decision_bit(&decisions, 0, endstate_for_odd_branch),
+            0
+        );
+    }
+
+    #[test]
     fn renormalize_guard_matches_threshold_rule() {
         assert!(!should_renormalize(RENORMALIZE_THRESHOLD));
         assert!(should_renormalize(RENORMALIZE_THRESHOLD + 1));
@@ -353,11 +406,15 @@ mod tests {
 
     #[test]
     fn renormalize_subtracts_min_when_above_threshold() {
-        let mut metrics = vec![RENORMALIZE_THRESHOLD + 2, RENORMALIZE_THRESHOLD + 12, 200];
+        let mut metrics = vec![
+            RENORMALIZE_THRESHOLD + 2,
+            RENORMALIZE_THRESHOLD + 12,
+            RENORMALIZE_THRESHOLD + 65,
+        ];
         ViterbiSpiral::renormalize(&mut metrics);
         assert_eq!(metrics[0], 0);
         assert_eq!(metrics[1], 10);
-        assert_eq!(metrics[2], 61);
+        assert_eq!(metrics[2], 63);
     }
 
     #[test]

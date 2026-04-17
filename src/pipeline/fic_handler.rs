@@ -9,6 +9,9 @@ use crate::pipeline::viterbi_handler::ViterbiSpiral;
 /// Size of the depunctured Viterbi input buffer for FIC decoding.
 /// = 24 puncture groups × 128 bits/group + 24 tail bits (ETSI EN 300 401 §11.1)
 const FIC_VITERBI_BUF_SIZE: usize = 3072 + 24;
+const FIC_BITS_OUT_SIZE: usize = 768;
+const FICS_PER_FRAME: usize = 4;
+const FIBS_PER_FIC: usize = 3;
 /// DABstar keeps a bounded 0..10 success ratio rather than trusting the last
 /// frame's raw 0/33/66/100 percent directly.
 const DABSTAR_FIC_RATIO_MAX: i16 = 10;
@@ -32,12 +35,17 @@ fn update_decode_ratio_steps(mut current_steps: i16, success: i16, total: i16) -
 pub struct FicHandler {
     bits_per_block: usize,
     ofdm_input: Vec<i16>,
+    ofdm_input_index: usize,
+    fic_decode_index: usize,
     puncture_table: Vec<bool>,
-    prbs: [u8; 768],
+    prbs: [u8; FIC_BITS_OUT_SIZE],
     viterbi: ViterbiSpiral,
     /// Pre-allocated depuncturing buffer reused across FIC blocks.
     viterbi_block: Vec<i16>,
     bit_buffer_out: Vec<u8>,
+    fib_bits_frame: Vec<u8>,
+    fic_valid: [bool; FICS_PER_FRAME],
+    is_running: bool,
     pub fib_processor: FibProcessor,
     fic_errors: i32,
     fic_success: i32,
@@ -95,11 +103,16 @@ impl FicHandler {
         FicHandler {
             bits_per_block,
             ofdm_input: vec![0i16; 2304],
+            ofdm_input_index: 0,
+            fic_decode_index: 0,
             puncture_table,
             prbs,
-            viterbi: ViterbiSpiral::new(768),
+            viterbi: ViterbiSpiral::new(FIC_BITS_OUT_SIZE),
             viterbi_block: vec![0i16; FIC_VITERBI_BUF_SIZE],
-            bit_buffer_out: vec![0u8; 768],
+            bit_buffer_out: vec![0u8; FIC_BITS_OUT_SIZE],
+            fib_bits_frame: vec![0u8; FIC_BITS_OUT_SIZE * FICS_PER_FRAME],
+            fic_valid: [false; FICS_PER_FRAME],
+            is_running: true,
             fib_processor: FibProcessor::new(),
             fic_errors: 0,
             fic_success: 0,
@@ -107,59 +120,86 @@ impl FicHandler {
         }
     }
 
-    /// Process the three FIC OFDM blocks (blocks 2, 3 and 4) for one DAB frame.
-    /// The output buffer holds one decoded FIC payload of 768 hard bits
-    /// (3 FIBs × 256 bits), which the caller may then reuse across the four CIFs.
-    pub fn process_fic_block(&mut self, data: &[i16], out: &mut [u8], valid: &mut [bool]) {
-        let mut index = 0usize;
-        let mut ficno = 0usize;
+    fn reset_frame_collection(&mut self) {
+        self.ofdm_input_index = 0;
+        self.fic_decode_index = 0;
+        self.fic_valid.fill(false);
+        self.fib_bits_frame.fill(0);
+    }
 
-        for i in 0..3 {
-            for j in 0..self.bits_per_block {
-                self.ofdm_input[index] = data[i * self.bits_per_block + j];
-                index += 1;
-                if index >= 2304 {
-                    self.process_fic_input(ficno, out, &mut valid[ficno]);
-                    index = 0;
-                    ficno += 1;
+    fn collect_block_soft_bits(&mut self, block: &[i16], out: &mut [u8], valid: &mut [bool]) {
+        for &soft_bit in block {
+            self.ofdm_input[self.ofdm_input_index] = soft_bit;
+            self.ofdm_input_index += 1;
+
+            if self.ofdm_input_index >= self.ofdm_input.len() {
+                let ficno = self.fic_decode_index;
+                let block_valid = self.process_fic_input(ficno, out);
+                if ficno < self.fic_valid.len() {
+                    self.fic_valid[ficno] = block_valid;
                 }
+                if ficno < valid.len() {
+                    valid[ficno] = block_valid;
+                }
+                self.ofdm_input_index = 0;
+                self.fic_decode_index += 1;
             }
         }
     }
 
-    fn process_fic_input(&mut self, ficno: usize, fib_bytes: &mut [u8], valid: &mut bool) {
-        // Depuncture into the pre-allocated buffer (avoids a 6 KB allocation per call).
+    fn depuncture_fic_bits(&mut self) {
         self.viterbi_block.fill(0);
-        let mut input_count = 0;
-        for (i, vb) in self
-            .viterbi_block
-            .iter_mut()
-            .enumerate()
-            .take(FIC_VITERBI_BUF_SIZE)
-        {
+        let mut input_count = 0usize;
+        for (i, vb) in self.viterbi_block.iter_mut().enumerate() {
             if self.puncture_table[i] {
                 *vb = self.ofdm_input[input_count];
                 input_count += 1;
             }
         }
+    }
 
-        // Viterbi decode
-        self.viterbi
-            .deconvolve(&self.viterbi_block, &mut self.bit_buffer_out);
-
-        // Energy dispersal (PRBS descramble)
-        for i in 0..768 {
+    fn descramble_fic_bits(&mut self) {
+        for i in 0..FIC_BITS_OUT_SIZE {
             self.bit_buffer_out[i] ^= self.prbs[i];
         }
+    }
 
-        // CRC check on each of the 3 FIBs in this ficno
-        *valid = true;
+    /// Process the three FIC OFDM blocks for one DAB frame in the same staged
+    /// collect → depuncture → Viterbi → descramble flow as DABstar.
+    pub fn process_block(&mut self, data: &[i16], out: &mut [u8], valid: &mut [bool]) {
+        if !self.is_running {
+            return;
+        }
+
+        self.reset_frame_collection();
+        for i in 0..FIBS_PER_FIC {
+            let start = i * self.bits_per_block;
+            let end = start + self.bits_per_block;
+            self.collect_block_soft_bits(&data[start..end], out, valid);
+        }
+    }
+
+    pub fn process_fic_block(&mut self, data: &[i16], out: &mut [u8], valid: &mut [bool]) {
+        self.process_block(data, out, valid);
+    }
+
+    fn process_fic_input(&mut self, ficno: usize, fib_bytes: &mut [u8]) -> bool {
+        if !self.is_running {
+            return false;
+        }
+
+        self.depuncture_fic_bits();
+        self.viterbi
+            .deconvolve(&self.viterbi_block, &mut self.bit_buffer_out);
+        self.descramble_fic_bits();
+
+        let mut valid = true;
         let mut frame_success = 0i16;
-        for fib_idx in 0..3 {
+        for fib_idx in 0..FIBS_PER_FIC {
             let p = &self.bit_buffer_out[fib_idx * 256..(fib_idx + 1) * 256];
             let crc_ok = check_crc_bits(p, 256);
             if !crc_ok {
-                *valid = false;
+                valid = false;
                 self.fic_errors += 1;
                 continue;
             }
@@ -167,13 +207,42 @@ impl FicHandler {
             frame_success += 1;
             self.fib_processor.process_fib(p, ficno as u16);
         }
-        self.fic_decode_ratio_steps =
-            update_decode_ratio_steps(self.fic_decode_ratio_steps, frame_success, 3);
+        self.fic_decode_ratio_steps = update_decode_ratio_steps(
+            self.fic_decode_ratio_steps,
+            frame_success,
+            FIBS_PER_FIC as i16,
+        );
 
-        // Copy bits to output
-        let offset = ficno * 768;
-        if offset + 768 <= fib_bytes.len() {
-            fib_bytes[offset..offset + 768].copy_from_slice(&self.bit_buffer_out);
+        let offset = ficno * FIC_BITS_OUT_SIZE;
+        if offset + FIC_BITS_OUT_SIZE <= fib_bytes.len() {
+            fib_bytes[offset..offset + FIC_BITS_OUT_SIZE].copy_from_slice(&self.bit_buffer_out);
+        }
+        if offset + FIC_BITS_OUT_SIZE <= self.fib_bits_frame.len() {
+            self.fib_bits_frame[offset..offset + FIC_BITS_OUT_SIZE]
+                .copy_from_slice(&self.bit_buffer_out);
+        }
+
+        valid
+    }
+
+    pub fn stop(&mut self) {
+        self.is_running = false;
+        self.fib_processor.clear_ensemble();
+    }
+
+    pub fn restart(&mut self) {
+        self.fic_decode_ratio_steps = 0;
+        self.reset_quality_counters();
+        self.reset_frame_collection();
+        self.is_running = true;
+    }
+
+    pub fn get_fib_bits(&self, v: &mut [u8], b: &mut [bool]) {
+        for (dst, src) in v.iter_mut().zip(self.fib_bits_frame.iter()) {
+            *dst = *src;
+        }
+        for (dst, src) in b.iter_mut().zip(self.fic_valid.iter()) {
+            *dst = *src;
         }
     }
 
@@ -309,6 +378,25 @@ mod tests {
         assert_eq!(update_decode_ratio_steps(3, 0, 3), 0);
         assert_eq!(update_decode_ratio_steps(9, 3, 3), 10);
         assert_eq!(update_decode_ratio_steps(5, 2, 3), 6);
+    }
+
+    #[test]
+    fn get_fib_bits_returns_last_frame_snapshot() {
+        let params = DabParams::new(1);
+        let mut fh = FicHandler::new(&params);
+        let bits_per_block = 2 * params.k as usize;
+        let data = vec![0i16; bits_per_block * 3];
+        let mut out = vec![0u8; 768 * 4];
+        let mut valid = [false; 4];
+
+        fh.process_fic_block(&data, &mut out, &mut valid);
+
+        let mut snapshot = vec![0u8; 768 * 4];
+        let mut snapshot_valid = [false; 4];
+        fh.get_fib_bits(&mut snapshot, &mut snapshot_valid);
+
+        assert_eq!(snapshot, out);
+        assert_eq!(snapshot_valid, valid);
     }
 
     #[test]
