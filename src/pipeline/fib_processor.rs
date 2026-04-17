@@ -27,6 +27,66 @@ fn ebu_to_char(ch: u8) -> char {
     s.chars().next().unwrap_or(ch as char)
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct FigHeader {
+    fig_type: u8,
+    length: usize,
+    cn_flag: bool,
+    oe_flag: bool,
+    pd_flag: bool,
+    extension: u8,
+}
+
+impl FigHeader {
+    fn fig_end_bit(self, base: usize) -> usize {
+        base + (self.length + 1) * 8
+    }
+}
+
+type Fig0LoopHandler = fn(&mut FibProcessor, &[u8], usize, usize, FigHeader) -> usize;
+
+fn parse_fig_header(bits: &[u8], base: usize) -> Option<FigHeader> {
+    if base + 8 > bits.len() {
+        return None;
+    }
+
+    let fig_type = get_bits_3(bits, base) as u8;
+    let length = get_bits_5(bits, base + 3) as usize;
+
+    if base + 16 > bits.len() {
+        return Some(FigHeader {
+            fig_type,
+            length,
+            ..FigHeader::default()
+        });
+    }
+
+    let (cn_flag, oe_flag, pd_flag, extension) = match fig_type {
+        0 => (
+            get_bits_1(bits, base + 8) == 1,
+            get_bits_1(bits, base + 9) == 1,
+            get_bits_1(bits, base + 10) == 1,
+            get_bits_5(bits, base + 11) as u8,
+        ),
+        1 => (
+            false,
+            get_bits_1(bits, base + 12) == 1,
+            false,
+            get_bits_3(bits, base + 13) as u8,
+        ),
+        _ => (false, false, false, 0),
+    };
+
+    Some(FigHeader {
+        fig_type,
+        length,
+        cn_flag,
+        oe_flag,
+        pd_flag,
+        extension,
+    })
+}
+
 // UEP protection level table (ETSI EN 300 401 Page 50)
 static PROT_LEVEL: [[i32; 3]; 64] = [
     [16, 5, 32],
@@ -159,70 +219,81 @@ impl FibProcessor {
         }
     }
 
-    pub fn process_fib(&mut self, p: &[u8], _fib: u16) {
-        let mut processed_bytes: i32 = 0;
+    pub fn process_fib(&mut self, bits: &[u8], _fib: u16) {
+        let mut processed_bytes = 0usize;
         while processed_bytes < 30 {
-            let offset = processed_bytes as usize * 8;
-            // Need at least 8 bits for the FIG header (type + length).
-            if offset + 8 > p.len() {
+            let bit_offset = processed_bytes * 8;
+            let Some(header) = parse_fig_header(bits, bit_offset) else {
+                break;
+            };
+
+            if header.fig_end_bit(bit_offset) > bits.len() {
                 break;
             }
-            let fig_type = get_bits_3(p, offset);
-            // Read the FIG length field before dispatching so we can verify
-            // the full FIG body fits within the FIB (ETSI EN 300 401 §5.2.1).
-            let length = get_bits_5(p, offset + 3) as i32;
-            let fig_end_bit = offset + (length as usize + 1) * 8;
-            if fig_end_bit > p.len() {
-                // Truncated or corrupted FIG — discard the rest of this FIB.
-                break;
+
+            if header.fig_type == 7 {
+                return;
             }
-            match fig_type {
-                0 => self.process_fig0(p, offset),
-                1 => self.process_fig1(p, offset),
-                7 => return,
-                _ => {}
-            }
-            processed_bytes += length + 1;
+
+            self.dispatch_fig(bits, bit_offset, header);
+            processed_bytes += header.length + 1;
         }
     }
 
-    fn process_fig0(&mut self, d: &[u8], base: usize) {
-        let extension = get_bits_5(d, base + 8 + 3);
-        match extension {
-            0 => self.fig0_extension0(d, base),
-            1 => self.fig0_extension1(d, base),
-            2 => self.fig0_extension2(d, base),
+    fn dispatch_fig(&mut self, d: &[u8], base: usize, header: FigHeader) {
+        match header.fig_type {
+            0 => self.process_fig0(d, base, header),
+            1 => self.process_fig1(d, base, header),
             _ => {}
         }
     }
 
-    fn fig0_extension0(&mut self, d: &[u8], base: usize) {
+    fn process_fig0(&mut self, d: &[u8], base: usize, header: FigHeader) {
+        match header.extension {
+            0 => self.process_fig0_0(d, base),
+            1 => self.process_fig0_1(d, base, header),
+            2 => self.process_fig0_2(d, base, header),
+            _ => {}
+        }
+    }
+
+    fn process_fig0_0(&mut self, d: &[u8], base: usize) {
         self.cif_count_hi = (get_bits_5(d, base + 16 + 19) % 20) as i16;
         self.cif_count_lo = (get_bits_8(d, base + 16 + 24) % 250) as i16;
     }
 
-    fn fig0_extension1(&mut self, d: &[u8], base: usize) {
-        let mut used: usize = 2;
-        let length = get_bits_5(d, base + 3) as usize;
-        let pd_bit = get_bits_1(d, base + 8 + 2);
-        while used < length.saturating_sub(1) {
-            used = self.handle_fig0_ext1(d, base, used, pd_bit as u8);
+    fn process_fig0_1(&mut self, d: &[u8], base: usize, header: FigHeader) {
+        self.process_fig0_loop(d, base, header, 2, FibProcessor::subprocess_fig0_1);
+    }
+
+    fn process_fig0_loop(
+        &mut self,
+        d: &[u8],
+        base: usize,
+        header: FigHeader,
+        mut used: usize,
+        step: Fig0LoopHandler,
+    ) {
+        while used < header.length.saturating_sub(1) {
+            let next = step(self, d, base, used, header);
+            if next <= used {
+                break;
+            }
+            used = next;
         }
     }
 
-    fn fig0_extension2(&mut self, d: &[u8], base: usize) {
-        let length = get_bits_5(d, base + 3) as usize;
-        let pd_bit = get_bits_1(d, base + 8 + 2) == 1;
-        let end_bit = base + (length + 1) * 8;
+    fn process_fig0_2(&mut self, d: &[u8], base: usize, header: FigHeader) {
+        let end_bit = header.fig_end_bit(base);
         let mut bit_offset = base + 16;
 
-        while bit_offset + if pd_bit { 40 } else { 24 } <= end_bit {
-            let sid = if pd_bit {
+        while bit_offset + if header.pd_flag { 40 } else { 24 } <= end_bit {
+            let sid = if header.pd_flag {
                 get_lbits(d, bit_offset, 32) as i32
             } else {
                 get_bits(d, bit_offset, 16) as i32
             };
-            bit_offset += if pd_bit { 32 } else { 16 };
+            bit_offset += if header.pd_flag { 32 } else { 16 };
 
             if bit_offset + 8 > end_bit {
                 break;
@@ -263,7 +334,13 @@ impl FibProcessor {
         }
     }
 
-    fn handle_fig0_ext1(&mut self, d: &[u8], base: usize, offset: usize, _pd: u8) -> usize {
+    fn subprocess_fig0_1(
+        &mut self,
+        d: &[u8],
+        base: usize,
+        offset: usize,
+        _header: FigHeader,
+    ) -> usize {
         let bit_offset = base + offset * 8;
         let sub_ch_id = get_bits_6(d, bit_offset) as usize;
         let start_cu = get_bits(d, bit_offset + 6, 10) as i16;
@@ -316,98 +393,85 @@ impl FibProcessor {
         offset + 4 // 32 bits = 4 bytes
     }
 
-    fn process_fig1(&mut self, d: &[u8], base: usize) {
+    fn process_fig1(&mut self, d: &[u8], base: usize, header: FigHeader) {
         let char_set = get_bits_4(d, base + 8);
-        let oe = get_bits_1(d, base + 8 + 4);
-        let extension = get_bits_3(d, base + 8 + 5);
-
-        if oe == 1 {
+        if header.oe_flag || char_set > 16 {
             return;
         }
 
-        match extension {
-            0 => {
-                // Ensemble label
-                let sid = get_bits(d, base + 16, 16) as u32;
-                if char_set <= 16 {
-                    let mut label = String::with_capacity(16);
-                    for i in 0..16 {
-                        let ch = get_bits_8(d, base + 32 + 8 * i) as u8;
-                        if ch != 0 {
-                            label.push(ebu_to_char(ch));
-                        }
-                    }
-                    if !is_valid_label(&label) {
-                        tracing::debug!(
-                            "FIG 1/0: rejected corrupt ensemble label (SId=0x{:04X})",
-                            sid
-                        );
-                        return;
-                    }
-                    if let Some(ref cb) = self.ensemble_name_cb {
-                        cb(&label, sid);
-                    }
-                    self.is_synced = true;
-                }
-            }
-            1 => {
-                // Service label (16-bit SId)
-                let sid = get_bits(d, base + 16, 16) as i32;
-                if char_set <= 16 {
-                    let svc = self.find_service_id(sid);
-                    if !self.list_of_services[svc].service_label.has_name {
-                        let mut label = String::with_capacity(16);
-                        for i in 0..16 {
-                            let ch = get_bits_8(d, base + 32 + 8 * i) as u8;
-                            if ch != 0 {
-                                label.push(ebu_to_char(ch));
-                            }
-                        }
-                        if !is_valid_label(&label) {
-                            tracing::debug!(
-                                "FIG 1/1: rejected corrupt service label (SId=0x{:04X})",
-                                sid
-                            );
-                            return;
-                        }
-                        self.list_of_services[svc].service_label.label = label.clone();
-                        self.list_of_services[svc].service_label.has_name = true;
-                        if let Some(ref cb) = self.program_name_cb {
-                            cb(&label, sid);
-                        }
-                    }
-                }
-            }
-            5 => {
-                // Service label (32-bit SId)
-                let sid = get_lbits(d, base + 16, 32) as i32;
-                if char_set <= 16 {
-                    let svc = self.find_service_id(sid);
-                    if !self.list_of_services[svc].service_label.has_name {
-                        let mut label = String::with_capacity(16);
-                        for i in 0..16 {
-                            let ch = get_bits_8(d, base + 48 + 8 * i) as u8;
-                            if ch != 0 {
-                                label.push(ebu_to_char(ch));
-                            }
-                        }
-                        label.push_str(" (data)");
-                        if !is_valid_label(&label) {
-                            tracing::debug!(
-                                "FIG 1/5: rejected corrupt service label (SId=0x{:08X})",
-                                sid as u32
-                            );
-                            return;
-                        }
-                        self.list_of_services[svc].service_label.label = label.clone();
-                        self.list_of_services[svc].service_label.has_name = true;
-                        if let Some(ref cb) = self.program_name_cb {
-                            cb(&label, sid);
-                        }
-                    }
-                }
-            }
+        match header.extension {
+            0 => self.process_fig1_0(d, base),
+            1 => self.process_fig1_1(d, base),
+            5 => self.process_fig1_5(d, base),
             _ => {}
+        }
+    }
+
+    fn process_fig1_0(&mut self, d: &[u8], base: usize) {
+        let sid = get_bits(d, base + 16, 16) as u32;
+        let label = self.decode_label_text(d, base + 32);
+        if !is_valid_label(&label) {
+            tracing::debug!(
+                "FIG 1/0: rejected corrupt ensemble label (SId=0x{:04X})",
+                sid
+            );
+            return;
+        }
+        if let Some(ref cb) = self.ensemble_name_cb {
+            cb(&label, sid);
+        }
+        self.is_synced = true;
+    }
+
+    fn process_fig1_1(&mut self, d: &[u8], base: usize) {
+        let sid = get_bits(d, base + 16, 16) as i32;
+        let label = self.decode_label_text(d, base + 32);
+        self.store_service_label(sid, label, false);
+    }
+
+    fn process_fig1_5(&mut self, d: &[u8], base: usize) {
+        let sid = get_lbits(d, base + 16, 32) as i32;
+        let mut label = self.decode_label_text(d, base + 48);
+        label.push_str(" (data)");
+        self.store_service_label(sid, label, true);
+    }
+
+    fn decode_label_text(&self, d: &[u8], start_bit: usize) -> String {
+        let mut label = String::with_capacity(16);
+        for i in 0..16 {
+            let ch = get_bits_8(d, start_bit + 8 * i) as u8;
+            if ch != 0 {
+                label.push(ebu_to_char(ch));
+            }
+        }
+        label
+    }
+
+    fn store_service_label(&mut self, sid: i32, label: String, is_data_label: bool) {
+        if !is_valid_label(&label) {
+            if is_data_label {
+                tracing::debug!(
+                    "FIG 1/5: rejected corrupt service label (SId=0x{:08X})",
+                    sid as u32
+                );
+            } else {
+                tracing::debug!(
+                    "FIG 1/1: rejected corrupt service label (SId=0x{:04X})",
+                    sid
+                );
+            }
+            return;
+        }
+
+        let svc = self.find_service_id(sid);
+        if self.list_of_services[svc].service_label.has_name {
+            return;
+        }
+
+        self.list_of_services[svc].service_label.label = label.clone();
+        self.list_of_services[svc].service_label.has_name = true;
+        if let Some(ref cb) = self.program_name_cb {
+            cb(&label, sid);
         }
     }
 
@@ -545,6 +609,17 @@ mod tests {
 
     /// A FIG with type = 7 (ETSI EN 300 401 §8.1.1) signals the end of the FIG
     /// list.  process_fib must return immediately and never invoke any callback.
+    #[test]
+    fn fig_header_extracts_type_length_and_flags() {
+        let fib = bytes_to_fib(&[0x35, 0x25]);
+        let header = parse_fig_header(&fib, 0).expect("header should parse");
+
+        assert_eq!(header.fig_type, 1);
+        assert_eq!(header.length, 21);
+        assert_eq!(header.extension, 5);
+        assert!(!header.oe_flag);
+    }
+
     #[test]
     fn process_fib_type7_end_marker_returns_early() {
         // Header byte: type=7 (0b111), length=0 → 0b111_00000 = 0xE0

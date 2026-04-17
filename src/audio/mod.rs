@@ -1,4 +1,5 @@
 pub mod aac_decoder;
+pub mod audio_runtime;
 pub mod crc;
 pub mod ebu_latin;
 pub mod fic_decoder;

@@ -20,13 +20,10 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::filter::Directive;
 use tracing_subscriber::EnvFilter;
 
-use dabctl::audio::fic_decoder::FicDecoder;
-use dabctl::audio::pad_decoder::PadDecoder;
-use dabctl::audio::pad_output::PadOutput;
-use dabctl::audio::silence_filler::{
-    advance_silence_deadline, silence_deadline_after_good_au, SilenceBuffer,
+use dabctl::audio::audio_runtime::{
+    spawn_status_thread, AudioCounters, AudioFrameProcessor, AudioProcessorConfig,
+    DecoderPreference, StatusThreadConfig,
 };
-use dabctl::audio::superframe::SuperframeFilter;
 use dabctl::device::rtlsdr_handler::{GainMode, RtlsdrHandler};
 use dabctl::pipeline::band_handler;
 use dabctl::pipeline::dab_constants::BAND_III;
@@ -39,13 +36,14 @@ const CHANNEL_CAPACITY: usize = 4;
 
 /// DABstar-inspired OFDM phase-correlation thresholds.
 ///
-/// Tom Neda's receiver uses a base threshold of 3.0 and a stricter symbol
-/// sync evaluation once lock is established. Using 3 / 6 here keeps startup
-/// tolerant enough to acquire while making steady tracking less likely to
-/// follow a weak false peak during SFN or fading.
-const OFDM_ACQ_THRESHOLD: i16 = 3;
-const OFDM_TRACK_THRESHOLD: i16 = 6;
+/// In this Rust live path, a slightly softer 2 / 5 pair matches the intended
+/// DABstar acquisition/tracking behavior more reliably on marginal RF than a
+/// stricter 3 / 6 pair, reducing avoidable relock bursts while keeping a clear
+/// separation between acquisition and steady-state tracking.
+const OFDM_ACQ_THRESHOLD: i16 = 2;
+const OFDM_TRACK_THRESHOLD: i16 = 5;
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[inline]
 fn is_metadata_blackout_during_dropout(
     sync_ok: i32,
@@ -369,184 +367,47 @@ pub fn run(args: Iq2pcmArgs) {
     let target_sid = parse_sid(&args.sid);
     let slide_dir = args.slide_dir.as_ref().map(std::path::PathBuf::from);
 
-    let mut fic_decoder = FicDecoder::new();
-    let mut pad_decoder = PadDecoder::new();
-    pad_decoder.set_mot_app_type(12);
-    let mut pad_output = PadOutput::new(slide_dir, args.slide_base64);
-    let mut superframe = SuperframeFilter::new();
-    let mut aac_decoder: Option<dabctl::audio::aac_decoder::AacDecoder> = None;
-    let mut au_count: usize = 0;
-    // Tracks the deadline for the next silence superframe.
-    // Initialised lazily on the first real AU output.
-    let mut silence_next = std::time::Instant::now();
-    // Deferred silence buffer (ETSI TS 102 563 §5.1).
-    // Holds silence frames for 2 CIF ticks (~48 ms) before writing them.
-    // A sync_ok within that window calls cancel(), preventing the pattern:
-    //   AU_OK → silence → AU_OK  (silence interleaved with real audio)
-    // instead of the correct:
-    //   silence → silence → AU_OK  (silence precedes the recovered audio)
-    // holdoff=2 (not 5) keeps the per-fade stream deficit to ~24 ms instead
-    // of ~96 ms, which is enough to keep ffmpeg speed ≥ 0.997× even during
-    // heavy fading.  holdoff=1 would flush on the very first tick and could
-    // still interleave silence with audio during a 24 ms recovery window.
-    let mut silence_buffer = SilenceBuffer::new(2);
+    #[cfg(not(feature = "fdk-aac"))]
+    let decoder_preference = DecoderPreference::Faad2;
 
-    let mut current_subchid: Option<u8> = None;
-    let mut ensemble_announced = false;
-    let mut service_announced = false;
+    #[cfg(feature = "fdk-aac")]
+    let decoder_preference = match args.aac_decoder {
+        AacBackend::Faad2 => DecoderPreference::Faad2,
+        AacBackend::FdkAac => DecoderPreference::FdkAac,
+    };
+
+    let counters = AudioCounters::new();
+    let mut frame_processor = AudioFrameProcessor::new(
+        AudioProcessorConfig {
+            target_sid,
+            target_label: args.label.clone(),
+            slide_dir,
+            slide_base64: args.slide_base64,
+            disable_dyn_fic: args.disable_dyn_fic,
+            no_silence_fill: args.no_silence_fill,
+            decoder_preference,
+        },
+        counters.clone(),
+    );
 
     // Spawn the PCM writer thread so that stdout writes never block the drain loop.
     // The drain loop pushes owned Vec<i16> frames non-blocking; the writer thread
     // absorbs transient pipe stalls without propagating backpressure up to the
     // OFDM ring buffer (ETSI TS 102 563 §5.2).
-    let pcm_out = pcm_writer::spawn_pcm_writer(std::io::stdout());
+    let pcm_out = dabctl::pcm_writer::spawn_pcm_writer(std::io::stdout());
 
-    // Audio pipeline diagnostic counters
-    let frames_in = Arc::new(AtomicI32::new(0));
-    let frames_no_subch = Arc::new(AtomicI32::new(0));
-    let sync_ok = Arc::new(AtomicI32::new(0));
-    let sync_fail = Arc::new(AtomicI32::new(0));
-    let aus_decoded = Arc::new(AtomicI32::new(0));
-    // Counts silence AUs emitted during signal fades (one per AU substituted).
-    let silence_aus = Arc::new(AtomicI32::new(0));
-    // Metadata continuity counters (events emitted to PadOutput / fd 3).
-    let service_events = Arc::new(AtomicI32::new(0));
-    let dls_events = Arc::new(AtomicI32::new(0));
-    let slide_events = Arc::new(AtomicI32::new(0));
-    // RS and AU CRC quality counters.
-    let rs_corrected = Arc::new(AtomicI32::new(0));
-    let rs_uncorrectable = Arc::new(AtomicI32::new(0));
-    let au_crc_fail = Arc::new(AtomicI32::new(0));
-
-    // Monitor thread to log status and respect record_time
-    let status_run = run.clone();
-    let sn2 = signal_noise.clone();
-    let fs2_ok = fic_ok.clone();
-    let fs2_total = fic_total.clone();
-    let c_fo = freq_offset_hz.clone();
-    let c_fi = frames_in.clone();
-    let c_fns = frames_no_subch.clone();
-    let c_sok = sync_ok.clone();
-    let c_sfail = sync_fail.clone();
-    let c_au = aus_decoded.clone();
-    let c_sil = silence_aus.clone();
-    let c_srv = service_events.clone();
-    let c_dls = dls_events.clone();
-    let c_sld = slide_events.clone();
-    let c_rsc = rs_corrected.clone();
-    let c_rsu = rs_uncorrectable.clone();
-    let c_aucrc = au_crc_fail.clone();
-    thread::spawn(move || {
-        // Counts consecutive 1-second intervals where reception is degraded
-        // (sfail > sok: majority of OFDM frames failed that second).
-        // Used to emit a WARN after DROPOUT_WARN_SECS dominated-by-failure seconds.
-        // Using sfail > sok (rather than sok == 0) catches fading conditions where
-        // a few frames recover within a second but overall reception is still broken,
-        // preventing a single partial-recovery tick from resetting the counter.
-        const DROPOUT_WARN_SECS: u32 = 5;
-        let mut consecutive_dropout_s: u32 = 0;
-
-        while status_run.load(Ordering::SeqCst) {
-            let fi = c_fi.swap(0, Ordering::SeqCst);
-            let fns = c_fns.swap(0, Ordering::SeqCst);
-            let sok = c_sok.swap(0, Ordering::SeqCst);
-            let sfail = c_sfail.swap(0, Ordering::SeqCst);
-            let au = c_au.swap(0, Ordering::SeqCst);
-            let sil = c_sil.swap(0, Ordering::SeqCst);
-            let srv = c_srv.swap(0, Ordering::SeqCst);
-            let dls = c_dls.swap(0, Ordering::SeqCst);
-            let sld = c_sld.swap(0, Ordering::SeqCst);
-            let rsc = c_rsc.swap(0, Ordering::SeqCst);
-            let rsu = c_rsu.swap(0, Ordering::SeqCst);
-            let aucrc = c_aucrc.swap(0, Ordering::SeqCst);
-            let fib_ok = fs2_ok.swap(0, Ordering::SeqCst);
-            let fib_tot = fs2_total.swap(0, Ordering::SeqCst);
-            let fib_quality = if fib_tot > 0 {
-                fib_ok * 100 / fib_tot
-            } else {
-                0
-            };
-
-            // Current tuner gain (tenths of dB); -1 = hardware AGC active.
-            let gain_t = gain_tenths.load(Ordering::Relaxed);
-            let gain_db_x10 = if gain_t >= 0 { gain_t } else { 0 };
-
-            // B. Only report frequency offset and PPM when the OFDM decoder is
-            // locked (sync_ok > 0).  During a full dropout the phase-reference
-            // correlator produces arbitrary values that would mislead the reader.
-            let (offset_hz, mppm) = if sok > 0 {
-                // Derive PPM from the OFDM AFC total offset (coarse + fine).
-                // ppm = offset_hz × 1_000_000 / tuned_freq_hz (ETSI EN 300 401 §8.4.3).
-                // Reported in milli-PPM (×1000) so sub-PPM offsets are visible.
-                let off = c_fo.load(Ordering::Relaxed);
-                let ppm = if freq > 0 {
-                    off * 1_000_000_000 / freq
-                } else {
-                    0
-                };
-                (off, ppm)
-            } else {
-                (0, 0)
-            };
-
-            debug!(
-                snr = sn2.load(Ordering::SeqCst),
-                fib_quality,
-                frames = fi,
-                no_subch = fns,
-                sync_ok = sok,
-                sync_fail = sfail,
-                aus = au,
-                silence_aus = sil,
-                rs_corrected = rsc,
-                rs_uncorrectable = rsu,
-                au_crc_fail = aucrc,
-                service_events = srv,
-                dls_events = dls,
-                slide_events = sld,
-                metadata_blackout = is_metadata_blackout_during_dropout(sok, sfail, dls, sld),
-                freq_offset_hz = offset_hz,
-                mppm,
-                gain_db_x10,
-                "status"
-            );
-
-            // C. Emit a WARN when reception has been degraded (sfail majority) for
-            // DROPOUT_WARN_SECS consecutive seconds.  sfail > sok means failures
-            // outnumbered successes that second — a reliable proxy for "the listener
-            // is hearing dropouts" even during fading with intermittent recovery.
-            if sfail > sok {
-                consecutive_dropout_s += 1;
-                if consecutive_dropout_s == DROPOUT_WARN_SECS {
-                    let snr_val = sn2.load(Ordering::SeqCst);
-                    let hint = if offset_hz == 0 && snr_val < 6 {
-                        " — weak RF signal, check antenna"
-                    } else if offset_hz.abs() > 500 {
-                        " — large frequency offset, try -p to adjust PPM"
-                    } else {
-                        " — OFDM sync lost, audio interrupted"
-                    };
-                    warn!(
-                        "Signal degraded for {} s (snr={} dB, freq_offset={} Hz){}",
-                        consecutive_dropout_s, snr_val, offset_hz, hint,
-                    );
-                    if is_metadata_blackout_during_dropout(sok, sfail, dls, sld) {
-                        warn!("Metadata blackout during dropout: no DLS/slide events in last 1 s");
-                    }
-                }
-            } else {
-                if consecutive_dropout_s >= DROPOUT_WARN_SECS {
-                    info!(
-                        "Signal recovered after {} s of degraded reception",
-                        consecutive_dropout_s
-                    );
-                }
-                consecutive_dropout_s = 0;
-            }
-
-            thread::sleep(std::time::Duration::from_secs(1));
-        }
-    });
+    spawn_status_thread(
+        counters.clone(),
+        StatusThreadConfig {
+            running: run.clone(),
+            signal_noise: signal_noise.clone(),
+            fic_ok: fic_ok.clone(),
+            fic_total: fic_total.clone(),
+            freq_offset_hz: freq_offset_hz.clone(),
+            tuned_freq_hz: freq,
+            gain_tenths: gain_tenths.clone(),
+        },
+    );
 
     // Main audio drain loop: receives DabFrame, decodes to PCM.
     // Uses recv_timeout instead of blocking iteration so that Ctrl-C (which sets
@@ -564,236 +425,7 @@ pub fn run(args: Iq2pcmArgs) {
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         };
 
-        // Process FIC to discover services — ETSI EN 300 401 §6.3
-        fic_decoder.process(frame.fic_data.as_ref());
-
-        // Announce ensemble on fd 3
-        if !ensemble_announced {
-            if let Some(ref ens) = fic_decoder.ensemble {
-                if !ens.label.is_empty() {
-                    pad_output.write_ensemble(&ens.label, &ens.short_label, ens.eid);
-                    info!("ensemble ready: {} (0x{:04X})", ens.label.trim(), ens.eid);
-                    ensemble_announced = true;
-                }
-            }
-        }
-
-        // Resolve which sub-channel to play
-        if current_subchid.is_none() {
-            let audio_service = fic_decoder.find_audio_service(target_sid);
-
-            if let Some(audio) = audio_service {
-                if !audio.dab_plus {
-                    warn!(
-                        "Service 0x{:04X} is DAB (MP2), only DAB+ is supported — skipping",
-                        target_sid
-                    );
-                    continue;
-                }
-                current_subchid = Some(audio.subchid);
-                info!("selected DAB+ sub-channel {}", audio.subchid);
-            }
-        }
-
-        // Announce service on fd 3
-        if !service_announced && current_subchid.is_some() {
-            if let Some(svc) = fic_decoder.services.get(&target_sid) {
-                if !svc.label.is_empty() {
-                    pad_output.write_service(&svc.label, &svc.short_label, svc.sid);
-                    service_events.fetch_add(1, Ordering::Relaxed);
-                    info!("service ready: {} (0x{:04X})", svc.label.trim(), svc.sid);
-                    service_announced = true;
-                }
-            }
-        }
-
-        let subchid = match current_subchid {
-            Some(id) => id,
-            None => continue,
-        };
-
-        frames_in.fetch_add(1, Ordering::Relaxed);
-
-        let subchannel_arc = match frame.subchannel_data(subchid) {
-            Some(arc) => arc,
-            None => {
-                frames_no_subch.fetch_add(1, Ordering::SeqCst);
-                continue;
-            }
-        };
-        let subchannel_data: &[u8] = subchannel_arc;
-
-        // ── DAB+ path: superframe → RS → AU → AAC → PCM ──────────────────────
-        {
-            // When the OFDM layer detected a block-sequence discontinuity, the
-            // rolling 5-CIF window in SuperframeFilter still holds pre-dropout CIF
-            // data.  Mixing old and new CIFs guarantees a Fire-code failure on the
-            // next decode attempt.  Reset now so the first 5 post-resync CIFs form
-            // a clean candidate.  (ETSI TS 102 563 §5 — DAB+ superframe structure)
-            if frame.sync_lost {
-                superframe.reset();
-                tracing::debug!("superframe accumulator reset after OFDM sync loss");
-            }
-            let result = superframe.feed(subchannel_data);
-            if result.sync_ok {
-                sync_ok.fetch_add(1, Ordering::Relaxed);
-            }
-            if result.sync_fail {
-                sync_fail.fetch_add(1, Ordering::Relaxed);
-            }
-            if result.rs_corrected > 0 {
-                rs_corrected.fetch_add(result.rs_corrected as i32, Ordering::Relaxed);
-            }
-            if result.rs_uncorrectable {
-                rs_uncorrectable.fetch_add(1, Ordering::Relaxed);
-            }
-            if result.au_crc_fail > 0 {
-                au_crc_fail.fetch_add(result.au_crc_fail as i32, Ordering::Relaxed);
-            }
-
-            if let Some(ref fmt) = result.format {
-                au_count = fmt.number_of_access_units();
-                let asc = fmt.build_asc();
-                info!(
-                    "audio format detected: {} {} kHz {} ch",
-                    fmt.codec_name(),
-                    fmt.sample_rate() / 1000,
-                    fmt.channels()
-                );
-                {
-                    #[cfg(not(feature = "fdk-aac"))]
-                    let init = dabctl::audio::aac_decoder::AacDecoder::new(&asc);
-
-                    #[cfg(feature = "fdk-aac")]
-                    let init = match args.aac_decoder {
-                        AacBackend::Faad2 => {
-                            dabctl::audio::aac_decoder::AacDecoder::new_faad2(&asc)
-                        }
-                        AacBackend::FdkAac => dabctl::audio::aac_decoder::AacDecoder::new_fdk_aac(
-                            &asc,
-                            fmt.channels(),
-                        ),
-                    };
-
-                    match init {
-                        Ok(dec) => {
-                            // Sample rate and channels are not yet populated from the
-                            // bitstream at decoder-open time for all backends (fdk-aac
-                            // defers this to the first DecodeFrame call). Use the values
-                            // parsed from the DAB+ superframe header instead, which are
-                            // already available and authoritative at this point.
-                            info!(
-                                "aac decoder ready: {} Hz {} ch",
-                                fmt.sample_rate(),
-                                fmt.channels()
-                            );
-                            aac_decoder = Some(dec);
-                        }
-                        Err(e) => error!("AAC decoder init failed: {}", e),
-                    }
-                }
-            }
-
-            // On sync_ok: flush buffered silence BEFORE writing real audio.
-            // This keeps the stream chronologically ordered (silence precedes
-            // the recovered audio) WITHOUT discarding any silence frames, so
-            // the total PCM duration stays equal to wall-clock time (speed = 1.0×).
-            if result.sync_ok {
-                for sil_frame in silence_buffer.flush() {
-                    if pcm_out.push(sil_frame) {
-                        silence_aus.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }
-
-            if let Some(ref mut dec) = aac_decoder {
-                let mut decoded_this_frame: usize = 0;
-                for au in &result.access_units {
-                    if let Some(pcm) = dec.decode_frame(&au.data) {
-                        decoded_this_frame += 1;
-                        aus_decoded.fetch_add(1, Ordering::Relaxed);
-                        pcm_out.push(pcm);
-                        silence_next = silence_deadline_after_good_au(std::time::Instant::now());
-                    }
-                }
-
-                // ── sync_ok path: fill each missing AU in this superframe ──────────
-                // On a structurally valid superframe (fire-code OK), individual AUs can
-                // still fail their inner CRC (ETSI TS 102 563 §5.3.2) or the AAC
-                // decoder can return None. Each missing AU is an ~40 ms gap at 48 kHz
-                // with SBR. Injecting silence immediately preserves the total PCM
-                // duration and keeps ffmpeg speed ≥ 1.0×.
-                //
-                // Silence frames are produced by the AAC decoder via decode_or_silence
-                // so the frame size is always correct without inline Vec allocation.
-                //
-                // Note: no rate-limiting is needed here. The number of silence frames
-                // is bounded by au_count per superframe (~3 every 120 ms = real-time).
-                // ETSI TS 102 563 §5.1 — one DAB+ superframe = 5 CIF × ~24 ms.
-                if result.sync_ok && !args.no_silence_fill {
-                    let missing = au_count.saturating_sub(decoded_this_frame);
-                    for _ in 0..missing {
-                        if let Some(sil) = dec.decode_or_silence(None) {
-                            if pcm_out.push(sil) {
-                                silence_aus.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                    }
-                }
-
-                // ── sync_fail path: rate-limited fill for fire-code failures ─────
-                // When the fire-code check itself fails, we have no superframe
-                // boundary to anchor fill rate. Rate-limit to one superframe period
-                // (120 ms) to match real-time, deferred via SilenceBuffer so a
-                // brief sync_ok recovery does not interleave silence with real audio.
-                // Silence frames are produced by the AAC decoder via decode_or_silence.
-                // ETSI TS 102 563 §5.1.
-                if result.sync_fail && !args.no_silence_fill {
-                    let now = std::time::Instant::now();
-                    if now >= silence_next {
-                        let n = au_count.max(1);
-                        for _ in 0..n {
-                            if let Some(sil) = dec.decode_or_silence(None) {
-                                silence_buffer.push(sil);
-                            }
-                        }
-                        silence_next = advance_silence_deadline(silence_next, now);
-                    }
-                }
-            }
-
-            // Flush deferred silence frames that have waited a full hold-off
-            // (2 CIF ticks ≈ 48 ms) without a sync_ok cancelling them.
-            for sil_frame in silence_buffer.tick() {
-                if pcm_out.push(sil_frame) {
-                    silence_aus.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-
-            for pad in &result.pad_data {
-                let pad_result =
-                    pad_decoder.process_full(&pad.xpad, pad.xpad.len(), true, &pad.fpad);
-                if let Some(ref label) = pad_result.dynamic_label {
-                    pad_output.write_dl(&label.text);
-                    dls_events.fetch_add(1, Ordering::Relaxed);
-                    if !args.disable_dyn_fic {
-                        debug!("dynamic label: {}", label.text);
-                    }
-                }
-                if let Some(ref slide) = pad_result.slide {
-                    pad_output.write_slide(slide);
-                    slide_events.fetch_add(1, Ordering::Relaxed);
-                    if !args.disable_dyn_fic {
-                        debug!(
-                            "slideshow image: {} ({}, {} bytes)",
-                            slide.content_name,
-                            slide.mime_type(),
-                            slide.data.len()
-                        );
-                    }
-                }
-            }
-        }
+        frame_processor.process_frame(frame, &pcm_out);
     }
 
     running.store(false, Ordering::SeqCst);
@@ -806,8 +438,6 @@ pub fn run(args: Iq2pcmArgs) {
         dev.stop_reader();
     }
 }
-
-use crate::pcm_writer;
 
 /// Parse a SID string (supports "0xF201" and "F201" hex formats).
 pub fn parse_sid(s: &str) -> u16 {

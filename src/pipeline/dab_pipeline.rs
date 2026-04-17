@@ -17,6 +17,7 @@ use std::sync::mpsc::{self, TrySendError};
 use std::sync::Arc;
 use std::thread;
 
+use crate::pipeline::dab_constants::ChannelData;
 use crate::pipeline::dab_frame::{DabFrame, SubchannelFrame};
 use crate::pipeline::dab_params::DabParams;
 use crate::pipeline::fic_handler::FicHandler;
@@ -39,6 +40,12 @@ const RING_CAPACITY: usize = 512;
 /// Bytes per capacity unit: 64 bits × 4 carriers = 64 samples.
 /// ETSI EN 300 401 §7 — one CU = 64 bits.
 const CU_SIZE: usize = 4 * 16;
+
+/// Mode I carries 18 MSC blocks per CIF — ETSI EN 300 401 §14.1.
+const NUMBER_OF_BLOCKS_PER_CIF: usize = 18;
+
+/// Time de-interleaving delay table — ETSI EN 300 401 §12.3, Table 22.
+const INTERLEAVE_MAP: [usize; 16] = [0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15];
 
 // ─────────────────────────────────────────────────────────────────────────────
 // OFDM frame sync state machine
@@ -105,6 +112,145 @@ impl OfdmFrameSync {
     }
 }
 
+struct PipelineThreadContext {
+    processing: Arc<AtomicBool>,
+    params: DabParams,
+    sender: mpsc::SyncSender<DabFrame>,
+    ensemble_cb: EnsembleCb,
+    program_cb: ProgramCb,
+    fic_quality_cb: FicQualityCb,
+}
+
+struct FicFrameAssembler {
+    fib_input: Vec<i16>,
+    fibs_bytes: Vec<u8>,
+}
+
+impl FicFrameAssembler {
+    fn new(bits_per_block: usize) -> Self {
+        Self {
+            fib_input: vec![0i16; 3 * bits_per_block],
+            fibs_bytes: vec![0u8; 4 * 768],
+        }
+    }
+
+    fn store_block(&mut self, blkno: i16, bdata: &[i16], bits_per_block: usize) -> bool {
+        let offset = (blkno - 2) as usize * bits_per_block;
+        let copy_len = bits_per_block.min(bdata.len());
+        self.fib_input[offset..offset + copy_len].copy_from_slice(&bdata[..copy_len]);
+        blkno == 4
+    }
+
+    fn decode_slots(&mut self, fic_handler: &mut FicHandler) -> [[u8; 96]; 4] {
+        let mut valid = [false; 4];
+        self.fibs_bytes.fill(0);
+        fic_handler.process_fic_block(&self.fib_input, &mut self.fibs_bytes, &mut valid);
+        replicate_fic_across_cifs(&self.fibs_bytes)
+    }
+
+    #[cfg(test)]
+    fn current_bits(&self) -> &[i16] {
+        &self.fib_input
+    }
+}
+
+struct CifAssembler {
+    cif_in: Vec<i16>,
+    cif_vector: Vec<Vec<i16>>,
+    fib_vector: Vec<[u8; 96]>,
+    temp: Vec<i16>,
+    index_out: usize,
+    amount: usize,
+    minor: u32,
+    cif_count_hi: i16,
+    cif_count_lo: i16,
+    sync_just_lost: bool,
+}
+
+impl CifAssembler {
+    fn new(bits_per_block: usize) -> Self {
+        let cif_buf_size = NUMBER_OF_BLOCKS_PER_CIF * bits_per_block;
+        Self {
+            cif_in: vec![0i16; cif_buf_size],
+            cif_vector: vec![vec![0i16; cif_buf_size]; 16],
+            fib_vector: vec![[0u8; 96]; 16],
+            temp: vec![0i16; cif_buf_size],
+            index_out: 0,
+            amount: 0,
+            minor: 0,
+            cif_count_hi: -1,
+            cif_count_lo: -1,
+            sync_just_lost: false,
+        }
+    }
+
+    fn store_msc_block(&mut self, blkno: i16, bdata: &[i16], bits_per_block: usize) -> bool {
+        let cif_index = ((blkno - 5) as usize) % NUMBER_OF_BLOCKS_PER_CIF;
+        let offset = cif_index * bits_per_block;
+        let copy_len = bits_per_block.min(bdata.len());
+        self.cif_in[offset..offset + copy_len].copy_from_slice(&bdata[..copy_len]);
+        cif_index == NUMBER_OF_BLOCKS_PER_CIF - 1
+    }
+
+    fn record_fic_slots(&mut self, fic_slots: [[u8; 96]; 4]) {
+        for (i, slot_data) in fic_slots.into_iter().enumerate() {
+            self.fib_vector[(self.index_out + i) & 0x0F] = slot_data;
+        }
+    }
+
+    fn update_cif_counter(&mut self, hi: i16, lo: i16) {
+        self.cif_count_hi = hi;
+        self.cif_count_lo = lo;
+        self.minor = 0;
+    }
+
+    fn note_sync_loss(&mut self) {
+        self.minor = 0;
+        self.sync_just_lost = true;
+    }
+
+    #[cfg(test)]
+    fn finish_cif(&mut self, current_cif: &[i16]) -> Option<DabFrame> {
+        let copy_len = self.cif_in.len().min(current_cif.len());
+        self.cif_in[..copy_len].copy_from_slice(&current_cif[..copy_len]);
+        self.finish_loaded_cif()
+    }
+
+    fn finish_loaded_cif(&mut self) -> Option<DabFrame> {
+        for i in 0..self.temp.len() {
+            let idx = INTERLEAVE_MAP[i & 0x0F];
+            self.cif_vector[self.index_out & 0x0F][i] = self.cif_in[i];
+            self.temp[i] = self.cif_vector[(self.index_out + idx) & 0x0F][i];
+        }
+
+        if self.amount < 15 {
+            self.amount += 1;
+            self.index_out = (self.index_out + 1) & 0x0F;
+            self.minor = 0;
+            return None;
+        }
+
+        if self.cif_count_hi < 0 || self.cif_count_lo < 0 {
+            return None;
+        }
+
+        let (adj_hi, adj_lo) = adjust_cif_counter(self.cif_count_hi, self.cif_count_lo, self.minor);
+        let mut frame = DabFrame::new(self.fib_vector[self.index_out], adj_hi, adj_lo);
+        if self.sync_just_lost {
+            frame.sync_lost = true;
+            self.sync_just_lost = false;
+        }
+
+        self.index_out = (self.index_out + 1) & 0x0F;
+        self.minor += 1;
+        Some(frame)
+    }
+
+    fn deinterleaved_bits(&self) -> &[i16] {
+        &self.temp
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // DabPipeline
 // ─────────────────────────────────────────────────────────────────────────────
@@ -141,12 +287,16 @@ impl DabPipeline {
         let processing = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::sync_channel(RING_CAPACITY);
 
-        let p = processing.clone();
-        let ecb = ensemble_cb.clone();
-        let pcb = program_cb.clone();
-        let fqcb = fic_quality_cb.clone();
+        let context = PipelineThreadContext {
+            processing: processing.clone(),
+            params,
+            sender,
+            ensemble_cb: ensemble_cb.clone(),
+            program_cb: program_cb.clone(),
+            fic_quality_cb: fic_quality_cb.clone(),
+        };
         let thread_handle = thread::spawn(move || {
-            Self::run_loop(rx, p, params, sender, ecb, pcb, fqcb);
+            Self::run_loop(rx, context);
         });
 
         DabPipeline {
@@ -213,12 +363,16 @@ impl DabPipeline {
         let (tx, rx) = mpsc::sync_channel(RING_CAPACITY);
         self.block_tx = Some(tx);
 
-        let p = self.processing.clone();
-        let ecb = self.ensemble_cb.clone();
-        let pcb = self.program_cb.clone();
-        let fqcb = self.fic_quality_cb.clone();
+        let context = PipelineThreadContext {
+            processing: self.processing.clone(),
+            params,
+            sender,
+            ensemble_cb: self.ensemble_cb.clone(),
+            program_cb: self.program_cb.clone(),
+            fic_quality_cb: self.fic_quality_cb.clone(),
+        };
         self.thread_handle = Some(thread::spawn(move || {
-            Self::run_loop(rx, p, params, sender, ecb, pcb, fqcb);
+            Self::run_loop(rx, context);
         }));
     }
 
@@ -226,55 +380,76 @@ impl DabPipeline {
     // Background thread
     // ─────────────────────────────────────────────────────────────────────────
 
-    #[allow(clippy::too_many_arguments)]
-    fn run_loop(
-        rx: mpsc::Receiver<(i16, Vec<i16>)>,
-        processing: Arc<AtomicBool>,
-        params: DabParams,
-        sender: mpsc::SyncSender<DabFrame>,
-        ensemble_cb: EnsembleCb,
-        program_cb: ProgramCb,
-        fic_quality_cb: FicQualityCb,
+    fn handle_fic_block(
+        blkno: i16,
+        bdata: &[i16],
+        bits_per_block: usize,
+        fic_assembler: &mut FicFrameAssembler,
+        cif_assembler: &mut CifAssembler,
+        fic_handler: &mut FicHandler,
+        fic_quality_cb: &FicQualityCb,
     ) {
+        if blkno == 2 {
+            fic_handler.reset_quality_counters();
+        }
+
+        if fic_assembler.store_block(blkno, bdata, bits_per_block) {
+            cif_assembler.record_fic_slots(fic_assembler.decode_slots(fic_handler));
+
+            let (hi, lo) = fic_handler.get_cif_count();
+            cif_assembler.update_cif_counter(hi, lo);
+            if let Some(ref cb) = fic_quality_cb {
+                let (success, total) = fic_handler.get_fic_counts();
+                cb(success, total);
+            }
+        }
+    }
+
+    fn emit_completed_cif(
+        processing: &Arc<AtomicBool>,
+        sender: &mpsc::SyncSender<DabFrame>,
+        cif_assembler: &mut CifAssembler,
+        fic_handler: &FicHandler,
+        prot_table: &mut [Option<Protection>],
+        descrambler: &mut [Option<Vec<u8>>],
+    ) -> bool {
+        let Some(mut frame) = cif_assembler.finish_loaded_cif() else {
+            return false;
+        };
+
+        let is_processing = processing.load(Ordering::Acquire);
+        if is_processing {
+            frame.subchannels = process_cif_to_frames(
+                cif_assembler.deinterleaved_bits(),
+                fic_handler,
+                prot_table,
+                descrambler,
+            );
+        }
+
+        send_frame_to_consumer(sender, is_processing, frame)
+    }
+
+    fn run_loop(rx: mpsc::Receiver<(i16, Vec<i16>)>, context: PipelineThreadContext) {
+        let PipelineThreadContext {
+            processing,
+            params,
+            sender,
+            ensemble_cb,
+            program_cb,
+            fic_quality_cb,
+        } = context;
+
         let bits_per_block = 2 * params.get_carriers();
-        // Mode I: 18 MSC blocks per CIF — ETSI EN 300 401 §14.1
-        let number_of_blocks_per_cif: usize = 18;
-        // Time de-interleaving delay table — ETSI EN 300 401 §12.3, Table 22
-        let interleave_map: [usize; 16] = [0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15];
-
-        let cif_buf_size = number_of_blocks_per_cif * bits_per_block;
-        let mut cif_in = vec![0i16; cif_buf_size];
-        // Circular history for time de-interleaving: 16 successive CIF snapshots.
-        let mut cif_vector = vec![vec![0i16; cif_buf_size]; 16];
-        // Circular FIB history: 4 FIBs packed into 96 bytes per slot.
-        let mut fib_vector = vec![[0u8; 96]; 16];
-        let mut fib_input = vec![0i16; 3 * bits_per_block];
-
+        let mut fic_assembler = FicFrameAssembler::new(bits_per_block);
         let mut prot_table: Vec<Option<Protection>> = (0..64).map(|_| None).collect();
         let mut descrambler: Vec<Option<Vec<u8>>> = (0..64).map(|_| None).collect();
-
-        let mut index_out: usize = 0;
         let mut frame_sync = OfdmFrameSync::new(params.get_l() as i16);
-        // Number of CIFs accumulated so far; output is withheld until 15 full
-        // cycles have passed so the interleaver history is valid.
-        let mut amount: usize = 0;
-        // Offset applied to the FIC-decoded CIF counter per emitted frame.
-        let mut minor: u32 = 0;
-        let mut cif_count_hi: i16 = -1;
-        let mut cif_count_lo: i16 = -1;
-        // De-interleaved output buffer reused each CIF to avoid per-frame allocation.
-        let mut temp = vec![0i16; cif_buf_size];
-        // Set when OfdmFrameSync reports SyncLost; propagated to the next DabFrame
-        // so the audio thread can reset its superframe accumulator.
-        let mut sync_just_lost = false;
+        let mut cif_assembler = CifAssembler::new(bits_per_block);
 
         let mut my_fic_handler = FicHandler::new(&params);
         my_fic_handler.fib_processor.ensemble_name_cb = ensemble_cb;
         my_fic_handler.fib_processor.program_name_cb = program_cb;
-
-        // Scratch buffer for four decoded FIC payloads:
-        // 4 × 768 hard bits = one 96-byte FIC image per CIF slot.
-        let mut fibs_bytes = vec![0u8; 4 * 768];
 
         while let Ok((blkno, bdata)) = rx.recv() {
             match frame_sync.advance(blkno) {
@@ -283,129 +458,41 @@ impl DabPipeline {
                     tracing::debug!(blkno, "OFDM frame sync restored");
                 }
                 SyncAction::SyncLost => {
-                    // CIF interleaver history (index_out, amount) is NOT reset:
-                    // the 16-CIF sliding window survives a single dropped block.
-                    // Resetting it would cause ~360 ms of unnecessary warm-up
-                    // latency (15 × 24 ms).
+                    // CIF interleaver history survives a single dropped block;
+                    // only the emitted-frame offset and sync marker are reset.
                     warn!(blkno, "OFDM frame sync lost, resyncing");
-                    minor = 0;
-                    sync_just_lost = true;
+                    cif_assembler.note_sync_loss();
                     continue;
                 }
                 SyncAction::Discard => continue,
             }
 
-            // FIC blocks 2..4 — ETSI EN 300 401 §3.2.1
             if (2..=4).contains(&blkno) {
-                // Reset quality counters at the start of each FIC frame so
-                // get_fic_quality() reflects only the current frame, not a
-                // cumulative average that masks recent degradation.
-                if blkno == 2 {
-                    my_fic_handler.reset_quality_counters();
-                }
-                let offset = (blkno - 2) as usize * bits_per_block;
-                let copy_len = bits_per_block.min(bdata.len());
-                fib_input[offset..offset + copy_len].copy_from_slice(&bdata[..copy_len]);
-
-                if blkno == 4 {
-                    // `process_fic_block` iterates over the three FIC OFDM blocks and
-                    // may complete one decoded FIC payload; keep a 4-slot validity buffer
-                    // like the original code path to avoid any out-of-bounds access.
-                    let mut valid = [false; 4];
-                    fibs_bytes.fill(0);
-                    my_fic_handler.process_fic_block(&fib_input, &mut fibs_bytes, &mut valid);
-
-                    // The three FIC OFDM blocks decode into four consecutive
-                    // 96-byte FIC payloads, one for each CIF slot in the frame.
-                    let fic_slots = replicate_fic_across_cifs(&fibs_bytes);
-                    for (i, slot_data) in fic_slots.into_iter().enumerate() {
-                        fib_vector[(index_out + i) & 0x0F] = slot_data;
-                    }
-                    minor = 0;
-                    let (hi, lo) = my_fic_handler.get_cif_count();
-                    cif_count_hi = hi;
-                    cif_count_lo = lo;
-                    if let Some(ref cb) = fic_quality_cb {
-                        let (success, total) = my_fic_handler.get_fic_counts();
-                        cb(success, total);
-                    }
-                }
+                Self::handle_fic_block(
+                    blkno,
+                    &bdata,
+                    bits_per_block,
+                    &mut fic_assembler,
+                    &mut cif_assembler,
+                    &mut my_fic_handler,
+                    &fic_quality_cb,
+                );
                 continue;
             }
 
-            // MSC blocks — ETSI EN 300 401 §14.6
-            let cif_index = ((blkno - 5) as usize) % number_of_blocks_per_cif;
-            let offset = cif_index * bits_per_block;
-            let copy_len = bits_per_block.min(bdata.len());
-            cif_in[offset..offset + copy_len].copy_from_slice(&bdata[..copy_len]);
+            if !cif_assembler.store_msc_block(blkno, &bdata, bits_per_block) {
+                continue;
+            }
 
-            // Emit one DabFrame when the last block of a CIF is received.
-            if cif_index == number_of_blocks_per_cif - 1 {
-                // Time de-interleaving — ETSI EN 300 401 §12.3.
-                //
-                // Write the current CIF slot FIRST so that D=0 positions
-                // (i % 16 == 0) read back the just-written current-frame data,
-                // not the 16-frame-old value that occupied the same circular
-                // slot. This matches the reference C++ order in RunProcessor.cpp.
-                #[allow(clippy::manual_memcpy)]
-                for i in 0..(3072 * 18) {
-                    let idx = interleave_map[i & 0x0F];
-                    cif_vector[index_out & 0x0F][i] = cif_in[i];
-                    temp[i] = cif_vector[(index_out + idx) & 0x0F][i];
-                }
-
-                // Withhold output until the 16-slot interleaver history is full.
-                if amount < 15 {
-                    amount += 1;
-                    index_out = (index_out + 1) & 0x0F;
-                    minor = 0;
-                    continue;
-                }
-
-                // No valid FIC counter yet — cannot compute ETI CIF counter.
-                if cif_count_hi < 0 || cif_count_lo < 0 {
-                    continue;
-                }
-
-                // Adjusted CIF counter — ETSI EN 300 401 §14.1
-                // CIFCountHigh ∈ [0, 19], CIFCountLow ∈ [0, 249]; both wrap modulo.
-                let (adj_hi, adj_lo) = adjust_cif_counter(cif_count_hi, cif_count_lo, minor);
-                let mut frame = DabFrame::new(fib_vector[index_out], adj_hi, adj_lo);
-
-                // Propagate OFDM sync-loss to the audio thread so it can reset
-                // SuperframeFilter before accumulating post-resync CIFs.
-                if sync_just_lost {
-                    frame.sync_lost = true;
-                    sync_just_lost = false;
-                }
-
-                // Snapshot `processing` once so the subchannel fill and the
-                // send-mode decision are always consistent for the same frame.
-                let is_processing = processing.load(Ordering::Acquire);
-                if is_processing {
-                    frame.subchannels = process_cif_to_frames(
-                        &temp,
-                        &my_fic_handler,
-                        &mut prot_table,
-                        &mut descrambler,
-                    );
-                }
-
-                // During startup (processing = false) use a non-blocking try_send to
-                // avoid stalling this thread while frame_rx is not yet drained.
-                // Once processing starts (processing = true), use a blocking send so
-                // the pipeline applies natural back-pressure on the downstream consumer.
-                let send_err = if is_processing {
-                    sender.send(frame).is_err()
-                } else {
-                    matches!(sender.try_send(frame), Err(TrySendError::Disconnected(_)))
-                };
-                if send_err {
-                    return;
-                }
-
-                index_out = (index_out + 1) & 0x0F;
-                minor += 1;
+            if Self::emit_completed_cif(
+                &processing,
+                &sender,
+                &mut cif_assembler,
+                &my_fic_handler,
+                &mut prot_table,
+                &mut descrambler,
+            ) {
+                return;
             }
         }
     }
@@ -425,6 +512,84 @@ impl Drop for DabPipeline {
 // CIF processing helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+struct SubchannelLayout {
+    start: usize,
+    size: usize,
+    out_size: usize,
+    byte_size: usize,
+}
+
+fn subchannel_layout(data: &ChannelData) -> SubchannelLayout {
+    let out_size = data.bitrate as usize * 24;
+    SubchannelLayout {
+        start: data.start_cu as usize * CU_SIZE,
+        size: data.size as usize * CU_SIZE,
+        out_size,
+        byte_size: out_size / 8,
+    }
+}
+
+fn build_msc_descrambler(out_size: usize) -> Vec<u8> {
+    // PRBS descrambler initialisation — ETSI EN 300 401 §11.1.
+    // Shift register initialised to all-ones; feedback taps at positions 8 and 4.
+    let mut shift_register = [1u8; 9];
+    let mut desc = vec![0u8; out_size];
+    for d in &mut desc {
+        let bit = shift_register[8] ^ shift_register[4];
+        for k in (1..9).rev() {
+            shift_register[k] = shift_register[k - 1];
+        }
+        shift_register[0] = bit;
+        *d = bit;
+    }
+    desc
+}
+
+fn build_protection(data: &ChannelData) -> Protection {
+    if data.uep_flag {
+        Protection::Uep(UepProtection::new(data.bitrate, data.protlev))
+    } else {
+        Protection::Eep(EepProtection::new(data.bitrate, data.protlev))
+    }
+}
+
+fn ensure_channel_runtime(
+    channel_index: usize,
+    data: &ChannelData,
+    prot_table: &mut [Option<Protection>],
+    descrambler: &mut [Option<Vec<u8>>],
+) {
+    if prot_table[channel_index].is_none() {
+        prot_table[channel_index] = Some(build_protection(data));
+    }
+    if descrambler[channel_index].is_none() {
+        descrambler[channel_index] = Some(build_msc_descrambler(subchannel_layout(data).out_size));
+    }
+}
+
+fn decode_subchannel_frame(
+    input: &[i16],
+    data: &ChannelData,
+    protection: &mut Protection,
+    descrambler: &[u8],
+) -> SubchannelFrame {
+    let layout = subchannel_layout(data);
+    let end = layout.start + layout.size;
+    let mut bit_buf = vec![0u8; layout.out_size];
+    protection.deconvolve(&input[layout.start..end], &mut bit_buf);
+
+    for (bit, prbs) in bit_buf.iter_mut().zip(descrambler.iter()) {
+        *bit ^= prbs;
+    }
+
+    let mut packed = vec![0u8; layout.byte_size];
+    pack_bits(&bit_buf, &mut packed);
+    SubchannelFrame {
+        subchid: data.id as u8,
+        data: Arc::from(packed.as_slice()),
+    }
+}
+
 /// Deconvolve, descramble and pack all active sub-channels from one CIF.
 ///
 /// Returns one `SubchannelFrame` per active sub-channel, in sub-channel ID order.
@@ -438,58 +603,20 @@ fn process_cif_to_frames(
 ) -> Vec<SubchannelFrame> {
     let mut frames = Vec::new();
 
-    for i in 0..64 {
-        let data = fic_handler.get_channel_info(i);
+    for channel_index in 0..64 {
+        let data = fic_handler.get_channel_info(channel_index);
         if !data.in_use {
             continue;
         }
 
-        // Lazily initialise protection and descrambler tables on first use.
-        if prot_table[i].is_none() {
-            let out_size = data.bitrate as usize * 24;
+        ensure_channel_runtime(channel_index, &data, prot_table, descrambler);
 
-            prot_table[i] = Some(if data.uep_flag {
-                Protection::Uep(UepProtection::new(data.bitrate, data.protlev))
-            } else {
-                Protection::Eep(EepProtection::new(data.bitrate, data.protlev))
-            });
-
-            // PRBS descrambler initialisation — ETSI EN 300 401 §11.1
-            // Shift register initialised to all-ones; feedback taps at positions 8 and 4.
-            let mut shift_register = [1u8; 9];
-            let mut desc = vec![0u8; out_size];
-            for d in desc.iter_mut() {
-                let b = shift_register[8] ^ shift_register[4];
-                for k in (1..9).rev() {
-                    shift_register[k] = shift_register[k - 1];
-                }
-                shift_register[0] = b;
-                *d = b;
-            }
-            descrambler[i] = Some(desc);
+        if let (Some(protection), Some(prbs)) = (
+            prot_table[channel_index].as_mut(),
+            descrambler[channel_index].as_deref(),
+        ) {
+            frames.push(decode_subchannel_frame(input, &data, protection, prbs));
         }
-
-        let start = data.start_cu as usize * CU_SIZE;
-        let size = data.size as usize * CU_SIZE;
-        let out_size = data.bitrate as usize * 24;
-        let byte_size = out_size / 8;
-
-        let mut bit_buf = vec![0u8; out_size];
-        if let Some(ref mut p) = prot_table[i] {
-            p.deconvolve(&input[start..start + size], &mut bit_buf);
-        }
-        if let Some(ref d) = descrambler[i] {
-            for (b, x) in bit_buf.iter_mut().zip(d.iter()) {
-                *b ^= x;
-            }
-        }
-
-        let mut packed = vec![0u8; byte_size];
-        pack_bits(&bit_buf, &mut packed);
-        frames.push(SubchannelFrame {
-            subchid: data.id as u8,
-            data: Arc::from(packed.as_slice()),
-        });
     }
 
     frames
@@ -532,6 +659,18 @@ fn replicate_fic_across_cifs(bits: &[u8]) -> [[u8; 96]; 4] {
         }
     }
     slots
+}
+
+fn send_frame_to_consumer(
+    sender: &mpsc::SyncSender<DabFrame>,
+    is_processing: bool,
+    frame: DabFrame,
+) -> bool {
+    if is_processing {
+        sender.send(frame).is_err()
+    } else {
+        matches!(sender.try_send(frame), Err(TrySendError::Disconnected(_)))
+    }
 }
 
 #[cfg(test)]
@@ -623,6 +762,31 @@ mod tests {
     }
 
     #[test]
+    fn msc_descrambler_prefix_matches_reference() {
+        let seq = build_msc_descrambler(16);
+        assert_eq!(seq, vec![0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 0]);
+    }
+
+    #[test]
+    fn subchannel_layout_uses_cu_and_bitrate_units() {
+        let data = crate::pipeline::dab_constants::ChannelData {
+            in_use: true,
+            id: 7,
+            start_cu: 3,
+            uep_flag: false,
+            protlev: 0,
+            size: 8,
+            bitrate: 32,
+        };
+
+        let layout = subchannel_layout(&data);
+        assert_eq!(layout.start, 3 * CU_SIZE);
+        assert_eq!(layout.size, 8 * CU_SIZE);
+        assert_eq!(layout.out_size, 32 * 24);
+        assert_eq!(layout.byte_size, 32 * 24 / 8);
+    }
+
+    #[test]
     fn pack_bits_empty_input_produces_no_output() {
         let bits: Vec<u8> = vec![];
         let mut out = [0u8; 0];
@@ -647,6 +811,21 @@ mod tests {
         assert_ne!(slots[0], slots[1]);
         assert_ne!(slots[1], slots[2]);
         assert_ne!(slots[2], slots[3]);
+    }
+
+    #[test]
+    fn process_cif_to_frames_ignores_unused_channels() {
+        let params = DabParams::new(1);
+        let fic_handler = FicHandler::new(&params);
+        let mut prot_table: Vec<Option<Protection>> = (0..64).map(|_| None).collect();
+        let mut descrambler: Vec<Option<Vec<u8>>> = (0..64).map(|_| None).collect();
+        let frames = process_cif_to_frames(
+            &vec![0i16; 18 * 2 * params.get_carriers()],
+            &fic_handler,
+            &mut prot_table,
+            &mut descrambler,
+        );
+        assert!(frames.is_empty());
     }
 
     // ── OfdmFrameSync ────────────────────────────────────────────────────────
@@ -888,5 +1067,75 @@ mod tests {
             "D=15 after 16 frames: expected 140 (frame 14 value), got {}",
             temp[15]
         );
+    }
+
+    #[test]
+    fn cif_assembler_waits_for_interleaver_history_before_emitting() {
+        let params = DabParams::new(1);
+        let bits_per_block = 2 * params.get_carriers();
+        let mut assembler = CifAssembler::new(bits_per_block);
+        assembler.update_cif_counter(2, 17);
+
+        for warmup_index in 0..15 {
+            let frame = assembler.finish_cif(&vec![warmup_index; 18 * bits_per_block]);
+            assert!(
+                frame.is_none(),
+                "warmup CIF {warmup_index} should not emit yet"
+            );
+        }
+
+        let frame = assembler
+            .finish_cif(&vec![123; 18 * bits_per_block])
+            .expect("frame should emit after history is full");
+        assert_eq!(frame.cif_count_hi, 2);
+        assert_eq!(frame.cif_count_lo, 17);
+    }
+
+    #[test]
+    fn cif_assembler_propagates_sync_loss_only_once() {
+        let params = DabParams::new(1);
+        let bits_per_block = 2 * params.get_carriers();
+        let mut assembler = CifAssembler::new(bits_per_block);
+        assembler.update_cif_counter(0, 0);
+
+        for _ in 0..15 {
+            let _ = assembler.finish_cif(&vec![0; 18 * bits_per_block]);
+        }
+
+        assembler.note_sync_loss();
+        let first = assembler
+            .finish_cif(&vec![1; 18 * bits_per_block])
+            .expect("first post-loss CIF should emit");
+        assert!(first.sync_lost);
+
+        let second = assembler
+            .finish_cif(&vec![2; 18 * bits_per_block])
+            .expect("next CIF should also emit");
+        assert!(!second.sync_lost);
+    }
+
+    #[test]
+    fn fic_frame_assembler_marks_frame_complete_only_on_block_four() {
+        let mut assembler = FicFrameAssembler::new(8);
+        assert!(!assembler.store_block(2, &[1; 8], 8));
+        assert!(!assembler.store_block(3, &[2; 8], 8));
+        assert!(assembler.store_block(4, &[3; 8], 8));
+    }
+
+    #[test]
+    fn fic_frame_assembler_places_blocks_in_order() {
+        let mut assembler = FicFrameAssembler::new(4);
+        let first = [1, 1, 1, 1];
+        let second = [2, 2, 2, 2];
+        let third = [3, 3, 3, 3];
+
+        assembler.store_block(2, &first, 4);
+        assembler.store_block(3, &second, 4);
+        assembler.store_block(4, &third, 4);
+
+        let combined = assembler.current_bits();
+        assert_eq!(&combined[0..4], &first);
+        assert_eq!(&combined[4..8], &second);
+        assert_eq!(&combined[8..12], &third);
     }
 }

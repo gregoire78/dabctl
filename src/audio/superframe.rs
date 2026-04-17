@@ -130,6 +130,46 @@ pub struct PadData {
     pub fpad: [u8; FPAD_LEN],
 }
 
+fn parse_superframe_header(header_byte: u8) -> SuperframeFormat {
+    SuperframeFormat {
+        dac_rate: header_byte & 0x40 != 0,
+        sbr_flag: header_byte & 0x20 != 0,
+        aac_channel_mode: header_byte & 0x10 != 0,
+        ps_flag: header_byte & 0x08 != 0,
+        mpeg_surround_config: header_byte & 0x07,
+    }
+}
+
+fn build_au_start_table(sf: &[u8], format: &SuperframeFormat, sf_len: usize) -> Vec<usize> {
+    let num_aus = format.number_of_access_units();
+    let mut au_start = vec![0usize; num_aus + 1];
+
+    // ETSI TS 102 563 §5.2: first AU start depends on the DAB+ header mode.
+    au_start[0] = match (format.dac_rate, format.sbr_flag) {
+        (true, true) => 6,
+        (true, false) => 11,
+        (false, true) => 5,
+        (false, false) => 8,
+    };
+
+    // Final pseudo-boundary after RS parity removal.
+    au_start[num_aus] = sf_len / 120 * 110;
+
+    au_start[1] = (sf[3] as usize) << 4 | (sf[4] as usize) >> 4;
+    if num_aus >= 3 {
+        au_start[2] = ((sf[4] & 0x0F) as usize) << 8 | sf[5] as usize;
+    }
+    if num_aus >= 4 {
+        au_start[3] = (sf[6] as usize) << 4 | (sf[7] as usize) >> 4;
+    }
+    if num_aus == 6 {
+        au_start[4] = ((sf[7] & 0x0F) as usize) << 8 | sf[8] as usize;
+        au_start[5] = (sf[9] as usize) << 4 | (sf[10] as usize) >> 4;
+    }
+
+    au_start
+}
+
 /// Superframe filter: accumulates logical frames, RS-decodes, extracts AUs
 pub struct SuperframeFilter {
     rs_dec: RsDecoder,
@@ -173,25 +213,39 @@ impl SuperframeFilter {
     /// Returns decoded access units + optional PAD + optional format change.
     pub fn feed(&mut self, data: &[u8]) -> SuperframeResult {
         let len = data.len();
-
-        // Initialize frame length on first frame
-        if self.frame_len == 0 {
-            if len < 10 || !(5 * len).is_multiple_of(120) {
-                return SuperframeResult::default();
-            }
-            self.frame_len = len;
-            self.sf_len = 5 * len;
-            self.sf_raw = vec![0u8; self.sf_len];
-            self.sf = vec![0u8; self.sf_len];
+        if !self.initialize_window_if_needed(len) {
+            return SuperframeResult::default();
         }
 
         if len != self.frame_len {
             return SuperframeResult::default();
         }
 
-        // Circular write: overwrite the oldest slot.
-        // Eliminates the copy_within(frame_len.., 0) that previously shifted
-        // 4 × frame_len bytes on every frame in the sliding-window path.
+        if !self.push_frame_to_window(data) {
+            return SuperframeResult::default();
+        }
+
+        self.linearize_window();
+        self.decode_current_window()
+    }
+
+    fn initialize_window_if_needed(&mut self, len: usize) -> bool {
+        if self.frame_len != 0 {
+            return true;
+        }
+
+        if len < 10 || !(5 * len).is_multiple_of(120) {
+            return false;
+        }
+
+        self.frame_len = len;
+        self.sf_len = 5 * len;
+        self.sf_raw = vec![0u8; self.sf_len];
+        self.sf = vec![0u8; self.sf_len];
+        true
+    }
+
+    fn push_frame_to_window(&mut self, data: &[u8]) -> bool {
         let slot = self.write_head;
         self.sf_raw[slot * self.frame_len..(slot + 1) * self.frame_len].copy_from_slice(data);
         self.write_head = (self.write_head + 1) % 5;
@@ -199,12 +253,11 @@ impl SuperframeFilter {
             self.frame_count += 1;
         }
 
-        if self.frame_count < 5 {
-            return SuperframeResult::default();
-        }
+        self.frame_count >= 5
+    }
 
-        // Linearize circular buffer into self.sf (oldest frame first).
-        // read_head = write_head (points to slot that was written longest ago).
+    fn linearize_window(&mut self) {
+        // Oldest frame first so RS and fire-code validation see a linear superframe.
         let read_head = self.write_head;
         for i in 0..5 {
             let src_slot = (read_head + i) % 5;
@@ -212,14 +265,15 @@ impl SuperframeFilter {
             let dst = i * self.frame_len..(i + 1) * self.frame_len;
             self.sf[dst].copy_from_slice(&self.sf_raw[src]);
         }
+    }
+
+    fn decode_current_window(&mut self) -> SuperframeResult {
         let (rs_corrected, rs_uncorrectable) = self.rs_dec.decode_superframe(&mut self.sf);
         if rs_corrected > 0 || rs_uncorrectable {
             trace!(rs_corrected, rs_uncorrectable, "SUPERFRAME: RS decode");
         }
 
-        // Check fire code sync
         if !self.check_sync() {
-            // Log the CRC mismatch to help diagnose systematic vs random failures.
             let crc_stored = (self.sf[0] as u16) << 8 | self.sf[1] as u16;
             let crc_calced = crc_fire_code().calc(&self.sf[2..11]);
             trace!(
@@ -227,8 +281,6 @@ impl SuperframeFilter {
                 calc = format_args!("0x{:04X}", crc_calced),
                 "SUPERFRAME: fire code CRC fail"
             );
-            // Slide by 1 frame: set count to 4 so we collect just one more frame.
-            // write_head already points to the next slot to overwrite.
             self.frame_count = 4;
             return SuperframeResult {
                 sync_fail: true,
@@ -238,21 +290,14 @@ impl SuperframeFilter {
             };
         }
 
-        // Check format change
-        let mut format_changed = false;
-        if self.format.is_none() || self.format_raw != self.sf[2] {
-            self.format_raw = self.sf[2];
-            self.format = Some(self.parse_format());
-            format_changed = true;
-        }
-
-        let format = self.format.as_ref().unwrap();
+        let format_changed = self.refresh_format_if_needed();
+        let format = self
+            .format
+            .as_ref()
+            .expect("superframe format must exist after refresh");
         let num_aus = format.number_of_access_units();
-
-        // Extract AU boundaries
         let au_start = self.compute_au_starts(num_aus);
 
-        // Decode each AU
         let mut access_units = Vec::with_capacity(num_aus);
         let mut pad_data = Vec::new();
         let mut au_crc_fail: usize = 0;
@@ -266,11 +311,10 @@ impl SuperframeFilter {
 
             let au_data = &self.sf[start..end];
             let au_len = au_data.len();
-
-            // CRC check
             if au_len < 2 {
                 continue;
             }
+
             let crc_stored = (au_data[au_len - 2] as u16) << 8 | au_data[au_len - 1] as u16;
             let crc_calced = self.crc_ccitt.calc(&au_data[..au_len - 2]);
             if crc_stored != crc_calced {
@@ -283,22 +327,19 @@ impl SuperframeFilter {
                 data: au_payload.to_vec(),
             });
 
-            // Extract PAD from AAC AU (Data Stream Element)
             if let Some(pad) = extract_pad_from_au(au_payload) {
                 pad_data.push(pad);
             }
         }
 
-        // Reset for next superframe
         self.frame_count = 0;
 
         let decoded = access_units.len();
-        let expected = num_aus;
-        if decoded < expected {
+        if decoded < num_aus {
             trace!(
                 decoded,
-                expected,
-                dropped = expected - decoded,
+                expected = num_aus,
+                dropped = num_aus - decoded,
                 "SUPERFRAME: AU CRC failures"
             );
         }
@@ -331,45 +372,26 @@ impl SuperframeFilter {
         crc_stored == crc_calced
     }
 
-    fn parse_format(&self) -> SuperframeFormat {
-        SuperframeFormat {
-            dac_rate: self.sf[2] & 0x40 != 0,
-            sbr_flag: self.sf[2] & 0x20 != 0,
-            aac_channel_mode: self.sf[2] & 0x10 != 0,
-            ps_flag: self.sf[2] & 0x08 != 0,
-            mpeg_surround_config: self.sf[2] & 0x07,
+    fn refresh_format_if_needed(&mut self) -> bool {
+        if self.format.is_none() || self.format_raw != self.sf[2] {
+            self.format_raw = self.sf[2];
+            self.format = Some(self.parse_format());
+            true
+        } else {
+            false
         }
     }
 
-    fn compute_au_starts(&self, num_aus: usize) -> Vec<usize> {
-        let sf = &self.sf;
-        let format = self.format.as_ref().unwrap();
-        let mut au_start = vec![0usize; num_aus + 1];
+    fn parse_format(&self) -> SuperframeFormat {
+        parse_superframe_header(self.sf[2])
+    }
 
-        // Premier offset AU selon le format
-        au_start[0] = match (format.dac_rate, format.sbr_flag) {
-            (true, true) => 6,
-            (true, false) => 11,
-            (false, true) => 5,
-            (false, false) => 8,
-        };
-
-        // Dernière pseudo-limite AU (après RS strip)
-        au_start[num_aus] = self.sf_len / 120 * 110;
-
-        // Offsets AU depuis l'en-tête superframe
-        au_start[1] = (sf[3] as usize) << 4 | (sf[4] as usize) >> 4;
-        if num_aus >= 3 {
-            au_start[2] = ((sf[4] & 0x0F) as usize) << 8 | sf[5] as usize;
-        }
-        if num_aus >= 4 {
-            au_start[3] = (sf[6] as usize) << 4 | (sf[7] as usize) >> 4;
-        }
-        if num_aus == 6 {
-            au_start[4] = ((sf[7] & 0x0F) as usize) << 8 | sf[8] as usize;
-            au_start[5] = (sf[9] as usize) << 4 | (sf[10] as usize) >> 4;
-        }
-
+    fn compute_au_starts(&self, _num_aus: usize) -> Vec<usize> {
+        let format = self
+            .format
+            .as_ref()
+            .expect("format must be known before AU parsing");
+        let mut au_start = build_au_start_table(&self.sf, format, self.sf_len);
         self.sanitize_au_starts(&mut au_start);
         au_start
     }
@@ -683,5 +705,48 @@ mod tests {
         filter.sanitize_au_starts(&mut starts);
 
         assert_eq!(starts, vec![11, 220, 220, 410, 410, 550, 550]);
+    }
+
+    #[test]
+    fn parse_superframe_header_decodes_audio_flags() {
+        let format = parse_superframe_header(0x7B);
+        assert!(format.dac_rate);
+        assert!(format.sbr_flag);
+        assert!(format.aac_channel_mode);
+        assert!(format.ps_flag);
+        assert_eq!(format.mpeg_surround_config, 0x03);
+    }
+
+    #[test]
+    fn build_au_start_table_extracts_header_offsets_for_three_aus() {
+        let format = SuperframeFormat {
+            dac_rate: true,
+            sbr_flag: true,
+            aac_channel_mode: true,
+            ps_flag: false,
+            mpeg_surround_config: 0,
+        };
+        let mut sf = vec![0u8; 600];
+        sf[3] = 0x02;
+        sf[4] = 0x31;
+        sf[5] = 0x90;
+
+        let starts = build_au_start_table(&sf, &format, 600);
+        assert_eq!(starts, vec![6, 35, 400, 550]);
+    }
+
+    #[test]
+    fn push_frame_to_window_becomes_ready_on_fifth_frame() {
+        let mut filter = SuperframeFilter::new();
+        filter.frame_len = 120;
+        filter.sf_len = 600;
+        filter.sf_raw = vec![0u8; 600];
+        filter.sf = vec![0u8; 600];
+        let frame = vec![0u8; 120];
+
+        for _ in 0..4 {
+            assert!(!filter.push_frame_to_window(&frame));
+        }
+        assert!(filter.push_frame_to_window(&frame));
     }
 }

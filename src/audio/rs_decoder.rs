@@ -10,6 +10,32 @@ const NN: usize = 255;
 const PAD: usize = 135;
 const BLOCK_SIZE: usize = 120;
 
+fn superframe_column_count(sf_len: usize) -> usize {
+    sf_len / BLOCK_SIZE
+}
+
+fn copy_interleaved_column(
+    sf: &[u8],
+    subch_index: usize,
+    column_index: usize,
+    packet: &mut [u8; BLOCK_SIZE],
+) {
+    for row in 0..BLOCK_SIZE {
+        packet[row] = sf[row * subch_index + column_index];
+    }
+}
+
+fn write_interleaved_column(
+    sf: &mut [u8],
+    subch_index: usize,
+    column_index: usize,
+    packet: &[u8; BLOCK_SIZE],
+) {
+    for row in 0..BLOCK_SIZE {
+        sf[row * subch_index + column_index] = packet[row];
+    }
+}
+
 /// GF(2^8) arithmetic tables
 struct GfTables {
     alpha_to: [u8; 256],
@@ -95,34 +121,32 @@ impl RsDecoder {
     /// `sf` is the full superframe buffer, `sf_len` must be a multiple of 120.
     /// Returns (total_corrections, has_uncorrectable_errors).
     pub fn decode_superframe(&self, sf: &mut [u8]) -> (usize, bool) {
-        let subch_index = sf.len() / BLOCK_SIZE;
+        let subch_index = superframe_column_count(sf.len());
         let mut total_corr = 0;
         let mut uncorr = false;
-
         let mut rs_packet = [0u8; BLOCK_SIZE];
 
-        for i in 0..subch_index {
-            // De-interleave: collect column i
-            for pos in 0..BLOCK_SIZE {
-                rs_packet[pos] = sf[pos * subch_index + i];
-            }
-
-            // Decode
-            match self.decode_rs(&mut rs_packet) {
-                Some(corr_count) => {
-                    total_corr += corr_count;
-                    // Write corrections back
-                    for pos in 0..BLOCK_SIZE {
-                        sf[pos * subch_index + i] = rs_packet[pos];
-                    }
-                }
-                None => {
-                    uncorr = true;
-                }
+        for column_index in 0..subch_index {
+            match self.decode_superframe_column(sf, subch_index, column_index, &mut rs_packet) {
+                Some(corr_count) => total_corr += corr_count,
+                None => uncorr = true,
             }
         }
 
         (total_corr, uncorr)
+    }
+
+    fn decode_superframe_column(
+        &self,
+        sf: &mut [u8],
+        subch_index: usize,
+        column_index: usize,
+        rs_packet: &mut [u8; BLOCK_SIZE],
+    ) -> Option<usize> {
+        copy_interleaved_column(sf, subch_index, column_index, rs_packet);
+        let corr_count = self.decode_rs(rs_packet)?;
+        write_interleaved_column(sf, subch_index, column_index, rs_packet);
+        Some(corr_count)
     }
 
     /// Decode a single RS(120,110) block. Returns number of corrections or None if uncorrectable.
@@ -512,5 +536,29 @@ mod tests {
         assert_eq!(corr, 2);
         assert!(!uncorr);
         assert_eq!(&sf[..110], &original[..]);
+    }
+
+    #[test]
+    fn superframe_column_count_matches_interleaved_width() {
+        assert_eq!(superframe_column_count(BLOCK_SIZE), 1);
+        assert_eq!(superframe_column_count(BLOCK_SIZE * 3), 3);
+    }
+
+    #[test]
+    fn interleaved_column_round_trip_preserves_bytes() {
+        let mut sf = vec![0u8; BLOCK_SIZE * 2];
+        for row in 0..BLOCK_SIZE {
+            sf[row * 2] = row as u8;
+            sf[row * 2 + 1] = (200 + row) as u8;
+        }
+
+        let mut packet = [0u8; BLOCK_SIZE];
+        copy_interleaved_column(&sf, 2, 1, &mut packet);
+        assert_eq!(packet[0], 200);
+        assert_eq!(packet[10], 210);
+
+        packet[0] = 7;
+        write_interleaved_column(&mut sf, 2, 1, &packet);
+        assert_eq!(sf[1], 7);
     }
 }

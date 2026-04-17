@@ -19,6 +19,14 @@ pub const CONTENT_SUB_TYPE_HEADER_UPDATE: u16 = 0x000;
 const CRC_LEN: usize = 2;
 const MAX_OBJECT_CACHE: usize = 15;
 
+struct ParsedMotDataGroup<'a> {
+    dg_type: u8,
+    last_seg: bool,
+    seg_number: usize,
+    transport_id: u16,
+    segment_data: &'a [u8],
+}
+
 /// A completed MOT file (slideshow image or other object).
 #[derive(Debug, Clone)]
 pub struct MotFile {
@@ -398,50 +406,37 @@ impl MotManager {
         self.objects.insert(transport_id, MotObject::new());
     }
 
+    fn parse_transport_group<'a>(&self, dg: &'a [u8]) -> Option<ParsedMotDataGroup<'a>> {
+        let mut offset = 0usize;
+        let dg_type = self.parse_dg_header(dg, &mut offset)?;
+        let (last_seg, seg_number, transport_id) = self.parse_session_header(dg, &mut offset)?;
+        let seg_size = self.parse_segmentation_header(dg, &mut offset)?;
+        Some(ParsedMotDataGroup {
+            dg_type,
+            last_seg,
+            seg_number,
+            transport_id: transport_id as u16,
+            segment_data: &dg[offset..offset + seg_size],
+        })
+    }
+
     /// Process a completed MOT Data Group. Returns Some(MotFile) if object is complete and displayable.
     pub fn handle_data_group(&mut self, dg: &[u8]) -> (Option<MotFile>, f64) {
-        let mut offset = 0;
-
-        // Parse Data Group header
-        let dg_type = match self.parse_dg_header(dg, &mut offset) {
-            Some(t) => t,
+        let parsed = match self.parse_transport_group(dg) {
+            Some(parsed) => parsed,
             None => {
-                tracing::debug!("MOT DG header parse failed (dg_len={})", dg.len());
-                return (None, -1.0);
-            }
-        };
-
-        // Parse session header
-        let (last_seg, seg_number, transport_id) = match self.parse_session_header(dg, &mut offset)
-        {
-            Some(v) => v,
-            None => {
-                tracing::debug!("MOT session header parse failed");
-                return (None, -1.0);
-            }
-        };
-
-        // Parse segmentation header
-        let seg_size = match self.parse_segmentation_header(dg, &mut offset) {
-            Some(s) => s,
-            None => {
-                tracing::trace!(
-                    "MOT segmentation header parse failed (dg_type={}, seg_number={}, tid={})",
-                    dg_type,
-                    seg_number,
-                    transport_id
-                );
+                tracing::debug!("MOT transport metadata parse failed (dg_len={})", dg.len());
                 return (None, -1.0);
             }
         };
 
         tracing::trace!(
             "MOT segment: type={} seg={} last={} tid={} size={}",
-            dg_type,
-            seg_number,
-            last_seg,
-            transport_id,
-            seg_size
+            parsed.dg_type,
+            parsed.seg_number,
+            parsed.last_seg,
+            parsed.transport_id,
+            parsed.segment_data.len()
         );
 
         // DABstar keeps multiple MOT objects alive by transport ID instead of
@@ -449,16 +444,15 @@ impl MotManager {
         // This prevents interleaved header/body delivery from dropping pending
         // slides on real multiplexes. ETSI EN 301 234 §5.3 allows concurrent
         // MOT transport contexts distinguished by transportId.
-        let transport_id = transport_id as u16;
-        let is_header = dg_type == 3;
+        let is_header = parsed.dg_type == 3;
 
         let (display, fraction, file, overflowed) = {
-            let object = self.object_for_transport(transport_id);
+            let object = self.object_for_transport(parsed.transport_id);
             object.add_segment(
                 is_header,
-                seg_number,
-                last_seg,
-                &dg[offset..offset + seg_size],
+                parsed.seg_number,
+                parsed.last_seg,
+                parsed.segment_data,
             );
 
             let overflowed = object.header_received()
@@ -486,9 +480,9 @@ impl MotManager {
         if overflowed {
             tracing::debug!(
                 "MOT body overflow on transport {}: resetting current object",
-                transport_id
+                parsed.transport_id
             );
-            self.reset_transport(transport_id);
+            self.reset_transport(parsed.transport_id);
             return (None, -1.0);
         }
 
@@ -894,6 +888,29 @@ mod tests {
 
         let (result, _) = mgr.handle_data_group(&dg);
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_transport_group_returns_metadata_and_segment_slice() {
+        let mgr = MotManager::new();
+        let dg = build_mot_dg(4, 3, true, 0x1234, &[0xDE, 0xAD, 0xBE]);
+
+        let parsed = mgr.parse_transport_group(&dg).expect("group must parse");
+
+        assert_eq!(parsed.dg_type, 4);
+        assert_eq!(parsed.seg_number, 3);
+        assert!(parsed.last_seg);
+        assert_eq!(parsed.transport_id, 0x1234);
+        assert_eq!(parsed.segment_data, &[0xDE, 0xAD, 0xBE]);
+    }
+
+    #[test]
+    fn test_parse_dg_header_rejects_missing_required_flags() {
+        let mgr = MotManager::new();
+        let mut offset = 0usize;
+        let dg = [0x00u8, 0x00u8];
+
+        assert!(mgr.parse_dg_header(&dg, &mut offset).is_none());
     }
 
     #[test]

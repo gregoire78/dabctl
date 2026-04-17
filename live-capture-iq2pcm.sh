@@ -7,10 +7,10 @@
 #   TRACE_OFDM : 1/true/on pour activer --trace-ofdm, sinon désactivé par défaut
 set -e
 
-CHANNEL="${1:-8C}"
-SID="${2:-0xF201}"
-#CHANNEL="${1:-6C}"
-#SID="${2:-0xF2F8}"
+#CHANNEL="${1:-8C}"
+#SID="${2:-0xF201}"
+CHANNEL="${1:-6C}"
+SID="${2:-0xF2F8}"
 GAIN="${3:-}"
 TRACE_OFDM="${4:-0}"
 RUN_TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
@@ -53,7 +53,7 @@ esac
 # Pipeline direct : RTL-SDR → décodage DAB/DAB+ → PCM
 # sudo closes inherited fd >= 3; open fd 3 inside the sudo shell.
 # RUST_LOG is passed explicitly because sudo strips the environment.
-sudo RUST_LOG="info,dabctl=${RUST_LOG:-debug}" sh -c 'exec 3>pad_metadata.json; exec "$@"' _ \
+sudo RUST_LOG="info,dabctl=${RUST_LOG:-trace}" sh -c 'exec 3>pad_metadata.json; exec "$@"' _ \
   ../target/release/dabctl \
   -C "$CHANNEL" \
   -s "$SID" \

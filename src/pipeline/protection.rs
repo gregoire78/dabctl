@@ -3,6 +3,11 @@
 use crate::pipeline::prot_tables::get_pcodes;
 use crate::pipeline::viterbi_handler::ViterbiSpiral;
 
+struct EepProfilePlan {
+    out_size: usize,
+    segments: [(usize, usize); 2],
+}
+
 pub struct EepProtection {
     index_table: Vec<bool>,
     viterbi_block: Vec<i16>,
@@ -33,129 +38,125 @@ fn count_marked_positions(index_table: &[bool]) -> usize {
     index_table.iter().filter(|&&b| b).count()
 }
 
+fn resolve_eep_profile(bit_rate: i16, prot_level: i16) -> Option<EepProfilePlan> {
+    if !is_valid_protection_bit_rate(bit_rate) {
+        return None;
+    }
+
+    let out_size = 24 * bit_rate as usize;
+    let segments = if (prot_level & (1 << 2)) == 0 {
+        match prot_level & 0x03 {
+            0 => [(6 * bit_rate as usize / 8 - 3, 23), (3, 22)],
+            1 if bit_rate == 8 => [(5, 12), (1, 11)],
+            1 => [
+                (2 * bit_rate as usize / 8 - 3, 13),
+                (4 * bit_rate as usize / 8 + 3, 12),
+            ],
+            2 => [(6 * bit_rate as usize / 8 - 3, 7), (3, 6)],
+            3 => [
+                (4 * bit_rate as usize / 8 - 3, 2),
+                (2 * bit_rate as usize / 8 + 3, 1),
+            ],
+            _ => return None,
+        }
+    } else {
+        match prot_level & 0x03 {
+            3 => [(24 * bit_rate as usize / 32 - 3, 1), (3, 0)],
+            2 => [(24 * bit_rate as usize / 32 - 3, 3), (3, 2)],
+            1 => [(24 * bit_rate as usize / 32 - 3, 5), (3, 4)],
+            0 => [(24 * bit_rate as usize / 32 - 3, 9), (3, 8)],
+            _ => return None,
+        }
+    };
+
+    Some(EepProfilePlan { out_size, segments })
+}
+
+fn mark_puncture_segment(
+    index_table: &mut [bool],
+    cursor: &mut usize,
+    repetitions: usize,
+    pcode_idx: usize,
+) {
+    let pcode = get_pcodes(pcode_idx);
+    for _ in 0..repetitions {
+        for j in 0..128 {
+            if pcode[j % 32] != 0 {
+                index_table[*cursor] = true;
+            }
+            *cursor += 1;
+        }
+    }
+}
+
+fn mark_tail_bits(index_table: &mut [bool], cursor: &mut usize) {
+    let pcode = get_pcodes(7);
+    for &value in pcode.iter().take(24) {
+        if value != 0 {
+            index_table[*cursor] = true;
+        }
+        *cursor += 1;
+    }
+}
+
+fn build_index_table(out_size: usize, segments: &[(usize, usize)]) -> Vec<bool> {
+    let mut index_table = vec![false; out_size * 4 + 24];
+    let mut cursor = 0usize;
+
+    for &(repetitions, pcode_idx) in segments {
+        mark_puncture_segment(&mut index_table, &mut cursor, repetitions, pcode_idx);
+    }
+    mark_tail_bits(&mut index_table, &mut cursor);
+
+    index_table
+}
+
+fn build_empty_profile() -> (Vec<bool>, Vec<i16>, ViterbiSpiral) {
+    (vec![false; 24], vec![0i16; 24], ViterbiSpiral::new(0))
+}
+
+fn deconvolve_protected_bits(
+    index_table: &[bool],
+    viterbi_block: &mut [i16],
+    viterbi: &mut ViterbiSpiral,
+    input: &[i16],
+    out_buffer: &mut [u8],
+) {
+    depuncture_soft_bits(index_table, input, viterbi_block);
+    viterbi.deconvolve(viterbi_block, out_buffer);
+}
+
 impl EepProtection {
     pub fn new(bit_rate: i16, prot_level: i16) -> Self {
-        if !is_valid_protection_bit_rate(bit_rate) {
+        let Some(profile) = resolve_eep_profile(bit_rate, prot_level) else {
             tracing::warn!(
                 bit_rate,
                 prot_level,
                 "EEP invalid bit_rate, creating empty protection profile"
             );
+            let (index_table, viterbi_block, viterbi) = build_empty_profile();
             return EepProtection {
-                index_table: vec![false; 24],
-                viterbi_block: vec![0i16; 24],
-                viterbi: ViterbiSpiral::new(0),
+                index_table,
+                viterbi_block,
+                viterbi,
             };
-        }
-
-        let out_size = 24 * bit_rate as usize;
-        let mut index_table = vec![false; out_size * 4 + 24];
-        let mut viterbi_counter = 0usize;
-
-        let (l1, l2, pi1_idx, pi2_idx);
-
-        if (prot_level & (1 << 2)) == 0 {
-            // A profiles
-            match prot_level & 0x03 {
-                0 => {
-                    l1 = 6 * bit_rate as usize / 8 - 3;
-                    l2 = 3;
-                    pi1_idx = 23;
-                    pi2_idx = 22;
-                }
-                1 => {
-                    if bit_rate == 8 {
-                        l1 = 5;
-                        l2 = 1;
-                        pi1_idx = 12;
-                        pi2_idx = 11;
-                    } else {
-                        l1 = 2 * bit_rate as usize / 8 - 3;
-                        l2 = 4 * bit_rate as usize / 8 + 3;
-                        pi1_idx = 13;
-                        pi2_idx = 12;
-                    }
-                }
-                2 => {
-                    l1 = 6 * bit_rate as usize / 8 - 3;
-                    l2 = 3;
-                    pi1_idx = 7;
-                    pi2_idx = 6;
-                }
-                3 => {
-                    l1 = 4 * bit_rate as usize / 8 - 3;
-                    l2 = 2 * bit_rate as usize / 8 + 3;
-                    pi1_idx = 2;
-                    pi2_idx = 1;
-                }
-                _ => unreachable!(),
-            }
-        } else {
-            // B profiles
-            match prot_level & 0x03 {
-                3 => {
-                    l1 = 24 * bit_rate as usize / 32 - 3;
-                    l2 = 3;
-                    pi1_idx = 1;
-                    pi2_idx = 0;
-                }
-                2 => {
-                    l1 = 24 * bit_rate as usize / 32 - 3;
-                    l2 = 3;
-                    pi1_idx = 3;
-                    pi2_idx = 2;
-                }
-                1 => {
-                    l1 = 24 * bit_rate as usize / 32 - 3;
-                    l2 = 3;
-                    pi1_idx = 5;
-                    pi2_idx = 4;
-                }
-                0 => {
-                    l1 = 24 * bit_rate as usize / 32 - 3;
-                    l2 = 3;
-                    pi1_idx = 9;
-                    pi2_idx = 8;
-                }
-                _ => unreachable!(),
-            }
-        }
-
-        let pi_x_idx = 7; // PI_8
-
-        for _ in 0..l1 {
-            for j in 0..128 {
-                if get_pcodes(pi1_idx)[j % 32] != 0 {
-                    index_table[viterbi_counter] = true;
-                }
-                viterbi_counter += 1;
-            }
-        }
-        for _ in 0..l2 {
-            for j in 0..128 {
-                if get_pcodes(pi2_idx)[j % 32] != 0 {
-                    index_table[viterbi_counter] = true;
-                }
-                viterbi_counter += 1;
-            }
-        }
-        for i in 0..24 {
-            if get_pcodes(pi_x_idx)[i] != 0 {
-                index_table[viterbi_counter] = true;
-            }
-            viterbi_counter += 1;
-        }
+        };
 
         EepProtection {
-            index_table,
-            viterbi_block: vec![0i16; out_size * 4 + 24],
-            viterbi: ViterbiSpiral::new(out_size),
+            index_table: build_index_table(profile.out_size, &profile.segments),
+            viterbi_block: vec![0i16; profile.out_size * 4 + 24],
+            viterbi: ViterbiSpiral::new(profile.out_size),
         }
     }
 
     pub fn deconvolve(&mut self, v: &[i16], out_buffer: &mut [u8]) {
-        depuncture_soft_bits(&self.index_table, v, &mut self.viterbi_block);
-        self.viterbi.deconvolve(&self.viterbi_block, out_buffer);
+        deconvolve_protected_bits(
+            &self.index_table,
+            &mut self.viterbi_block,
+            &mut self.viterbi,
+            v,
+            out_buffer,
+        );
     }
 }
 
@@ -974,10 +975,11 @@ impl UepProtection {
                 prot_level,
                 "UEP invalid bit_rate, creating empty protection profile"
             );
+            let (index_table, viterbi_block, viterbi) = build_empty_profile();
             return UepProtection {
-                index_table: vec![false; 24],
-                viterbi_block: vec![0i16; 24],
-                viterbi: ViterbiSpiral::new(0),
+                index_table,
+                viterbi_block,
+                viterbi,
             };
         }
 
@@ -989,10 +991,11 @@ impl UepProtection {
                     prot_level,
                     "UEP bitrate not found in ETSI table, creating empty protection profile"
                 );
+                let (index_table, viterbi_block, viterbi) = build_empty_profile();
                 return UepProtection {
-                    index_table: vec![false; 24],
-                    viterbi_block: vec![0i16; 24],
-                    viterbi: ViterbiSpiral::new(0),
+                    index_table,
+                    viterbi_block,
+                    viterbi,
                 };
             }
         };
@@ -1012,70 +1015,30 @@ impl UepProtection {
         let out_size = 24 * bit_rate as usize;
         let p = &PROFILE_TABLE[index];
 
-        let mut index_table = vec![false; out_size * 4 + 24];
-        let mut vc = 0usize;
-
-        let pi1 = get_pcodes((p.pi1 - 1) as usize);
-        let pi2 = get_pcodes((p.pi2 - 1) as usize);
-        let pi3 = get_pcodes((p.pi3 - 1) as usize);
-        let pi4 = if p.pi4 > 0 {
-            Some(get_pcodes((p.pi4 - 1) as usize))
-        } else {
-            None
-        };
-        let pi_x = get_pcodes(7);
-
-        for _ in 0..p.l1 {
-            for j in 0..128 {
-                if pi1[j % 32] != 0 {
-                    index_table[vc] = true;
-                }
-                vc += 1;
-            }
-        }
-        for _ in 0..p.l2 {
-            for j in 0..128 {
-                if pi2[j % 32] != 0 {
-                    index_table[vc] = true;
-                }
-                vc += 1;
-            }
-        }
-        for _ in 0..p.l3 {
-            for j in 0..128 {
-                if pi3[j % 32] != 0 {
-                    index_table[vc] = true;
-                }
-                vc += 1;
-            }
-        }
-        if let Some(pi4) = pi4 {
-            for _ in 0..p.l4 {
-                for j in 0..128 {
-                    if pi4[j % 32] != 0 {
-                        index_table[vc] = true;
-                    }
-                    vc += 1;
-                }
-            }
-        }
-        for &px in pi_x.iter().take(24) {
-            if px != 0 {
-                index_table[vc] = true;
-            }
-            vc += 1;
+        let mut segments = vec![
+            (p.l1 as usize, (p.pi1 - 1) as usize),
+            (p.l2 as usize, (p.pi2 - 1) as usize),
+            (p.l3 as usize, (p.pi3 - 1) as usize),
+        ];
+        if p.pi4 > 0 {
+            segments.push((p.l4 as usize, (p.pi4 - 1) as usize));
         }
 
         UepProtection {
-            index_table,
+            index_table: build_index_table(out_size, &segments),
             viterbi_block: vec![0i16; out_size * 4 + 24],
             viterbi: ViterbiSpiral::new(out_size),
         }
     }
 
     pub fn deconvolve(&mut self, v: &[i16], out_buffer: &mut [u8]) {
-        depuncture_soft_bits(&self.index_table, v, &mut self.viterbi_block);
-        self.viterbi.deconvolve(&self.viterbi_block, out_buffer);
+        deconvolve_protected_bits(
+            &self.index_table,
+            &mut self.viterbi_block,
+            &mut self.viterbi,
+            v,
+            out_buffer,
+        );
     }
 }
 
@@ -1121,6 +1084,22 @@ mod tests {
         // 64 kbps exists in table, but level 99 does not.
         let idx = resolve_uep_profile_index(64, 99).expect("must find same-bitrate fallback");
         assert_eq!(PROFILE_TABLE[idx].bit_rate, 64);
+    }
+
+    #[test]
+    fn resolve_eep_profile_returns_expected_a_level_layout() {
+        let profile = resolve_eep_profile(64, 0).expect("A1 profile should resolve");
+        assert_eq!(profile.out_size, 24 * 64);
+        assert_eq!(profile.segments[0], (6 * 64usize / 8 - 3, 23));
+        assert_eq!(profile.segments[1], (3, 22));
+    }
+
+    #[test]
+    fn resolve_eep_profile_returns_expected_b_level_layout() {
+        let profile = resolve_eep_profile(64, 7).expect("B4 profile should resolve");
+        assert_eq!(profile.out_size, 24 * 64);
+        assert_eq!(profile.segments[0], (24 * 64usize / 32 - 3, 1));
+        assert_eq!(profile.segments[1], (3, 0));
     }
 
     #[test]

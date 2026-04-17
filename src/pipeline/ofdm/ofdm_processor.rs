@@ -65,9 +65,51 @@ fn apply_coarse_correction(current_coarse: i32, correction_hz: i32) -> (i32, boo
     (updated, correction_hz != 0)
 }
 
-fn phase_threshold_pair(threshold_1: i16, _threshold_2: i16) -> (i16, i16) {
+fn plan_coarse_correction(
+    fic_quality_percent: i16,
+    reused_previous_start: bool,
+    current_coarse: i32,
+    correction_hz: i32,
+) -> Option<CoarseCorrectionPlan> {
+    if reused_previous_start || !coarse_afc_needed(fic_quality_percent) {
+        return None;
+    }
+
+    let (updated_coarse_hz, step_applied) = apply_coarse_correction(current_coarse, correction_hz);
+    Some(CoarseCorrectionPlan {
+        updated_coarse_hz,
+        step_applied,
+        reset_clock_error: step_applied,
+    })
+}
+
+fn plan_null_symbol_metrics(
+    prev_snr_db: f32,
+    signal_level: f32,
+    null_avg_level: f32,
+    report_count: usize,
+    coarse_corrector: i32,
+    fine_corrector: f32,
+) -> NullSymbolMetricsPlan {
+    let safe_null_level = null_avg_level.max(1e-6);
+    let next_snr_db =
+        0.9 * prev_snr_db + 0.1 * 20.0 * ((signal_level + 0.005) / safe_null_level).log10();
+    let next_report_count = report_count + 1;
+    let emit_report = next_report_count > 10;
+
+    NullSymbolMetricsPlan {
+        snr_db: next_snr_db,
+        next_report_count: if emit_report { 0 } else { next_report_count },
+        emit_report,
+        offset_hz: coarse_corrector + fine_corrector as i32,
+    }
+}
+
+fn phase_threshold_pair(threshold_1: i16, threshold_2: i16) -> (i16, i16) {
     let acq_threshold = threshold_1.clamp(OFDM_THRESHOLD_MIN, OFDM_THRESHOLD_MAX);
-    let track_threshold = (2 * acq_threshold).clamp(OFDM_THRESHOLD_MIN, OFDM_THRESHOLD_MAX);
+    let track_threshold = threshold_2
+        .clamp(OFDM_THRESHOLD_MIN, OFDM_THRESHOLD_MAX)
+        .max(acq_threshold);
 
     (acq_threshold, track_threshold)
 }
@@ -84,12 +126,61 @@ fn resolve_sync_start_index(
         return Some(raw_index as usize);
     }
 
-    if allow_single_miss_reuse && *tracking_miss_budget > 0 && last_sync_start_index < t_u {
-        *tracking_miss_budget -= 1;
-        return Some(last_sync_start_index);
+    let _ = (last_sync_start_index, t_u, allow_single_miss_reuse);
+    None
+}
+
+fn plan_time_sync_follow_up(
+    state: Option<TimeSyncState>,
+    attempts: i16,
+) -> Result<TimeSyncFollowUpPlan, ProcessorError> {
+    match state {
+        Some(TimeSyncState::TimeSyncEstablished) => Ok(TimeSyncFollowUpPlan {
+            established: true,
+            attempts: 0,
+            emit_warning: false,
+        }),
+        Some(TimeSyncState::NoDipFound) => {
+            let next_attempts = attempts + 1;
+            Ok(TimeSyncFollowUpPlan {
+                established: false,
+                attempts: next_attempts,
+                emit_warning: next_attempts >= 8,
+            })
+        }
+        Some(TimeSyncState::NoEndOfDipFound) => Ok(TimeSyncFollowUpPlan {
+            established: false,
+            attempts: 0,
+            emit_warning: false,
+        }),
+        None => Err(ProcessorError::Stopped),
+    }
+}
+
+fn build_sync_alignment_plan(
+    raw_start_index: i32,
+    last_sync_start_index: usize,
+    tracking_miss_budget: &mut u8,
+    t_u: usize,
+    allow_single_miss_reuse: bool,
+) -> Option<SyncAlignmentPlan> {
+    let start_index = resolve_sync_start_index(
+        raw_start_index,
+        last_sync_start_index,
+        tracking_miss_budget,
+        t_u,
+        allow_single_miss_reuse,
+    )?;
+
+    if start_index >= t_u {
+        return None;
     }
 
-    None
+    Some(SyncAlignmentPlan {
+        start_index,
+        samples_to_fetch: start_index,
+        reused_previous_start: raw_start_index < 0 && allow_single_miss_reuse,
+    })
 }
 
 fn turn_phase_to_first_quadrant(mut phase: f32) -> f32 {
@@ -112,6 +203,48 @@ fn norm_to_length_one(value: Complex32) -> Complex32 {
         value / norm
     } else {
         Complex32::new(1.0, 0.0)
+    }
+}
+
+fn carrier_weight(mean_level: f32, mean_sigma_sq: f32, null_noise: f32, mean_power: f32) -> f32 {
+    let null_n = null_noise.max(NOISE_FLOOR_MIN);
+    let signal_p = (mean_power - null_n).max(SIGNAL_NOISE_MIN_RATIO);
+    mean_level / mean_sigma_sq.max(1e-4) / ((null_n / signal_p) + 1.0)
+}
+
+fn soft_bit_from_component(component: f32, mean_value: f32) -> i16 {
+    let soft_scale = -100.0 / mean_value.max(1e-3);
+    (component * soft_scale).clamp(-127.0, 127.0) as i16
+}
+
+fn plan_symbol_read(
+    coarse_corrector: i32,
+    fine_corrector: f32,
+    frame_sample_count: usize,
+    t_s: usize,
+) -> SymbolReadPlan {
+    SymbolReadPlan {
+        phase_hz: coarse_corrector + fine_corrector as i32,
+        next_frame_sample_count: frame_sample_count + t_s,
+    }
+}
+
+fn accumulate_prefix_correlation(block_buf: &[Complex32], t_u: usize, t_s: usize) -> Complex32 {
+    let mut freq_corr = Complex32::new(0.0, 0.0);
+    for i in t_u..t_s {
+        freq_corr += block_buf[i] * block_buf[i - t_u].conj();
+    }
+    freq_corr
+}
+
+fn plan_frame_rest_metrics(
+    frame_sample_count: usize,
+    null_symbol_len: usize,
+    coarse_step_applied: bool,
+) -> FrameRestMetricsPlan {
+    FrameRestMetricsPlan {
+        next_frame_sample_count: frame_sample_count + null_symbol_len,
+        should_integrate_clock_error: !coarse_step_applied,
     }
 }
 
@@ -157,9 +290,12 @@ const SIGNAL_NOISE_MIN_RATIO: f32 = 0.1;
 /// during brief fades or false locks.
 const MIN_CP_CORR_NORM: f32 = 0.05;
 
-/// Allow exactly one negative PRS tracking miss to reuse the last known good
-/// start index before forcing a full reacquisition.
-const TRACKING_MISS_TOLERANCE: u8 = 1;
+/// Do not reuse the previous PRS start index after a tracking miss.
+///
+/// Live RF captures showed that holding a stale alignment for even one missed
+/// phase-reference symbol causes RS/fire-code failures, metadata blackout, and
+/// rapid sync loss. Force immediate reacquisition instead.
+const TRACKING_MISS_TOLERANCE: u8 = 0;
 
 /// Maximum per-carrier phase back-rotation used by the DABstar-style symbol
 /// decoder loop.
@@ -226,6 +362,9 @@ pub struct OfdmProcessor {
     phase_corr_const: Vec<f32>,
     /// Start index found during the latest phase-reference evaluation.
     last_sync_start_index: usize,
+    /// True when the current symbol-0 alignment reused the previous start index
+    /// after a negative PRS miss, so coarse AFC should not trust this frame.
+    last_sync_alignment_reused: bool,
     // Callbacks
     sync_signal: Option<Box<dyn Fn(bool) + Send>>,
     show_snr: Option<Box<dyn Fn(i16) + Send>>,
@@ -252,6 +391,121 @@ enum SyncState {
     EvalSyncSymbol,
     /// Decode the remainder of the frame once symbol 0 is aligned.
     ProcessRestOfFrame,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TimeSyncFollowUpPlan {
+    established: bool,
+    attempts: i16,
+    emit_warning: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SyncAlignmentPlan {
+    start_index: usize,
+    samples_to_fetch: usize,
+    reused_previous_start: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CoarseCorrectionPlan {
+    updated_coarse_hz: i32,
+    step_applied: bool,
+    reset_clock_error: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SymbolReadPlan {
+    phase_hz: i32,
+    next_frame_sample_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FrameRestMetricsPlan {
+    next_frame_sample_count: usize,
+    should_integrate_clock_error: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct NullSymbolMetricsPlan {
+    snr_db: f32,
+    next_report_count: usize,
+    emit_report: bool,
+    offset_hz: i32,
+}
+
+struct OfdmRunBuffers {
+    ibits: Vec<i16>,
+    null_buf: Vec<Complex32>,
+    check_buf: Vec<Complex32>,
+    block_buf: Vec<Complex32>,
+}
+
+impl OfdmRunBuffers {
+    fn new(carriers: usize, t_null: usize, t_u: usize, t_s: usize) -> Self {
+        Self {
+            ibits: vec![0i16; 2 * carriers],
+            null_buf: vec![Complex32::new(0.0, 0.0); t_null],
+            check_buf: vec![Complex32::new(0.0, 0.0); t_u],
+            block_buf: vec![Complex32::new(0.0, 0.0); t_s],
+        }
+    }
+}
+
+struct SyncLoopControl {
+    state: SyncState,
+    time_syncer: TimeSyncer,
+    attempts: i16,
+    tracking_miss_budget: u8,
+    acq_threshold: i16,
+    track_threshold: i16,
+    sync_threshold: i16,
+}
+
+impl SyncLoopControl {
+    fn new(threshold_1: i16, threshold_2: i16) -> Self {
+        let (acq_threshold, track_threshold) = phase_threshold_pair(threshold_1, threshold_2);
+        Self {
+            state: SyncState::WaitForTimeSyncMarker,
+            time_syncer: TimeSyncer::default(),
+            attempts: 0,
+            tracking_miss_budget: TRACKING_MISS_TOLERANCE,
+            acq_threshold,
+            track_threshold,
+            sync_threshold: acq_threshold,
+        }
+    }
+
+    fn state(&self) -> SyncState {
+        self.state
+    }
+
+    fn current_threshold(&self) -> i16 {
+        self.sync_threshold
+    }
+
+    fn is_tracking_threshold(&self) -> bool {
+        self.sync_threshold == self.track_threshold
+    }
+
+    fn on_time_sync_established(&mut self) {
+        self.attempts = 0;
+        self.sync_threshold = self.acq_threshold;
+        self.state = SyncState::EvalSyncSymbol;
+    }
+
+    fn on_sync_symbol_aligned(&mut self) {
+        self.state = SyncState::ProcessRestOfFrame;
+    }
+
+    fn on_frame_processed(&mut self) {
+        self.sync_threshold = self.track_threshold;
+        self.state = SyncState::EvalSyncSymbol;
+    }
+
+    fn on_sync_lost(&mut self) {
+        self.state = SyncState::WaitForTimeSyncMarker;
+    }
 }
 
 impl OfdmProcessor {
@@ -331,6 +585,7 @@ impl OfdmProcessor {
             clock_err_hz: 0.0,
             phase_corr_const,
             last_sync_start_index: 0,
+            last_sync_alignment_reused: false,
             sync_signal: None,
             show_snr: None,
             show_freq_offset: None,
@@ -468,16 +723,25 @@ impl OfdmProcessor {
         self.clock_err_hz = 0.0;
     }
 
-    fn prepare_for_acquisition_retry(&mut self) {
+    fn prepare_for_acquisition_retry(&mut self, cold_reset: bool) {
         self.reset_tracking_loop();
-        // DABstar resets the OFDM decoder state when re-entering
-        // WAIT_FOR_TIME_SYNC_MARKER, so stale reference carriers and per-bin
-        // soft-bit statistics from the failed lock do not poison the next
-        // acquisition attempt. ETSI EN 300 401 §14.8 acquisition/tracking.
-        self.reset_llr_state();
+
+        // Clear volatile symbol-to-symbol state on every reacquisition attempt
+        // so a stale reference symbol cannot poison the next PRS/data frame.
         self.reference_phase.fill(Complex32::new(0.0, 0.0));
         self.r1_buf.fill(Complex32::new(0.0, 0.0));
-        self.last_sync_start_index = 0;
+
+        // For a brief sync loss at otherwise healthy RF, keep the long-lived
+        // power/noise estimators warm so the decoder can relock like DABstar
+        // without re-learning the whole channel from scratch. Only cold-reset
+        // those statistics when acquisition has already failed for more than
+        // one attempt or at startup. ETSI EN 300 401 §14.8 acquisition/tracking.
+        self.last_sync_alignment_reused = false;
+
+        if cold_reset {
+            self.reset_llr_state();
+            self.last_sync_start_index = 0;
+        }
     }
 
     fn store_reference_symbol_0(&mut self) {
@@ -487,17 +751,27 @@ impl OfdmProcessor {
     }
 
     fn update_coarse_frequency_from_sync_symbol_0(&mut self) -> bool {
-        if !coarse_afc_needed(self.current_fic_quality_percent()) {
-            return false;
-        }
-
         let correction = self
             .phase_synchronizer
-            .estimate_offset(&self.ofdm_buffer[..self.t_u]);
+            .estimate_carrier_offset_from_sync_symbol_0(&self.ofdm_buffer[..self.t_u]);
         let prev = self.coarse_corrector;
-        let (updated_coarse, coarse_step_applied) =
-            apply_coarse_correction(self.coarse_corrector, correction);
-        self.coarse_corrector = updated_coarse;
+
+        let Some(plan) = plan_coarse_correction(
+            self.current_fic_quality_percent(),
+            self.last_sync_alignment_reused,
+            self.coarse_corrector,
+            correction,
+        ) else {
+            if self.last_sync_alignment_reused {
+                trace!(
+                    start_index = self.last_sync_start_index,
+                    "OFDM: skipping coarse AFC on reused sync alignment"
+                );
+            }
+            return false;
+        };
+
+        self.coarse_corrector = plan.updated_coarse_hz;
 
         if correction != PhaseReference::IDX_NOT_FOUND && self.coarse_corrector != prev {
             trace!(
@@ -508,11 +782,34 @@ impl OfdmProcessor {
             );
         }
 
-        if coarse_step_applied {
+        if plan.reset_clock_error {
             self.clock_err_hz = 0.0;
         }
 
-        coarse_step_applied
+        plan.step_applied
+    }
+
+    fn process_symbol_block(
+        &mut self,
+        device: &RtlsdrHandler,
+        dab_pipeline: &mut DabPipeline,
+        symbol_count: u16,
+        frame_sample_count: usize,
+        ibits: &mut [i16],
+        block_buf: &mut [Complex32],
+    ) -> Result<(Complex32, usize), ProcessorError> {
+        let plan = plan_symbol_read(
+            self.coarse_corrector,
+            self.fine_corrector,
+            frame_sample_count,
+            self.t_s,
+        );
+        self.get_samples(device, block_buf, plan.phase_hz)?;
+
+        let freq_corr = accumulate_prefix_correlation(block_buf, self.t_u, self.t_s);
+        self.process_block(block_buf, ibits);
+        dab_pipeline.process_block(ibits, symbol_count as i16);
+        Ok((freq_corr, plan.next_frame_sample_count))
     }
 
     fn process_ofdm_symbols_1_to_l(
@@ -522,22 +819,23 @@ impl OfdmProcessor {
         ibits: &mut [i16],
         block_buf: &mut [Complex32],
     ) -> Result<(Complex32, usize), ProcessorError> {
-        let mut freq_corr = Complex32::new(0.0, 0.0);
+        let mut total_freq_corr = Complex32::new(0.0, 0.0);
         let mut frame_sample_count = self.t_u + self.last_sync_start_index;
 
         for symbol_count in 2..=(self.nr_blocks as u16) {
-            let phase = self.coarse_corrector + self.fine_corrector as i32;
-            self.get_samples(device, block_buf, phase)?;
-            frame_sample_count += self.t_s;
-
-            for i in self.t_u..self.t_s {
-                freq_corr += block_buf[i] * block_buf[i - self.t_u].conj();
-            }
-            self.process_block(block_buf, ibits);
-            dab_pipeline.process_block(ibits, symbol_count as i16);
+            let (freq_corr, next_frame_sample_count) = self.process_symbol_block(
+                device,
+                dab_pipeline,
+                symbol_count,
+                frame_sample_count,
+                ibits,
+                block_buf,
+            )?;
+            total_freq_corr += freq_corr;
+            frame_sample_count = next_frame_sample_count;
         }
 
-        Ok((freq_corr, frame_sample_count))
+        Ok((total_freq_corr, frame_sample_count))
     }
 
     fn update_fine_frequency_from_cyclic_prefix(&mut self, freq_corr: Complex32) {
@@ -576,20 +874,25 @@ impl OfdmProcessor {
         let phase = self.coarse_corrector + self.fine_corrector as i32;
         self.get_samples(device, null_buf, phase)?;
 
-        let sum: f32 = null_buf.iter().map(|s| s.norm()).sum::<f32>() / self.t_null as f32;
-        self.snr_estimate =
-            0.9 * self.snr_estimate + 0.1 * 20.0 * ((self.s_level + 0.005) / sum).log10();
-        self.snr_report_count += 1;
+        let null_avg_level = null_buf.iter().map(|s| s.norm()).sum::<f32>() / self.t_null as f32;
+        let telemetry = plan_null_symbol_metrics(
+            self.snr_estimate,
+            self.s_level,
+            null_avg_level,
+            self.snr_report_count,
+            self.coarse_corrector,
+            self.fine_corrector,
+        );
+        self.snr_estimate = telemetry.snr_db;
+        self.snr_report_count = telemetry.next_report_count;
         self.update_null_noise(null_buf);
 
-        if self.snr_report_count > 10 {
-            self.snr_report_count = 0;
+        if telemetry.emit_report {
             self.emit_snr(self.snr_estimate as i16);
-            let offset_hz = self.coarse_corrector + self.fine_corrector as i32;
-            self.emit_freq_offset(offset_hz);
+            self.emit_freq_offset(telemetry.offset_hz);
             debug!(
                 snr_db = self.snr_estimate,
-                freq_offset_hz = offset_hz,
+                freq_offset_hz = telemetry.offset_hz,
                 "OFDM telemetry updated"
             );
         }
@@ -676,17 +979,18 @@ impl OfdmProcessor {
                 self.mean_sigma_sq[i] * (1.0 - MEAN_POWER_ALPHA) + sigma_sq * MEAN_POWER_ALPHA;
 
             if fft_bin.norm() > 0.0 {
-                let null_n = self.null_noise[i].max(NOISE_FLOOR_MIN);
-                let signal_p = (self.mean_power[i] - null_n).max(SIGNAL_NOISE_MIN_RATIO);
-                let weight =
-                    mean_level / self.mean_sigma_sq[i].max(1e-4) / ((null_n / signal_p) + 1.0);
+                let weight = carrier_weight(
+                    mean_level,
+                    self.mean_sigma_sq[i],
+                    self.null_noise[i],
+                    self.mean_power[i],
+                );
 
                 let r1 = norm_to_length_one(fft_bin) * weight;
                 self.r1_buf[i] = r1;
 
-                let soft_scale = -100.0 / self.mean_value.max(1e-3);
-                ibits[i] = (r1.re * soft_scale).clamp(-127.0, 127.0) as i16;
-                ibits[self.carriers + i] = (r1.im * soft_scale).clamp(-127.0, 127.0) as i16;
+                ibits[i] = soft_bit_from_component(r1.re, self.mean_value);
+                ibits[self.carriers + i] = soft_bit_from_component(r1.im, self.mean_value);
                 sum += r1.norm();
             } else {
                 self.r1_buf[i] = Complex32::new(0.0, 0.0);
@@ -764,46 +1068,38 @@ impl OfdmProcessor {
         }
     }
 
-    fn wait_for_time_sync_marker(
+    fn state_wait_for_time_sync_marker(
         &mut self,
         device: &RtlsdrHandler,
         time_syncer: &mut TimeSyncer,
         attempts: &mut i16,
     ) -> Result<bool, ProcessorError> {
-        self.prepare_for_acquisition_retry();
+        self.prepare_for_acquisition_retry(*attempts > 0);
 
-        match time_syncer.read_samples_until_end_of_level_drop(
-            self.s_level,
-            self.t_f,
-            self.t_null,
-            || self.get_sample(device, 0).ok().map(jan_abs),
-        ) {
-            Some(TimeSyncState::TimeSyncEstablished) => {
-                *attempts = 0;
-                Ok(true)
-            }
-            Some(TimeSyncState::NoDipFound) => {
-                *attempts += 1;
-                if *attempts >= 8 {
-                    warn!(
-                        "OFDM: no null symbol detected after {} attempts \
-                         — signal absent or very weak",
-                        attempts
-                    );
-                    self.emit_sync_signal(false);
-                    *attempts = 0;
-                }
-                Ok(false)
-            }
-            Some(TimeSyncState::NoEndOfDipFound) => {
-                *attempts = 0;
-                Ok(false)
-            }
-            None => Err(ProcessorError::Stopped),
+        let plan = plan_time_sync_follow_up(
+            time_syncer.read_samples_until_end_of_level_drop(
+                self.s_level,
+                self.t_f,
+                self.t_null,
+                || self.get_sample(device, 0).ok().map(jan_abs),
+            ),
+            *attempts,
+        )?;
+
+        *attempts = if plan.emit_warning { 0 } else { plan.attempts };
+        if plan.emit_warning {
+            warn!(
+                "OFDM: no null symbol detected after {} attempts \
+                 — signal absent or very weak",
+                plan.attempts
+            );
+            self.emit_sync_signal(false);
         }
+
+        Ok(plan.established)
     }
 
-    fn eval_sync_symbol(
+    fn state_eval_sync_symbol(
         &mut self,
         device: &RtlsdrHandler,
         threshold: i16,
@@ -817,9 +1113,9 @@ impl OfdmProcessor {
 
         let raw_start_index = self
             .phase_synchronizer
-            .find_index(&self.ofdm_buffer[..self.t_u], threshold);
+            .correlate_with_phase_ref_and_find_max_peak(&self.ofdm_buffer[..self.t_u], threshold);
 
-        let Some(start_index) = resolve_sync_start_index(
+        let Some(plan) = build_sync_alignment_plan(
             raw_start_index,
             self.last_sync_start_index,
             tracking_miss_budget,
@@ -829,25 +1125,44 @@ impl OfdmProcessor {
             return Ok(false);
         };
 
-        if raw_start_index < 0 && allow_single_miss_reuse {
+        if plan.reused_previous_start {
             trace!(
-                start_index,
+                start_index = plan.start_index,
                 "OFDM: reusing last good start index after one tracking miss"
             );
         }
 
-        self.last_sync_start_index = start_index;
-        let next_ofdm_buffer_idx = self.t_u - start_index;
-        self.ofdm_buffer.copy_within(start_index..self.t_u, 0);
+        self.last_sync_alignment_reused = plan.reused_previous_start;
+        self.last_sync_start_index = plan.start_index;
+        let next_ofdm_buffer_idx = self.t_u - plan.start_index;
+        self.ofdm_buffer.copy_within(plan.start_index..self.t_u, 0);
 
-        let needed = self.t_u - next_ofdm_buffer_idx;
-        self.get_samples(device, &mut check_buf[..needed], phase)?;
-        self.ofdm_buffer[next_ofdm_buffer_idx..self.t_u].copy_from_slice(&check_buf[..needed]);
+        self.get_samples(device, &mut check_buf[..plan.samples_to_fetch], phase)?;
+        self.ofdm_buffer[next_ofdm_buffer_idx..self.t_u]
+            .copy_from_slice(&check_buf[..plan.samples_to_fetch]);
 
         Ok(true)
     }
 
-    fn process_frame_rest(
+    fn finish_frame_rest_metrics(
+        &mut self,
+        device: &RtlsdrHandler,
+        null_buf: &mut [Complex32],
+        freq_corr: Complex32,
+        frame_sample_count: usize,
+        coarse_step_applied: bool,
+    ) -> Result<(), ProcessorError> {
+        self.update_fine_frequency_from_cyclic_prefix(freq_corr);
+        let null_symbol_len = self.process_null_symbol(device, null_buf)?;
+        let plan =
+            plan_frame_rest_metrics(frame_sample_count, null_symbol_len, coarse_step_applied);
+        if plan.should_integrate_clock_error {
+            self.integrate_clock_error_from_frame_length(plan.next_frame_sample_count, false);
+        }
+        Ok(())
+    }
+
+    fn state_process_rest_of_frame(
         &mut self,
         device: &RtlsdrHandler,
         dab_pipeline: &mut DabPipeline,
@@ -873,11 +1188,15 @@ impl OfdmProcessor {
             return Ok(false);
         }
 
-        let (freq_corr, mut frame_sample_count) =
+        let (freq_corr, frame_sample_count) =
             self.process_ofdm_symbols_1_to_l(device, dab_pipeline, ibits, block_buf)?;
-        self.update_fine_frequency_from_cyclic_prefix(freq_corr);
-        frame_sample_count += self.process_null_symbol(device, null_buf)?;
-        self.integrate_clock_error_from_frame_length(frame_sample_count, coarse_step_applied);
+        self.finish_frame_rest_metrics(
+            device,
+            null_buf,
+            freq_corr,
+            frame_sample_count,
+            coarse_step_applied,
+        )?;
 
         self.emit_sync_signal(true);
         Ok(true)
@@ -892,18 +1211,8 @@ impl OfdmProcessor {
     /// The DAB synchronisation algorithm (null detection, phase-reference
     /// correlation, coarse/fine AFC, LLR soft-bits) is unchanged.
     pub fn run(&mut self, device: &RtlsdrHandler, dab_pipeline: &mut DabPipeline) {
-        let mut attempts: i16 = 0;
-        let mut ibits = vec![0i16; 2 * self.carriers];
-        let mut null_buf = vec![Complex32::new(0.0, 0.0); self.t_null];
-        let mut check_buf = vec![Complex32::new(0.0, 0.0); self.t_u];
-        let mut block_buf = vec![Complex32::new(0.0, 0.0); self.t_s];
-        let mut time_syncer = TimeSyncer::default();
-
-        // ETSI EN 300 401 §8.4: acquisition and tracking use configured
-        // fixed phase-correlation thresholds.
-        let (acq_threshold, track_threshold) =
-            phase_threshold_pair(self.threshold_1, self.threshold_2);
-        let mut sync_threshold = acq_threshold;
+        let mut buffers = OfdmRunBuffers::new(self.carriers, self.t_null, self.t_u, self.t_s);
+        let mut control = SyncLoopControl::new(self.threshold_1, self.threshold_2);
 
         // DABstar warms the signal-level estimator with a short burst of raw
         // useful-symbol reads before entering the state machine.
@@ -912,72 +1221,64 @@ impl OfdmProcessor {
         self.fine_corrector = 0.0;
         self.clock_err_hz = 0.0;
         self.nco_phasor = Complex32::new(1.0, 0.0);
+        self.last_sync_alignment_reused = false;
         self.reset_llr_state();
         self.reference_phase.fill(Complex32::new(0.0, 0.0));
         self.r1_buf.fill(Complex32::new(0.0, 0.0));
         if self
-            .discard_samples(device, 20 * self.t_u, &mut block_buf)
+            .discard_samples(device, 20 * self.t_u, &mut buffers.block_buf)
             .is_err()
         {
             return;
         }
 
-        let mut state = SyncState::WaitForTimeSyncMarker;
-        let mut tracking_miss_budget = TRACKING_MISS_TOLERANCE;
-
         loop {
-            match state {
+            match control.state() {
                 SyncState::WaitForTimeSyncMarker => {
-                    match self.wait_for_time_sync_marker(device, &mut time_syncer, &mut attempts) {
-                        Ok(true) => {
-                            sync_threshold = acq_threshold;
-                            state = SyncState::EvalSyncSymbol;
-                        }
+                    match self.state_wait_for_time_sync_marker(
+                        device,
+                        &mut control.time_syncer,
+                        &mut control.attempts,
+                    ) {
+                        Ok(true) => control.on_time_sync_established(),
                         Ok(false) => {}
                         Err(_) => return,
                     }
                 }
 
                 SyncState::EvalSyncSymbol => {
-                    match self.eval_sync_symbol(
+                    match self.state_eval_sync_symbol(
                         device,
-                        sync_threshold,
-                        sync_threshold == track_threshold,
-                        &mut tracking_miss_budget,
-                        &mut check_buf,
+                        control.current_threshold(),
+                        control.is_tracking_threshold(),
+                        &mut control.tracking_miss_budget,
+                        &mut buffers.check_buf,
                     ) {
-                        Ok(true) => {
-                            state = SyncState::ProcessRestOfFrame;
-                        }
+                        Ok(true) => control.on_sync_symbol_aligned(),
                         Ok(false) => {
-                            if sync_threshold == track_threshold {
+                            if control.is_tracking_threshold() {
                                 warn!("OFDM: synchronisation lost — returning to acquisition");
                             } else {
                                 trace!(
                                     "OFDM: phase ref not found (correlation below threshold), retry"
                                 );
                             }
-                            state = SyncState::WaitForTimeSyncMarker;
+                            control.on_sync_lost();
                         }
                         Err(_) => return,
                     }
                 }
 
                 SyncState::ProcessRestOfFrame => {
-                    match self.process_frame_rest(
+                    match self.state_process_rest_of_frame(
                         device,
                         dab_pipeline,
-                        &mut ibits,
-                        &mut null_buf,
-                        &mut block_buf,
+                        &mut buffers.ibits,
+                        &mut buffers.null_buf,
+                        &mut buffers.block_buf,
                     ) {
-                        Ok(true) => {
-                            sync_threshold = track_threshold;
-                            state = SyncState::EvalSyncSymbol;
-                        }
-                        Ok(false) => {
-                            state = SyncState::WaitForTimeSyncMarker;
-                        }
+                        Ok(true) => control.on_frame_processed(),
+                        Ok(false) => control.on_sync_lost(),
                         Err(_) => return,
                     }
                 }
@@ -1270,7 +1571,7 @@ mod tests {
     }
 
     #[test]
-    fn acquisition_retry_resets_dabstar_decoder_state() {
+    fn brief_reacquisition_keeps_long_lived_estimators_warm() {
         let running = Arc::new(AtomicBool::new(true));
         let mut proc = OfdmProcessor::new(1, 2, 5, running);
         proc.mean_power[0] = 42.0;
@@ -1283,10 +1584,33 @@ mod tests {
         proc.fine_corrector = -33.5;
         proc.coarse_corrector = 2_000;
 
-        proc.prepare_for_acquisition_retry();
+        proc.prepare_for_acquisition_retry(false);
 
         assert_eq!(proc.fine_corrector, -33.5);
         assert_eq!(proc.coarse_corrector, 2_000);
+        assert_eq!(proc.clock_err_hz, 0.0);
+        assert_eq!(proc.mean_power[0], 42.0);
+        assert_eq!(proc.null_noise[0], 7.0);
+        assert_eq!(proc.integ_abs_phase[0], 0.1);
+        assert_eq!(proc.reference_phase[0], Complex32::new(0.0, 0.0));
+        assert_eq!(proc.r1_buf[0], Complex32::new(0.0, 0.0));
+        assert_eq!(proc.last_sync_start_index, 384);
+    }
+
+    #[test]
+    fn cold_acquisition_retry_resets_decoder_state() {
+        let running = Arc::new(AtomicBool::new(true));
+        let mut proc = OfdmProcessor::new(1, 2, 5, running);
+        proc.mean_power[0] = 42.0;
+        proc.null_noise[0] = 7.0;
+        proc.clock_err_hz = 12.5;
+        proc.integ_abs_phase[0] = 0.1;
+        proc.reference_phase[0] = Complex32::new(1.0, 2.0);
+        proc.r1_buf[0] = Complex32::new(3.0, 4.0);
+        proc.last_sync_start_index = 384;
+
+        proc.prepare_for_acquisition_retry(true);
+
         assert_eq!(proc.clock_err_hz, 0.0);
         assert_eq!(proc.mean_power[0], 0.0);
         assert_eq!(proc.null_noise[0], 0.0);
@@ -1297,25 +1621,43 @@ mod tests {
     }
 
     #[test]
-    fn phase_threshold_pair_doubles_the_acquisition_threshold_like_dabstar() {
+    fn phase_threshold_pair_uses_the_explicit_tracking_threshold() {
         let (acq, track) = phase_threshold_pair(2, 5);
         assert_eq!(acq, 2);
-        assert_eq!(track, 4);
+        assert_eq!(track, 5);
     }
 
     #[test]
-    fn phase_threshold_pair_uses_two_times_acq_for_tracking() {
-        let (acq, track) = phase_threshold_pair(3, 6);
-        assert_eq!(acq, 3);
-        assert_eq!(track, 6);
+    fn phase_threshold_pair_clamps_both_thresholds_independently() {
+        let (acq, track) = phase_threshold_pair(0, 99);
+        assert_eq!(acq, OFDM_THRESHOLD_MIN);
+        assert_eq!(track, OFDM_THRESHOLD_MAX);
     }
 
     #[test]
-    fn single_tracking_miss_can_reuse_last_good_start_once() {
+    fn tracking_miss_forces_immediate_reacquisition() {
         let mut budget = TRACKING_MISS_TOLERANCE;
         let reused = resolve_sync_start_index(-1, 384, &mut budget, 2048, true);
-        assert_eq!(reused, Some(384));
-        assert_eq!(budget, 0);
+        assert_eq!(reused, None);
+        assert_eq!(budget, TRACKING_MISS_TOLERANCE);
+    }
+
+    #[test]
+    fn repeated_negative_tracking_misses_keep_reacquiring() {
+        let mut budget = TRACKING_MISS_TOLERANCE;
+        assert_eq!(
+            resolve_sync_start_index(-1, 384, &mut budget, 2048, true),
+            None
+        );
+        assert_eq!(
+            resolve_sync_start_index(-1, 384, &mut budget, 2048, true),
+            None
+        );
+        assert_eq!(
+            resolve_sync_start_index(-1, 384, &mut budget, 2048, true),
+            None
+        );
+        assert_eq!(budget, TRACKING_MISS_TOLERANCE);
     }
 
     #[test]
@@ -1394,5 +1736,152 @@ mod tests {
         assert!((clamp_phase_error(10.0) - limit).abs() < 1e-6);
         assert!((clamp_phase_error(-10.0) + limit).abs() < 1e-6);
         assert!((clamp_phase_error(0.1) - 0.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sync_loop_control_promotes_to_tracking_after_good_frame() {
+        let mut control = SyncLoopControl::new(3, 6);
+        assert_eq!(control.state(), SyncState::WaitForTimeSyncMarker);
+
+        control.on_time_sync_established();
+        assert_eq!(control.state(), SyncState::EvalSyncSymbol);
+        assert_eq!(control.current_threshold(), 3);
+
+        control.on_frame_processed();
+        assert_eq!(control.state(), SyncState::EvalSyncSymbol);
+        assert_eq!(control.current_threshold(), 6);
+    }
+
+    #[test]
+    fn sync_loop_control_returns_to_acquisition_after_sync_loss() {
+        let mut control = SyncLoopControl::new(3, 6);
+        control.on_time_sync_established();
+        control.on_frame_processed();
+
+        control.on_sync_lost();
+        assert_eq!(control.state(), SyncState::WaitForTimeSyncMarker);
+        assert_eq!(control.current_threshold(), 6);
+    }
+
+    #[test]
+    fn time_sync_follow_up_warns_after_eighth_missed_null() {
+        let plan = match plan_time_sync_follow_up(Some(TimeSyncState::NoDipFound), 7) {
+            Ok(plan) => plan,
+            Err(_) => panic!("time sync planning should succeed for NoDipFound"),
+        };
+        assert!(!plan.established);
+        assert_eq!(plan.attempts, 8);
+        assert!(plan.emit_warning);
+    }
+
+    #[test]
+    fn time_sync_follow_up_resets_attempts_after_partial_dip() {
+        let plan = match plan_time_sync_follow_up(Some(TimeSyncState::NoEndOfDipFound), 4) {
+            Ok(plan) => plan,
+            Err(_) => panic!("time sync planning should succeed for NoEndOfDipFound"),
+        };
+        assert!(!plan.established);
+        assert_eq!(plan.attempts, 0);
+        assert!(!plan.emit_warning);
+    }
+
+    #[test]
+    fn sync_alignment_plan_rejects_tracking_miss_reuse() {
+        let mut budget = TRACKING_MISS_TOLERANCE;
+        let plan = build_sync_alignment_plan(-1, 384, &mut budget, 2048, true);
+        assert!(plan.is_none());
+        assert_eq!(budget, TRACKING_MISS_TOLERANCE);
+    }
+
+    #[test]
+    fn sync_alignment_plan_uses_detected_start_when_available() {
+        let mut budget = 0;
+        let plan = build_sync_alignment_plan(512, 384, &mut budget, 2048, false).unwrap();
+        assert_eq!(plan.start_index, 512);
+        assert_eq!(plan.samples_to_fetch, 512);
+        assert!(!plan.reused_previous_start);
+        assert_eq!(budget, TRACKING_MISS_TOLERANCE);
+    }
+
+    #[test]
+    fn coarse_correction_plan_respects_fic_quality_gate() {
+        assert!(plan_coarse_correction(80, false, 500, 1_000).is_none());
+
+        let plan = plan_coarse_correction(0, false, 500, 1_000)
+            .expect("coarse correction should be considered at low FIC quality");
+        assert_eq!(plan.updated_coarse_hz, 1_500);
+        assert!(plan.step_applied);
+        assert!(plan.reset_clock_error);
+    }
+
+    #[test]
+    fn coarse_correction_plan_skips_reused_tracking_alignment() {
+        assert!(plan_coarse_correction(0, true, 500, 1_000).is_none());
+    }
+
+    #[test]
+    fn null_symbol_metrics_plan_stays_finite_and_reports_on_schedule() {
+        let plan = plan_null_symbol_metrics(0.0, 0.0, 0.0, 10, 200, -33.5);
+        assert!(plan.snr_db.is_finite());
+        assert!(plan.emit_report);
+        assert_eq!(plan.next_report_count, 0);
+        assert_eq!(plan.offset_hz, 167);
+    }
+
+    #[test]
+    fn store_reference_symbol_0_captures_fft_phase_history() {
+        let running = Arc::new(AtomicBool::new(true));
+        let mut proc = OfdmProcessor::new(1, 2, 5, running);
+        proc.ofdm_buffer[..proc.t_u].fill(Complex32::new(1.0, 0.0));
+
+        proc.store_reference_symbol_0();
+
+        assert!(
+            proc.reference_phase
+                .iter()
+                .any(|&value| value != Complex32::new(0.0, 0.0)),
+            "reference phase should be populated from symbol 0"
+        );
+    }
+
+    #[test]
+    fn soft_bit_from_component_is_clamped_and_signed() {
+        assert_eq!(soft_bit_from_component(10.0, 1.0), -127);
+        assert_eq!(soft_bit_from_component(-10.0, 1.0), 127);
+        assert_eq!(soft_bit_from_component(0.0, 1.0), 0);
+    }
+
+    #[test]
+    fn carrier_weight_stays_finite_with_zero_noise_floor() {
+        let weight = carrier_weight(1.0, 0.0, 0.0, 0.0);
+        assert!(weight.is_finite());
+        assert!(weight > 0.0);
+    }
+
+    #[test]
+    fn symbol_read_plan_uses_combined_afc_and_advances_frame_count() {
+        let plan = plan_symbol_read(2_000, -33.5, 4_096, 2_552);
+        assert_eq!(plan.phase_hz, 1_967);
+        assert_eq!(plan.next_frame_sample_count, 6_648);
+    }
+
+    #[test]
+    fn accumulate_prefix_correlation_sums_cyclic_prefix_pairs() {
+        let block = vec![
+            Complex32::new(1.0, 0.0),
+            Complex32::new(2.0, 0.0),
+            Complex32::new(3.0, 0.0),
+            Complex32::new(4.0, 0.0),
+        ];
+
+        let corr = accumulate_prefix_correlation(&block, 2, 4);
+        assert_eq!(corr, Complex32::new(11.0, 0.0));
+    }
+
+    #[test]
+    fn frame_rest_metrics_plan_skips_clock_update_after_coarse_step() {
+        let plan = plan_frame_rest_metrics(10_000, 2656, true);
+        assert_eq!(plan.next_frame_sample_count, 12_656);
+        assert!(!plan.should_integrate_clock_error);
     }
 }

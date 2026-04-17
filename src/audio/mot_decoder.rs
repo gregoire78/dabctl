@@ -24,6 +24,33 @@ impl Default for MotDecoder {
 }
 
 impl MotDecoder {
+    fn has_pending_length(&self) -> bool {
+        self.size_needed >= CRC_LEN
+    }
+
+    fn begin_subfield(&mut self, start: bool) -> bool {
+        if start {
+            self.size = 0;
+            if !self.has_pending_length() {
+                tracing::trace!("Ignoring MOT start subfield without a valid pending DGLI");
+                return false;
+            }
+            return true;
+        }
+
+        self.size != 0
+    }
+
+    fn append_subfield_data(&mut self, data: &[u8]) {
+        let copy_len = (MOT_DG_SIZE_MAX - self.size).min(data.len());
+        self.buffer[self.size..self.size + copy_len].copy_from_slice(&data[..copy_len]);
+        self.size += copy_len;
+    }
+
+    fn is_complete_group_ready(&self) -> bool {
+        self.has_pending_length() && self.size == self.size_needed && self.is_valid_crc()
+    }
+
     pub fn new() -> Self {
         MotDecoder {
             buffer: vec![0u8; MOT_DG_SIZE_MAX],
@@ -56,28 +83,16 @@ impl MotDecoder {
 
     /// Process a data subfield. Returns true when a complete valid Data Group is available.
     pub fn process_subfield(&mut self, start: bool, data: &[u8]) -> bool {
-        if start {
-            self.size = 0;
-            if self.size_needed < CRC_LEN {
-                tracing::trace!("Ignoring MOT start subfield without a valid pending DGLI");
-                return false;
-            }
-        } else if self.size == 0 {
-            // Ignore continuation without a start
+        if !self.begin_subfield(start) {
             return false;
         }
 
-        // Abort if we've already reached needed size
         if self.size_needed > 0 && self.size >= self.size_needed {
             return false;
         }
 
-        // Append data
-        let copy_len = (MOT_DG_SIZE_MAX - self.size).min(data.len());
-        self.buffer[self.size..self.size + copy_len].copy_from_slice(&data[..copy_len]);
-        self.size += copy_len;
+        self.append_subfield_data(data);
 
-        // Check if we have enough data
         if self.size_needed == 0 || self.size < self.size_needed {
             if self.size_needed > 0 && self.size % 200 < data.len() {
                 tracing::trace!(
@@ -88,11 +103,13 @@ impl MotDecoder {
             }
             return false;
         }
-        if !self.is_valid_crc() {
+
+        if !self.is_complete_group_ready() {
             tracing::trace!("MOT DG CRC INVALID (size={})", self.size_needed);
             self.reset();
             return false;
         }
+
         tracing::trace!("MOT DG CRC OK (size={})", self.size_needed);
         true
     }
@@ -110,6 +127,9 @@ impl MotDecoder {
         crc_stored == crc_calced
     }
     pub fn get_data_group(&self) -> Vec<u8> {
+        if !self.is_complete_group_ready() {
+            return Vec::new();
+        }
         self.buffer[..self.size_needed].to_vec()
     }
 }
@@ -258,5 +278,19 @@ mod tests {
         dec.set_len(dg.len());
         assert!(dec.process_subfield(true, &dg));
         assert_eq!(dec.get_data_group(), dg);
+    }
+
+    #[test]
+    fn test_get_data_group_is_empty_until_crc_checked_group_is_complete() {
+        let mut dec = MotDecoder::new();
+        let dg = build_dg_with_crc(&[0x21, 0x22, 0x23, 0x24]);
+        let mid = dg.len() / 2;
+
+        dec.set_len(dg.len());
+        assert!(!dec.process_subfield(true, &dg[..mid]));
+        assert!(
+            dec.get_data_group().is_empty(),
+            "partial MOT groups must not be handed to the manager"
+        );
     }
 }

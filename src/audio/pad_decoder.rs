@@ -332,6 +332,161 @@ impl Default for PadDecoder {
 }
 
 impl PadDecoder {
+    fn reverse_xpad_bytes(&mut self, xpad_data: &[u8], xpad_len: usize) -> usize {
+        let used_len = xpad_len.min(MAX_XPAD_LEN).min(xpad_data.len());
+        for i in 0..used_len {
+            self.xpad_buf[i] = xpad_data[used_len - 1 - i];
+        }
+        used_len
+    }
+
+    fn update_last_xpad_ci(&mut self, cis: &[XpadCi]) {
+        let mut last_continued_type: Option<u8> = None;
+        for ci in cis {
+            if ci.ci_type == 2 || ci.ci_type == 3 {
+                last_continued_type = Some(3);
+            } else if self.mot_app_type >= 0 {
+                let app_type = self.mot_app_type as u8;
+                if ci.ci_type == app_type || ci.ci_type == app_type + 1 {
+                    last_continued_type = Some(app_type + 1);
+                }
+            }
+        }
+
+        if let Some(cont_type) = last_continued_type {
+            self.last_xpad_ci = Some(XpadCi {
+                len: 0,
+                ci_type: cont_type,
+            });
+        }
+    }
+
+    fn collect_cis(
+        &mut self,
+        used_len: usize,
+        xpad_ind: u8,
+        ci_flag: bool,
+    ) -> (Vec<XpadCi>, usize) {
+        let mut cis = Vec::new();
+        let mut cis_len = 0usize;
+
+        if ci_flag {
+            match xpad_ind {
+                0b01 => {
+                    if used_len >= 1 {
+                        let ci_type = self.xpad_buf[0] & 0x1F;
+                        if ci_type != 0x00 {
+                            cis_len = 1;
+                            cis.push(XpadCi { len: 3, ci_type });
+                        }
+                    }
+                }
+                0b10 => {
+                    for k in 0..4 {
+                        if used_len < k + 1 {
+                            break;
+                        }
+                        let raw = self.xpad_buf[k];
+                        cis_len += 1;
+                        if raw & 0x1F == 0x00 {
+                            break;
+                        }
+                        cis.push(XpadCi::from_raw(raw));
+                    }
+                }
+                _ => {}
+            }
+
+            if !cis.is_empty() {
+                self.update_last_xpad_ci(&cis);
+            }
+        } else if matches!(xpad_ind, 0b01 | 0b10) {
+            if let Some(ref stored_ci) = self.last_xpad_ci {
+                cis.push(XpadCi {
+                    len: used_len,
+                    ci_type: stored_ci.ci_type,
+                });
+            }
+        }
+
+        (cis, cis_len)
+    }
+
+    fn handle_dynamic_label_subfield(
+        &mut self,
+        start: bool,
+        subfield: &[u8],
+        result: &mut PadResult,
+    ) {
+        if let Some(seg) = self.dl_decoder.process(start, subfield) {
+            if self.dl_reassembler.add_segment(seg) {
+                if let Some(dl) = self.dl_reassembler.assemble() {
+                    let text = dl.text.trim().to_string();
+                    if !text.is_empty() && text != self.last_dl_text {
+                        self.last_dl_text = text;
+                        result.dynamic_label = Some(dl);
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle_mot_subfield(&mut self, ci_type: u8, subfield: &[u8], result: &mut PadResult) {
+        if self.mot_app_type < 0 {
+            return;
+        }
+
+        let app_type = self.mot_app_type as u8;
+        if ci_type != app_type && ci_type != app_type + 1 {
+            return;
+        }
+
+        let start = ci_type == app_type;
+        let dgli_len = if start {
+            let dgli_len = self.dgli_decoder.take_len();
+            tracing::trace!(
+                "MOT start subfield (ci_type={}, dgli_len={})",
+                ci_type,
+                dgli_len
+            );
+            self.mot_decoder.set_len(dgli_len);
+            dgli_len
+        } else {
+            usize::MAX
+        };
+
+        if start && dgli_len < 2 {
+            tracing::trace!(
+                "Ignoring MOT start subfield without valid DGLI length (ci_type={})",
+                ci_type
+            );
+            self.mot_decoder.reset();
+            return;
+        }
+
+        if self.mot_decoder.process_subfield(start, subfield) {
+            let dg = self.mot_decoder.get_data_group();
+            tracing::trace!(
+                "MOT DG complete, forwarding to mot_manager (dg_len={})",
+                dg.len()
+            );
+            let (file, _fraction) = self.mot_manager.handle_data_group(&dg);
+            if let Some(file) = file {
+                if file.is_image() {
+                    result.slide = Some(file);
+                }
+            }
+        }
+    }
+
+    fn handle_ci_subfield(&mut self, ci_type: u8, subfield: &[u8], result: &mut PadResult) {
+        match ci_type {
+            1 => self.dgli_decoder.process(true, subfield),
+            2 | 3 => self.handle_dynamic_label_subfield(ci_type == 2, subfield, result),
+            _ => self.handle_mot_subfield(ci_type, subfield, result),
+        }
+    }
+
     pub fn new() -> Self {
         PadDecoder {
             dl_decoder: DlDataGroupDecoder::new(),
@@ -360,6 +515,10 @@ impl PadDecoder {
     /// Set the MOT application type (from FIC, SLS app type).
     /// Typically 12 for MOT Slideshow.
     pub fn set_mot_app_type(&mut self, app_type: i8) {
+        if self.mot_app_type != app_type {
+            self.last_xpad_ci = None;
+            self.mot_decoder.reset();
+        }
         self.mot_app_type = app_type;
     }
 
@@ -386,105 +545,22 @@ impl PadDecoder {
         fpad_data: &[u8; 2],
     ) -> PadResult {
         let mut result = PadResult::default();
-
-        // Reverse X-PAD byte order (DAB+ provides it reversed for compatibility with DAB)
-        // Guard against malformed callers that declare xpad_len larger than
-        // the actual provided buffer length.
-        let used_len = xpad_len.min(MAX_XPAD_LEN).min(xpad_data.len());
-        for i in 0..used_len {
-            self.xpad_buf[i] = xpad_data[used_len - 1 - i];
-        }
+        let used_len = self.reverse_xpad_bytes(xpad_data, xpad_len);
 
         let fpad_type = fpad_data[0] >> 6;
         let xpad_ind = (fpad_data[0] & 0x30) >> 4;
         let ci_flag = fpad_data[1] & 0x02 != 0;
 
-        let mut cis = Vec::new();
-        let mut cis_len: usize = 0;
-
-        if fpad_type == 0b00 {
-            if ci_flag {
-                match xpad_ind {
-                    0b01 => {
-                        // Short X-PAD
-                        if used_len >= 1 {
-                            let ci_type = self.xpad_buf[0] & 0x1F;
-                            if ci_type != 0x00 {
-                                cis_len = 1;
-                                cis.push(XpadCi { len: 3, ci_type });
-                            }
-                        }
-                    }
-                    0b10 => {
-                        // Variable size X-PAD
-                        cis_len = 0;
-                        for k in 0..4 {
-                            if used_len < k + 1 {
-                                break;
-                            }
-                            let raw = self.xpad_buf[k];
-                            cis_len += 1;
-                            if raw & 0x1F == 0x00 {
-                                break;
-                            }
-                            cis.push(XpadCi::from_raw(raw));
-                        }
-                    }
-                    _ => {}
-                }
-                // Store continuation CI for non-CI frames.
-                // ETSI EN 300 401 §7.4.3: after a start subfield in a CI frame,
-                // subsequent non-CI frames carry the corresponding continuation type.
-                // Start types (even) imply continuation types (odd = start + 1):
-                //   DL start (2) → DL continuation (3)
-                //   MOT start (app_type) → MOT continuation (app_type + 1)
-                if !cis.is_empty() {
-                    let mut last_continued_type: Option<u8> = None;
-                    for ci in &cis {
-                        if ci.ci_type == 2 || ci.ci_type == 3 {
-                            last_continued_type = Some(3);
-                        } else if self.mot_app_type >= 0 {
-                            let app_type = self.mot_app_type as u8;
-                            if ci.ci_type == app_type || ci.ci_type == app_type + 1 {
-                                last_continued_type = Some(app_type + 1);
-                            }
-                        }
-                    }
-                    if let Some(cont_type) = last_continued_type {
-                        self.last_xpad_ci = Some(XpadCi {
-                            len: 0, // not used; non-CI frames use full X-PAD length
-                            ci_type: cont_type,
-                        });
-                    }
-                    // If no continuable type found (e.g. DGLI-only CI frame),
-                    // keep previous last_xpad_ci unchanged so ongoing MOT/DLS
-                    // continuations are not disrupted.
-                }
-            } else {
-                // No CI flag: use single stored continuation CI (like dablin)
-                match xpad_ind {
-                    0b01 | 0b10 => {
-                        if let Some(ref stored_ci) = self.last_xpad_ci {
-                            // Non-CI frame: entire X-PAD data is one continuation subfield
-                            cis.push(XpadCi {
-                                len: used_len,
-                                ci_type: stored_ci.ci_type,
-                            });
-                            cis_len = 0; // no CI bytes present in non-CI frames
-                        }
-                    }
-                    _ => {}
-                }
-            }
+        if fpad_type != 0b00 {
+            return result;
         }
 
+        let (cis, cis_len) = self.collect_cis(used_len, xpad_ind, ci_flag);
         if cis.is_empty() {
             return result;
         }
 
-        // Process CI subfields
         let mut xpad_offset = cis_len;
-
         for ci in &cis {
             if xpad_offset + ci.len > used_len {
                 tracing::trace!(
@@ -494,73 +570,8 @@ impl PadDecoder {
                 break;
             }
 
-            let subfield = &self.xpad_buf[xpad_offset..xpad_offset + ci.len];
-
-            match ci.ci_type {
-                1 => {
-                    // DGLI - always self-contained, always a start
-                    self.dgli_decoder.process(true, subfield);
-                }
-                2 | 3 => {
-                    // Dynamic Label (start=2, continuation=3)
-                    let start = ci.ci_type == 2;
-                    if let Some(seg) = self.dl_decoder.process(start, subfield) {
-                        if self.dl_reassembler.add_segment(seg) {
-                            if let Some(dl) = self.dl_reassembler.assemble() {
-                                let text = dl.text.trim().to_string();
-                                if !text.is_empty() && text != self.last_dl_text {
-                                    self.last_dl_text = text;
-                                    result.dynamic_label = Some(dl);
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => {
-                    // MOT Data Group (app_type = start, app_type+1 = continuation)
-                    if self.mot_app_type >= 0 {
-                        let app_type = self.mot_app_type as u8;
-                        if ci.ci_type == app_type || ci.ci_type == app_type + 1 {
-                            let start = ci.ci_type == app_type;
-
-                            // DGLI len is only valid for the immediate next DG.
-                            let dgli_len = if start {
-                                let dgli_len = self.dgli_decoder.take_len();
-                                tracing::trace!(
-                                    "MOT start subfield (ci_type={}, dgli_len={})",
-                                    ci.ci_type,
-                                    dgli_len
-                                );
-                                self.mot_decoder.set_len(dgli_len);
-                                dgli_len
-                            } else {
-                                usize::MAX
-                            };
-
-                            if start && dgli_len < 2 {
-                                tracing::trace!(
-                                    "Ignoring MOT start subfield without valid DGLI length (ci_type={})",
-                                    ci.ci_type
-                                );
-                                self.mot_decoder.reset();
-                            } else if self.mot_decoder.process_subfield(start, subfield) {
-                                let dg = self.mot_decoder.get_data_group();
-                                tracing::trace!(
-                                    "MOT DG complete, forwarding to mot_manager (dg_len={})",
-                                    dg.len()
-                                );
-                                let (file, _fraction) = self.mot_manager.handle_data_group(&dg);
-                                if let Some(f) = file {
-                                    if f.is_image() {
-                                        result.slide = Some(f);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
+            let subfield = self.xpad_buf[xpad_offset..xpad_offset + ci.len].to_vec();
+            self.handle_ci_subfield(ci.ci_type, &subfield, &mut result);
             xpad_offset += ci.len;
         }
 
@@ -568,43 +579,39 @@ impl PadDecoder {
     }
 }
 
-/// Decode label bytes to UTF-8 text
-fn decode_label_text(raw: &[u8], charset: u8, mot: bool) -> String {
-    // Nettoyage des caractères de contrôle
-    let cleaned: Vec<u8> = raw
-        .iter()
+fn strip_control_label_bytes(raw: &[u8]) -> Vec<u8> {
+    raw.iter()
         .copied()
         .filter(|&ch| ch != 0x00 && ch != 0x0A && ch != 0x0B && ch != 0x1F)
-        .collect();
+        .collect()
+}
+
+fn decode_utf16be_label(raw: &[u8]) -> String {
+    if !raw.len().is_multiple_of(2) {
+        return String::new();
+    }
+    let (cow, _, had_errors) = UTF_16BE.decode(raw);
+    if had_errors {
+        String::new()
+    } else {
+        cow.into_owned().to_string()
+    }
+}
+
+/// Decode label bytes to UTF-8 text.
+fn decode_label_text(raw: &[u8], charset: u8, mot: bool) -> String {
+    let cleaned = strip_control_label_bytes(raw);
     match charset {
-        0 => {
-            // EBU Latin
-            cleaned
-                .iter()
-                .map(|&ch| ebu_latin_char_to_utf8_string(ch))
-                .collect()
-        }
+        0 => cleaned
+            .iter()
+            .map(|&ch| ebu_latin_char_to_utf8_string(ch))
+            .collect(),
         4 if mot => {
-            // ISO-8859-1 (MOT) (utilise WINDOWS_1252, compatible pour DAB)
             let (cow, _, _) = WINDOWS_1252.decode(&cleaned);
             cow.into_owned().to_string()
         }
-        6 if !mot => {
-            // UCS-2BE (DAB only) : décodage direct via encoding_rs (UTF_16BE)
-            if !raw.len().is_multiple_of(2) {
-                return String::new();
-            }
-            let (cow, _, had_errors) = UTF_16BE.decode(raw);
-            if had_errors {
-                String::new()
-            } else {
-                cow.into_owned().to_string()
-            }
-        }
-        15 => {
-            // UTF-8 (no fallback)
-            String::from_utf8(cleaned).unwrap_or_else(|_| String::new())
-        }
+        6 if !mot => decode_utf16be_label(raw),
+        15 => String::from_utf8(cleaned).unwrap_or_else(|_| String::new()),
         _ => {
             tracing::warn!("unsupported DL charset {}; ignoring label", charset);
             String::new()
@@ -744,6 +751,13 @@ mod tests {
     }
 
     #[test]
+    fn test_decode_label_ucs2_odd_length_is_rejected() {
+        let raw = [0x00, 0x43, 0x00];
+        let text = decode_label_text(&raw, 6, false);
+        assert_eq!(text, "");
+    }
+
+    #[test]
     fn test_decode_label_unknown_charset_fallback() {
         // Unknown charset (e.g. 5) : DABlin-style = chaîne vide
         let raw = b"Cavaill\xe9";
@@ -802,5 +816,37 @@ mod tests {
             decoder.data.is_empty(),
             "decoder must reset after DL Plus command"
         );
+    }
+
+    #[test]
+    fn set_mot_app_type_change_clears_stale_continuation_ci() {
+        let mut decoder = PadDecoder::new();
+        decoder.mot_app_type = 7;
+        decoder.last_xpad_ci = Some(XpadCi { len: 0, ci_type: 8 });
+
+        decoder.set_mot_app_type(12);
+
+        assert!(
+            decoder.last_xpad_ci.is_none(),
+            "changing slideshow app type must clear stale continuation state"
+        );
+    }
+
+    #[test]
+    fn collect_cis_keeps_existing_continuation_when_ci_frame_only_carries_dgli() {
+        let mut decoder = PadDecoder::new();
+        decoder.mot_app_type = 12;
+        decoder.last_xpad_ci = Some(XpadCi {
+            len: 0,
+            ci_type: 13,
+        });
+        decoder.xpad_buf[0] = 0x01;
+
+        let (cis, cis_len) = decoder.collect_cis(1, 0b01, true);
+
+        assert_eq!(cis_len, 1);
+        assert_eq!(cis.len(), 1);
+        assert_eq!(cis[0].ci_type, 1);
+        assert_eq!(decoder.last_xpad_ci.as_ref().map(|ci| ci.ci_type), Some(13));
     }
 }

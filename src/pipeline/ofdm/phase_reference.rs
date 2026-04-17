@@ -46,6 +46,7 @@ pub struct PhaseReference {
     carrier_diff: i32,
     ref_table: Vec<Complex32>,
     coarse_ref_arg: Vec<Complex32>,
+    sync_on_strongest_peak: bool,
     fft: Arc<dyn Fft<f32>>,
     ifft: Arc<dyn Fft<f32>>,
 }
@@ -68,6 +69,7 @@ fn peak_index_in_window(
     win_start: usize,
     win_end: usize,
     threshold: i16,
+    sync_on_strongest_peak: bool,
 ) -> i32 {
     if win_start >= win_end || win_end > fft_buffer.len() {
         return -1;
@@ -81,6 +83,8 @@ fn peak_index_in_window(
     let window = &fft_buffer[win_start..win_end];
     let threshold_value = threshold as f32 * total_sum / fft_buffer.len() as f32;
     let mut max_val = f32::NEG_INFINITY;
+    let mut strongest_peak_index = -1;
+    let mut strongest_peak_value = f32::NEG_INFINITY;
 
     for (offset, sample) in window.iter().enumerate() {
         let value = sample.norm();
@@ -103,9 +107,23 @@ fn peak_index_in_window(
             }
         }
 
-        if is_local_peak {
-            return (win_start + offset) as i32;
+        if !is_local_peak {
+            continue;
         }
+
+        let peak_index = (win_start + offset) as i32;
+        if !sync_on_strongest_peak {
+            return peak_index;
+        }
+
+        if value > strongest_peak_value {
+            strongest_peak_value = value;
+            strongest_peak_index = peak_index;
+        }
+    }
+
+    if strongest_peak_index >= 0 {
+        return strongest_peak_index;
     }
 
     -(max_val * fft_buffer.len() as f32 / total_sum).abs() as i32 - 1
@@ -149,6 +167,7 @@ impl PhaseReference {
             carrier_diff,
             ref_table,
             coarse_ref_arg,
+            sync_on_strongest_peak: false,
             fft,
             ifft,
         }
@@ -182,6 +201,10 @@ impl PhaseReference {
         fft_buffer
     }
 
+    pub fn set_sync_on_strongest_peak(&mut self, sync: bool) {
+        self.sync_on_strongest_peak = sync;
+    }
+
     /// Find the first sample of the first non-null symbol by correlation.
     ///
     /// The search is restricted to the window `[T_g − WINDOW_MARGIN, T_g + 2·WINDOW_MARGIN)`
@@ -191,11 +214,26 @@ impl PhaseReference {
     /// `sum /= cTu` logic and avoids making tracking artificially harsher just
     /// because the search window is narrower than T_u.
     ///
-    /// Adapted from DABstar's `correlate_with_phase_ref_and_find_max_peak()` (GPLv2).
-    pub fn find_index(&self, v: &[Complex32], threshold: i16) -> i32 {
+    /// When `sync_on_strongest_peak` is disabled, the earliest valid peak is used,
+    /// which matches DABstar's default SFN-friendly timing policy.
+    pub fn correlate_with_phase_ref_and_find_max_peak(
+        &self,
+        v: &[Complex32],
+        threshold: i16,
+    ) -> i32 {
         let fft_buffer = self.correlate_with_phase_ref(v);
         let (win_start, win_end) = self.correlation_search_window();
-        peak_index_in_window(&fft_buffer, win_start, win_end, threshold)
+        peak_index_in_window(
+            &fft_buffer,
+            win_start,
+            win_end,
+            threshold,
+            self.sync_on_strongest_peak,
+        )
+    }
+
+    pub fn find_index(&self, v: &[Complex32], threshold: i16) -> i32 {
+        self.correlate_with_phase_ref_and_find_max_peak(v, threshold)
     }
 
     /// Estimate coarse frequency offset.
@@ -205,7 +243,7 @@ impl PhaseReference {
     /// 2. form relative phase products between adjacent FFT bins
     /// 3. IFFT to time domain, multiply by the precomputed reference response
     /// 4. FFT back and pick the strongest peak in the ±70-bin coarse window
-    pub fn estimate_offset(&self, v: &[Complex32]) -> i32 {
+    pub fn estimate_carrier_offset_from_sync_symbol_0(&self, v: &[Complex32]) -> i32 {
         let mut fft_buffer = v[..self.t_u].to_vec();
         self.fft.process(&mut fft_buffer);
 
@@ -253,6 +291,10 @@ impl PhaseReference {
         };
 
         (offset * self.carrier_diff as f32) as i32
+    }
+
+    pub fn estimate_offset(&self, v: &[Complex32]) -> i32 {
+        self.estimate_carrier_offset_from_sync_symbol_0(v)
     }
 }
 
@@ -390,7 +432,18 @@ mod tests {
         corr[30] = Complex32::new(5.0, 0.0);
         corr[31] = Complex32::new(4.5, 0.0);
 
-        assert_eq!(peak_index_in_window(&corr, 0, 64, 2), 10);
+        assert_eq!(peak_index_in_window(&corr, 0, 64, 2, false), 10);
+    }
+
+    #[test]
+    fn peak_index_can_lock_on_strongest_peak_when_enabled() {
+        let mut corr = vec![Complex32::new(0.0, 0.0); 64];
+        corr[10] = Complex32::new(3.0, 0.0);
+        corr[11] = Complex32::new(2.5, 0.0);
+        corr[30] = Complex32::new(5.0, 0.0);
+        corr[31] = Complex32::new(4.5, 0.0);
+
+        assert_eq!(peak_index_in_window(&corr, 0, 64, 2, true), 30);
     }
 
     #[test]
@@ -401,7 +454,7 @@ mod tests {
         corr[30] = Complex32::new(5.0, 0.0);
         corr[31] = Complex32::new(4.5, 0.0);
 
-        assert_eq!(peak_index_in_window(&corr, 0, 64, 2), 11);
+        assert_eq!(peak_index_in_window(&corr, 0, 64, 2, false), 11);
     }
 
     #[test]
@@ -413,6 +466,6 @@ mod tests {
         corr[504] = Complex32::new(3.0, 0.0);
         corr[505] = Complex32::new(2.0, 0.0);
 
-        assert_eq!(peak_index_in_window(&corr, 254, 1004, 6), 504);
+        assert_eq!(peak_index_in_window(&corr, 254, 1004, 6, false), 504);
     }
 }
