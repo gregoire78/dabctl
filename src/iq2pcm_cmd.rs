@@ -54,6 +54,24 @@ fn is_metadata_blackout_during_dropout(
     sync_fail > sync_ok && dls_events == 0 && slide_events == 0
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+fn update_fic_confidence_steps(current_steps: i16, success: i16, total: i16) -> i16 {
+    let success = success.max(0);
+    let failure = total.saturating_sub(success);
+    let rose = current_steps.saturating_add(success.saturating_mul(2));
+    let decayed = if failure > 0 {
+        rose.saturating_sub(1)
+    } else {
+        rose
+    };
+    let minimum = if current_steps > 0 || success > 0 {
+        1
+    } else {
+        0
+    };
+    decayed.clamp(minimum, 10)
+}
+
 #[derive(Args, Debug)]
 pub struct Iq2pcmArgs {
     /// DAB channel (e.g., 5A, 6C, 11C, 12C)
@@ -275,11 +293,10 @@ pub fn run(args: Iq2pcmArgs) {
             fok.fetch_add(i32::from(success), Ordering::Relaxed);
             ftot.fetch_add(i32::from(total), Ordering::Relaxed);
 
-            // DABstar-style leaky FIC ratio for OFDM control: increment on valid
-            // FIB CRCs, decrement on failures, clamp to 0..10 then scale to %.
+            // Sticky FIC confidence: fast rise on valid CRCs, very slow decay on
+            // blackouts. Zero is reserved for “never decoded since startup”.
             let prev = fqsteps.load(Ordering::Relaxed);
-            let failures = total.saturating_sub(success);
-            let next = (prev + success - failures).clamp(0, 10);
+            let next = update_fic_confidence_steps(prev, success, total);
             fqsteps.store(next, Ordering::Relaxed);
             ficq.store(next * 10, Ordering::Relaxed);
         }));
@@ -302,7 +319,6 @@ pub fn run(args: Iq2pcmArgs) {
     ofdm_processor.set_show_freq_offset(move |offset_hz| {
         fo.store(offset_hz, Ordering::Relaxed);
     });
-    ofdm_processor.set_fic_quality_percent_source(current_fic_quality_percent.clone());
 
     if !input_device.restart_reader() {
         error!("Failed to start RTL-SDR reader");
@@ -403,6 +419,7 @@ pub fn run(args: Iq2pcmArgs) {
             signal_noise: signal_noise.clone(),
             fic_ok: fic_ok.clone(),
             fic_total: fic_total.clone(),
+            fic_quality_percent: current_fic_quality_percent.clone(),
             freq_offset_hz: freq_offset_hz.clone(),
             tuned_freq_hz: freq,
             gain_tenths: gain_tenths.clone(),
@@ -694,6 +711,24 @@ mod tests {
         assert!(!is_metadata_blackout_during_dropout(10, 1, 0, 0));
         assert!(!is_metadata_blackout_during_dropout(1, 10, 1, 0));
         assert!(!is_metadata_blackout_during_dropout(1, 10, 0, 1));
+    }
+
+    #[test]
+    fn fic_confidence_builds_faster_than_it_decays() {
+        let built = update_fic_confidence_steps(0, 3, 3);
+        let decayed = update_fic_confidence_steps(built, 0, 3);
+
+        assert!(built >= 6);
+        assert!(decayed >= built - 1);
+    }
+
+    #[test]
+    fn fic_confidence_zero_means_never_decoded_since_startup() {
+        let built = update_fic_confidence_steps(0, 3, 3);
+        let held = update_fic_confidence_steps(built, 0, 0);
+
+        assert!(built > 0);
+        assert_eq!(held, built);
     }
 
     /// Simulate one metadata emission step from the main loop.

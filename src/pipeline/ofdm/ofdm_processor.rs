@@ -28,13 +28,18 @@ fn fine_afc_delta_hz(
     carrier_diff: i32,
     cp_pair_count: usize,
     s_level: f32,
+    post_eq_quality: f32,
+    eq_weak_ratio: f32,
 ) -> f32 {
     if freq_corr.norm() == 0.0 {
         return 0.0;
     }
 
     let cp_coherence = normalized_cp_coherence(freq_corr, cp_pair_count, s_level);
-    if cp_coherence < MIN_CP_CORR_NORM {
+    if cp_coherence < MIN_CP_CORR_NORM
+        || post_eq_quality < HOLD_ENTER_POST_EQ_MIN
+        || eq_weak_ratio > HOLD_ENTER_WEAK_RATIO_MAX
+    {
         return 0.0;
     }
 
@@ -42,8 +47,23 @@ fn fine_afc_delta_hz(
     phase_offset / std::f32::consts::TAU * carrier_diff as f32
 }
 
-fn coarse_afc_needed(fic_quality_percent: i16) -> bool {
-    fic_quality_percent < 30
+fn snr_is_observable(post_eq_quality: f32, eq_weak_ratio: f32, soft_locked: bool) -> bool {
+    soft_locked
+        && post_eq_quality >= SNR_OBSERVABLE_POST_EQ_MIN
+        && eq_weak_ratio <= SNR_OBSERVABLE_WEAK_RATIO_MAX
+}
+
+fn structural_hold_allowed(post_eq_quality: f32, eq_weak_ratio: f32) -> bool {
+    post_eq_quality >= HOLD_ENTER_POST_EQ_MIN && eq_weak_ratio <= HOLD_ENTER_WEAK_RATIO_MAX
+}
+
+fn should_release_degraded_hold(post_eq_quality: f32, eq_weak_ratio: f32) -> bool {
+    post_eq_quality >= HOLD_RELEASE_POST_EQ_MIN && eq_weak_ratio <= HOLD_RELEASE_WEAK_RATIO_MAX
+}
+
+fn structural_collapse_detected(post_eq_quality: f32, eq_weak_ratio: f32) -> bool {
+    post_eq_quality <= STRUCTURAL_COLLAPSE_POST_EQ_MAX
+        || eq_weak_ratio >= STRUCTURAL_COLLAPSE_WEAK_RATIO_MIN
 }
 
 fn continue_after_coarse_step(_coarse_step_applied: bool) -> bool {
@@ -66,12 +86,22 @@ fn apply_coarse_correction(current_coarse: i32, correction_hz: i32) -> (i32, boo
 }
 
 fn plan_coarse_correction(
-    fic_quality_percent: i16,
     reused_previous_start: bool,
+    soft_locked: bool,
     current_coarse: i32,
     correction_hz: i32,
+    post_eq_quality: f32,
+    eq_weak_ratio: f32,
 ) -> Option<CoarseCorrectionPlan> {
-    if reused_previous_start || !coarse_afc_needed(fic_quality_percent) {
+    // ETSI EN 300 401 §14.8: once timing/frequency tracking is already stable,
+    // keep the coarse loop frozen and let the fine loop absorb residual drift.
+    // Real receivers do not keep nudging the coarse estimator by a few Hz every
+    // frame while the multiplex is decoding correctly.
+    if reused_previous_start
+        || soft_locked
+        || !structural_hold_allowed(post_eq_quality, eq_weak_ratio)
+        || structural_collapse_detected(post_eq_quality, eq_weak_ratio)
+    {
         return None;
     }
 
@@ -90,10 +120,25 @@ fn plan_null_symbol_metrics(
     report_count: usize,
     coarse_corrector: i32,
     fine_corrector: f32,
+    observability: ObservabilitySnapshot,
 ) -> NullSymbolMetricsPlan {
     let safe_null_level = null_avg_level.max(1e-6);
-    let next_snr_db =
-        0.9 * prev_snr_db + 0.1 * 20.0 * ((signal_level + 0.005) / safe_null_level).log10();
+    let next_snr_db = if snr_is_observable(
+        observability.post_eq_quality,
+        observability.eq_weak_ratio,
+        observability.soft_locked,
+    ) {
+        let observed = 20.0 * ((signal_level + 0.005) / safe_null_level).log10();
+        let bounded = observed.clamp(0.0, 35.0);
+        if prev_snr_db <= 0.0 {
+            bounded
+        } else {
+            let smoothed = 0.96 * prev_snr_db + 0.04 * bounded;
+            smoothed.clamp((prev_snr_db - 0.75).max(0.0), (prev_snr_db + 0.5).min(35.0))
+        }
+    } else {
+        prev_snr_db.max(0.0)
+    };
     let next_report_count = report_count + 1;
     let emit_report = next_report_count > 10;
 
@@ -290,6 +335,30 @@ const SIGNAL_NOISE_MIN_RATIO: f32 = 0.1;
 /// during brief fades or false locks.
 const MIN_CP_CORR_NORM: f32 = 0.05;
 
+/// Continuity-first degraded-hold budget measured in frame attempts.
+const MAX_DEGRADED_HOLD_FRAMES: u8 = 12;
+
+/// Each successfully decoded frame while still in degraded hold replenishes
+/// one survival slot. This keeps the RF supervisor continuity-first across
+/// intermittent micro-fades instead of draining the budget to zero over time.
+const HOLD_BUDGET_REFILL_PER_GOOD_FRAME: u8 = 1;
+
+/// Structural hold-entry thresholds derived from post-equalizer observability.
+const HOLD_ENTER_POST_EQ_MIN: f32 = 0.30;
+const HOLD_ENTER_WEAK_RATIO_MAX: f32 = 0.30;
+
+/// Recovery thresholds needed before leaving degraded hold.
+const HOLD_RELEASE_POST_EQ_MIN: f32 = 0.50;
+const HOLD_RELEASE_WEAK_RATIO_MAX: f32 = 0.25;
+
+/// Structural collapse thresholds that require a real reacquisition.
+const STRUCTURAL_COLLAPSE_POST_EQ_MAX: f32 = 0.18;
+const STRUCTURAL_COLLAPSE_WEAK_RATIO_MIN: f32 = 0.60;
+
+/// MER-like SNR must only move when the constellation is still observable.
+const SNR_OBSERVABLE_POST_EQ_MIN: f32 = 0.50;
+const SNR_OBSERVABLE_WEAK_RATIO_MAX: f32 = 0.25;
+
 /// Do not reuse the previous PRS start index after a tracking miss.
 ///
 /// Live RF captures showed that holding a stale alignment for even one missed
@@ -333,7 +402,13 @@ pub struct OfdmProcessor {
     coarse_corrector: i32,
     s_level: f32,
     running: Arc<AtomicBool>,
-    fic_quality_percent: Option<Arc<AtomicI16>>,
+    /// Smoothed structural quality of the post-EQ constellation.
+    post_eq_quality: f32,
+    /// Fraction of carriers currently judged weak or poorly observable.
+    eq_weak_ratio: f32,
+    /// True once OFDM has produced at least one structurally valid frame and
+    /// until a genuine RF loss forces reacquisition.
+    soft_lock_active: bool,
     /// Per-carrier running mean of FFT-bin power, updated per symbol.
     /// IIR with α = MEAN_POWER_ALPHA. Matches DABstar's power tracking for
     /// soft-bit weighting and quality estimation.
@@ -389,8 +464,17 @@ enum SyncState {
     WaitForTimeSyncMarker,
     /// Evaluate the phase-reference symbol and align symbol 0 in the buffer.
     EvalSyncSymbol,
+    /// Soft-locked RF hold state: preserve continuity and retry on the next
+    /// plausible frame boundary without declaring hard sync loss yet.
+    DegradedHolding,
     /// Decode the remainder of the frame once symbol 0 is aligned.
     ProcessRestOfFrame,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncRecovery {
+    Hold,
+    Lost,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -427,6 +511,13 @@ struct FrameRestMetricsPlan {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+struct ObservabilitySnapshot {
+    post_eq_quality: f32,
+    eq_weak_ratio: f32,
+    soft_locked: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct NullSymbolMetricsPlan {
     snr_db: f32,
     next_report_count: usize,
@@ -460,6 +551,11 @@ struct SyncLoopControl {
     acq_threshold: i16,
     track_threshold: i16,
     sync_threshold: i16,
+    soft_locked: bool,
+    degraded_holding: bool,
+    hold_frames_remaining: u8,
+    lock_frozen_until_next_frame: bool,
+    sync_loss_reported: bool,
 }
 
 impl SyncLoopControl {
@@ -473,6 +569,11 @@ impl SyncLoopControl {
             acq_threshold,
             track_threshold,
             sync_threshold: acq_threshold,
+            soft_locked: false,
+            degraded_holding: false,
+            hold_frames_remaining: MAX_DEGRADED_HOLD_FRAMES,
+            lock_frozen_until_next_frame: false,
+            sync_loss_reported: false,
         }
     }
 
@@ -498,12 +599,75 @@ impl SyncLoopControl {
         self.state = SyncState::ProcessRestOfFrame;
     }
 
-    fn on_frame_processed(&mut self) {
-        self.sync_threshold = self.track_threshold;
+    fn on_frame_processed(&mut self, post_eq_quality: f32, eq_weak_ratio: f32) {
+        self.soft_locked = true;
+        self.lock_frozen_until_next_frame = false;
+        self.sync_loss_reported = false;
+
+        if self.degraded_holding {
+            if should_release_degraded_hold(post_eq_quality, eq_weak_ratio) {
+                self.degraded_holding = false;
+                self.hold_frames_remaining = MAX_DEGRADED_HOLD_FRAMES;
+                self.sync_threshold = self.track_threshold;
+            } else {
+                // ETSI EN 300 401 §14.8 tracking continuity: when a structurally
+                // plausible frame is decoded after a brief fade, keep hold mode
+                // active but replenish part of the survival budget so repeated
+                // short fades do not force needless reacquisition churn.
+                self.hold_frames_remaining = self
+                    .hold_frames_remaining
+                    .saturating_add(HOLD_BUDGET_REFILL_PER_GOOD_FRAME)
+                    .min(MAX_DEGRADED_HOLD_FRAMES);
+                self.sync_threshold = self.acq_threshold;
+            }
+        } else {
+            self.hold_frames_remaining = MAX_DEGRADED_HOLD_FRAMES;
+            self.sync_threshold = self.track_threshold;
+        }
+
         self.state = SyncState::EvalSyncSymbol;
     }
 
+    fn on_tracking_miss(&mut self, post_eq_quality: f32, eq_weak_ratio: f32) -> SyncRecovery {
+        let can_hold = self.soft_locked
+            && !self.lock_frozen_until_next_frame
+            && self.hold_frames_remaining > 0
+            && structural_hold_allowed(post_eq_quality, eq_weak_ratio)
+            && !structural_collapse_detected(post_eq_quality, eq_weak_ratio);
+
+        if can_hold {
+            self.degraded_holding = true;
+            self.hold_frames_remaining = self.hold_frames_remaining.saturating_sub(1);
+            self.lock_frozen_until_next_frame = true;
+            self.sync_threshold = self.acq_threshold;
+            self.state = SyncState::DegradedHolding;
+            SyncRecovery::Hold
+        } else {
+            self.on_sync_lost();
+            SyncRecovery::Lost
+        }
+    }
+
+    fn on_degraded_frame_boundary(&mut self) {
+        self.lock_frozen_until_next_frame = false;
+        self.state = SyncState::EvalSyncSymbol;
+    }
+
+    fn should_report_sync_loss(&mut self) -> bool {
+        if self.sync_loss_reported {
+            false
+        } else {
+            self.sync_loss_reported = true;
+            true
+        }
+    }
+
     fn on_sync_lost(&mut self) {
+        self.soft_locked = false;
+        self.degraded_holding = false;
+        self.lock_frozen_until_next_frame = false;
+        self.hold_frames_remaining = MAX_DEGRADED_HOLD_FRAMES;
+        self.sync_threshold = self.acq_threshold;
         self.state = SyncState::WaitForTimeSyncMarker;
     }
 }
@@ -571,7 +735,9 @@ impl OfdmProcessor {
             coarse_corrector: 0,
             s_level: 0.0,
             running,
-            fic_quality_percent: None,
+            post_eq_quality: 0.0,
+            eq_weak_ratio: 0.0,
+            soft_lock_active: false,
             // DABstar starts these estimators at zero and lets them converge
             // from real RF measurements.
             mean_power: vec![0.0f32; carriers],
@@ -608,14 +774,7 @@ impl OfdmProcessor {
     }
 
     pub fn set_fic_quality_percent_source(&mut self, fic_quality_percent: Arc<AtomicI16>) {
-        self.fic_quality_percent = Some(fic_quality_percent);
-    }
-
-    fn current_fic_quality_percent(&self) -> i16 {
-        self.fic_quality_percent
-            .as_ref()
-            .map(|v| v.load(Ordering::Relaxed))
-            .unwrap_or(0)
+        let _ = fic_quality_percent;
     }
 
     fn emit_sync_signal(&self, val: bool) {
@@ -757,15 +916,22 @@ impl OfdmProcessor {
         let prev = self.coarse_corrector;
 
         let Some(plan) = plan_coarse_correction(
-            self.current_fic_quality_percent(),
             self.last_sync_alignment_reused,
+            self.soft_lock_active,
             self.coarse_corrector,
             correction,
+            self.post_eq_quality,
+            self.eq_weak_ratio,
         ) else {
             if self.last_sync_alignment_reused {
                 trace!(
                     start_index = self.last_sync_start_index,
                     "OFDM: skipping coarse AFC on reused sync alignment"
+                );
+            } else if self.soft_lock_active {
+                trace!(
+                    coarse_hz = self.coarse_corrector,
+                    "OFDM: coarse AFC frozen while soft-locked"
                 );
             }
             return false;
@@ -840,8 +1006,14 @@ impl OfdmProcessor {
 
     fn update_fine_frequency_from_cyclic_prefix(&mut self, freq_corr: Complex32) {
         let cp_pair_count = (self.nr_blocks.saturating_sub(1)) * self.t_g;
-        let fine_delta_hz =
-            fine_afc_delta_hz(freq_corr, self.carrier_diff, cp_pair_count, self.s_level);
+        let fine_delta_hz = fine_afc_delta_hz(
+            freq_corr,
+            self.carrier_diff,
+            cp_pair_count,
+            self.s_level,
+            self.post_eq_quality,
+            self.eq_weak_ratio,
+        );
         self.fine_corrector += fine_delta_hz;
         self.wrap_fine_corrector_into_coarse();
     }
@@ -882,6 +1054,11 @@ impl OfdmProcessor {
             self.snr_report_count,
             self.coarse_corrector,
             self.fine_corrector,
+            ObservabilitySnapshot {
+                post_eq_quality: self.post_eq_quality,
+                eq_weak_ratio: self.eq_weak_ratio,
+                soft_locked: self.soft_lock_active,
+            },
         );
         self.snr_estimate = telemetry.snr_db;
         self.snr_report_count = telemetry.next_report_count;
@@ -942,6 +1119,8 @@ impl OfdmProcessor {
         self.fft.process(&mut self.fft_buffer);
 
         let mut sum = 0.0f32;
+        let mut quality_sum = 0.0f32;
+        let mut weak_carriers = 0usize;
 
         for i in 0..self.carriers {
             let mut index = self.freq_interleaver.map_in(i) as i32;
@@ -984,7 +1163,21 @@ impl OfdmProcessor {
                     self.mean_sigma_sq[i],
                     self.null_noise[i],
                     self.mean_power[i],
-                );
+                )
+                .clamp(0.0, 1.0);
+
+                let null_floor = self.null_noise[i].max(NOISE_FLOOR_MIN);
+                let signal_power = (self.mean_power[i] - null_floor).max(0.0);
+                let denom = signal_power + self.mean_sigma_sq[i] + null_floor;
+                let carrier_quality = if denom > 0.0 {
+                    signal_power / denom
+                } else {
+                    0.0
+                };
+                quality_sum += carrier_quality;
+                if carrier_quality < 0.5 {
+                    weak_carriers += 1;
+                }
 
                 let r1 = norm_to_length_one(fft_bin) * weight;
                 self.r1_buf[i] = r1;
@@ -1001,6 +1194,19 @@ impl OfdmProcessor {
         }
 
         self.mean_value = (sum / self.carriers.max(1) as f32).max(1e-3);
+
+        let measured_post_eq_quality = quality_sum / self.carriers.max(1) as f32;
+        let measured_weak_ratio = weak_carriers as f32 / self.carriers.max(1) as f32;
+        self.post_eq_quality = if self.post_eq_quality == 0.0 {
+            measured_post_eq_quality
+        } else {
+            0.8 * self.post_eq_quality + 0.2 * measured_post_eq_quality
+        };
+        self.eq_weak_ratio = if self.eq_weak_ratio == 0.0 && measured_weak_ratio == 0.0 {
+            0.0
+        } else {
+            0.8 * self.eq_weak_ratio + 0.2 * measured_weak_ratio
+        };
     }
 
     /// Reset per-carrier power and null-noise IIR estimators to their initial
@@ -1073,8 +1279,10 @@ impl OfdmProcessor {
         device: &RtlsdrHandler,
         time_syncer: &mut TimeSyncer,
         attempts: &mut i16,
+        emit_absent_warning: bool,
+        hold_mode: bool,
     ) -> Result<bool, ProcessorError> {
-        self.prepare_for_acquisition_retry(*attempts > 0);
+        self.prepare_for_acquisition_retry(!hold_mode && *attempts > 0);
 
         let plan = plan_time_sync_follow_up(
             time_syncer.read_samples_until_end_of_level_drop(
@@ -1087,12 +1295,13 @@ impl OfdmProcessor {
         )?;
 
         *attempts = if plan.emit_warning { 0 } else { plan.attempts };
-        if plan.emit_warning {
+        if plan.emit_warning && emit_absent_warning {
             warn!(
                 "OFDM: no null symbol detected after {} attempts \
                  — signal absent or very weak",
                 plan.attempts
             );
+            self.soft_lock_active = false;
             self.emit_sync_signal(false);
         }
 
@@ -1198,6 +1407,7 @@ impl OfdmProcessor {
             coarse_step_applied,
         )?;
 
+        self.soft_lock_active = true;
         self.emit_sync_signal(true);
         Ok(true)
     }
@@ -1239,6 +1449,8 @@ impl OfdmProcessor {
                         device,
                         &mut control.time_syncer,
                         &mut control.attempts,
+                        true,
+                        false,
                     ) {
                         Ok(true) => control.on_time_sync_established(),
                         Ok(false) => {}
@@ -1255,16 +1467,40 @@ impl OfdmProcessor {
                         &mut buffers.check_buf,
                     ) {
                         Ok(true) => control.on_sync_symbol_aligned(),
-                        Ok(false) => {
-                            if control.is_tracking_threshold() {
-                                warn!("OFDM: synchronisation lost — returning to acquisition");
-                            } else {
-                                trace!(
-                                    "OFDM: phase ref not found (correlation below threshold), retry"
+                        Ok(false) => match control
+                            .on_tracking_miss(self.post_eq_quality, self.eq_weak_ratio)
+                        {
+                            SyncRecovery::Hold => {
+                                debug!(
+                                    post_eq_quality = self.post_eq_quality,
+                                    eq_weak_ratio = self.eq_weak_ratio,
+                                    remaining_frames = control.hold_frames_remaining,
+                                    "OFDM: entering degraded holding"
                                 );
                             }
-                            control.on_sync_lost();
-                        }
+                            SyncRecovery::Lost => {
+                                self.soft_lock_active = false;
+                                if control.should_report_sync_loss() {
+                                    warn!(
+                                        "OFDM: synchronisation lost — structural evidence collapsed; returning to acquisition"
+                                    );
+                                }
+                            }
+                        },
+                        Err(_) => return,
+                    }
+                }
+
+                SyncState::DegradedHolding => {
+                    match self.state_wait_for_time_sync_marker(
+                        device,
+                        &mut control.time_syncer,
+                        &mut control.attempts,
+                        false,
+                        true,
+                    ) {
+                        Ok(true) => control.on_degraded_frame_boundary(),
+                        Ok(false) => {}
                         Err(_) => return,
                     }
                 }
@@ -1277,7 +1513,9 @@ impl OfdmProcessor {
                         &mut buffers.null_buf,
                         &mut buffers.block_buf,
                     ) {
-                        Ok(true) => control.on_frame_processed(),
+                        Ok(true) => {
+                            control.on_frame_processed(self.post_eq_quality, self.eq_weak_ratio)
+                        }
                         Ok(false) => control.on_sync_lost(),
                         Err(_) => return,
                     }
@@ -1535,7 +1773,7 @@ mod tests {
 
     #[test]
     fn fine_afc_delta_is_suppressed_when_cp_coherence_is_too_low() {
-        let delta = fine_afc_delta_hz(Complex32::new(0.0, 1.0), 1000, 1000, 1000.0);
+        let delta = fine_afc_delta_hz(Complex32::new(0.0, 1.0), 1000, 1000, 1000.0, 0.8, 0.1);
         assert_eq!(
             delta, 0.0,
             "fine AFC must stay frozen when cyclic-prefix coherence is too weak"
@@ -1544,7 +1782,7 @@ mod tests {
 
     #[test]
     fn fine_afc_delta_is_applied_when_cp_coherence_is_good() {
-        let delta = fine_afc_delta_hz(Complex32::new(0.0, 5000.0), 1000, 1000, 1.0);
+        let delta = fine_afc_delta_hz(Complex32::new(0.0, 5000.0), 1000, 1000, 1.0, 0.8, 0.1);
         assert!(
             delta > 0.0,
             "fine AFC should react on coherent cyclic-prefix data"
@@ -1676,11 +1914,10 @@ mod tests {
     }
 
     #[test]
-    fn coarse_afc_needed_matches_dabstar_fic_gate() {
-        assert!(coarse_afc_needed(0));
-        assert!(coarse_afc_needed(29));
-        assert!(!coarse_afc_needed(30));
-        assert!(!coarse_afc_needed(100));
+    fn structural_hold_gate_depends_only_on_rf_quality() {
+        assert!(structural_hold_allowed(0.35, 0.20));
+        assert!(!structural_hold_allowed(0.20, 0.20));
+        assert!(!structural_hold_allowed(0.35, 0.40));
     }
 
     #[test]
@@ -1747,20 +1984,76 @@ mod tests {
         assert_eq!(control.state(), SyncState::EvalSyncSymbol);
         assert_eq!(control.current_threshold(), 3);
 
-        control.on_frame_processed();
+        control.on_frame_processed(0.75, 0.10);
         assert_eq!(control.state(), SyncState::EvalSyncSymbol);
         assert_eq!(control.current_threshold(), 6);
+    }
+
+    #[test]
+    fn sync_loop_control_enters_degraded_holding_before_drop() {
+        let mut control = SyncLoopControl::new(2, 5);
+        control.on_time_sync_established();
+        control.on_frame_processed(0.72, 0.08);
+
+        let outcome = control.on_tracking_miss(0.36, 0.18);
+
+        assert_eq!(outcome, SyncRecovery::Hold);
+        assert_eq!(control.state(), SyncState::DegradedHolding);
+        assert_eq!(control.current_threshold(), 2);
+    }
+
+    #[test]
+    fn sync_loop_control_only_drops_after_hold_budget_is_exhausted() {
+        let mut control = SyncLoopControl::new(2, 5);
+        control.on_time_sync_established();
+        control.on_frame_processed(0.72, 0.08);
+
+        assert_eq!(control.on_tracking_miss(0.34, 0.20), SyncRecovery::Hold);
+        for _ in 0..MAX_DEGRADED_HOLD_FRAMES.saturating_sub(1) {
+            control.on_degraded_frame_boundary();
+            assert_eq!(control.on_tracking_miss(0.34, 0.20), SyncRecovery::Hold);
+        }
+
+        control.on_degraded_frame_boundary();
+        assert_eq!(control.on_tracking_miss(0.12, 0.72), SyncRecovery::Lost);
+        assert_eq!(control.state(), SyncState::WaitForTimeSyncMarker);
+    }
+
+    #[test]
+    fn sync_loop_control_refills_hold_budget_after_recovered_frame() {
+        let mut control = SyncLoopControl::new(2, 5);
+        control.on_time_sync_established();
+        control.on_frame_processed(0.72, 0.08);
+
+        for cycle in 0..(MAX_DEGRADED_HOLD_FRAMES as usize + 2) {
+            assert_eq!(
+                control.on_tracking_miss(0.34, 0.20),
+                SyncRecovery::Hold,
+                "intermittent fade cycle {cycle} should stay in degraded hold"
+            );
+            control.on_degraded_frame_boundary();
+            control.on_frame_processed(0.40, 0.20);
+            assert_eq!(control.state(), SyncState::EvalSyncSymbol);
+        }
+    }
+
+    #[test]
+    fn snr_observability_requires_soft_lock_and_good_post_eq_quality() {
+        assert!(snr_is_observable(0.72, 0.10, true));
+        assert!(!snr_is_observable(0.49, 0.10, true));
+        assert!(!snr_is_observable(0.72, 0.30, true));
+        assert!(!snr_is_observable(0.72, 0.10, false));
     }
 
     #[test]
     fn sync_loop_control_returns_to_acquisition_after_sync_loss() {
         let mut control = SyncLoopControl::new(3, 6);
         control.on_time_sync_established();
-        control.on_frame_processed();
+        control.on_frame_processed(0.72, 0.10);
 
         control.on_sync_lost();
         assert_eq!(control.state(), SyncState::WaitForTimeSyncMarker);
-        assert_eq!(control.current_threshold(), 6);
+        assert_eq!(control.current_threshold(), 3);
     }
 
     #[test]
@@ -1804,11 +2097,12 @@ mod tests {
     }
 
     #[test]
-    fn coarse_correction_plan_respects_fic_quality_gate() {
-        assert!(plan_coarse_correction(80, false, 500, 1_000).is_none());
+    fn coarse_correction_plan_respects_structural_gate() {
+        assert!(plan_coarse_correction(false, false, 500, 1_000, 0.20, 0.10).is_none());
+        assert!(plan_coarse_correction(false, false, 500, 1_000, 0.40, 0.70).is_none());
 
-        let plan = plan_coarse_correction(0, false, 500, 1_000)
-            .expect("coarse correction should be considered at low FIC quality");
+        let plan = plan_coarse_correction(false, false, 500, 1_000, 0.72, 0.10)
+            .expect("coarse correction should be considered during acquisition when RF structure is healthy");
         assert_eq!(plan.updated_coarse_hz, 1_500);
         assert!(plan.step_applied);
         assert!(plan.reset_clock_error);
@@ -1816,12 +2110,29 @@ mod tests {
 
     #[test]
     fn coarse_correction_plan_skips_reused_tracking_alignment() {
-        assert!(plan_coarse_correction(0, true, 500, 1_000).is_none());
+        assert!(plan_coarse_correction(true, false, 500, 1_000, 0.72, 0.10).is_none());
+    }
+
+    #[test]
+    fn coarse_correction_plan_freezes_during_soft_lock() {
+        assert!(plan_coarse_correction(false, true, 500, 6, 0.72, 0.10).is_none());
     }
 
     #[test]
     fn null_symbol_metrics_plan_stays_finite_and_reports_on_schedule() {
-        let plan = plan_null_symbol_metrics(0.0, 0.0, 0.0, 10, 200, -33.5);
+        let plan = plan_null_symbol_metrics(
+            0.0,
+            0.0,
+            0.0,
+            10,
+            200,
+            -33.5,
+            ObservabilitySnapshot {
+                post_eq_quality: 0.8,
+                eq_weak_ratio: 0.1,
+                soft_locked: true,
+            },
+        );
         assert!(plan.snr_db.is_finite());
         assert!(plan.emit_report);
         assert_eq!(plan.next_report_count, 0);
