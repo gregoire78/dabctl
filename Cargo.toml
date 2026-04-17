@@ -17,17 +17,12 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 base64 = "0.22"
 encoding_rs = "0.8.35"
-rtl-sdr-rs = { version = "0.3", optional = true }
 
 [features]
 # RTL-SDR backend selection (choose exactly one):
 #   default: old-dab/rtlsdr (vendored, built from source via cmake)
-#   rtl-sdr-osmocom: system librtlsdr-dev (osmocom fork) — cargo build --no-default-features --features rtl-sdr-osmocom
-#   rtl-sdr-rs: pure-Rust crate — cargo build --no-default-features --features rtl-sdr-rs
 default = ["rtl-sdr-old-dab"]
 rtl-sdr-old-dab = []
-rtl-sdr-osmocom = []
-rtl-sdr-rs = ["dep:rtl-sdr-rs"]
 
 # Enable the Fraunhofer fdk-aac decoder instead of the default faad2.
 # Install libfdk-aac-dev and build with: cargo build --features fdk-aac
