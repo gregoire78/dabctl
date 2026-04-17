@@ -42,9 +42,27 @@ impl MotDecoder {
     }
 
     fn append_subfield_data(&mut self, data: &[u8]) {
-        let copy_len = (MOT_DG_SIZE_MAX - self.size).min(data.len());
+        // ETSI EN 301 234 §5.1: DGLI announces the exact Data Group size.
+        // The final X-PAD subfield may still contain trailing pad bytes, which
+        // must not be accumulated into the MOT group or the CRC check will be
+        // evaluated on an overrun buffer.
+        let remaining = if self.has_pending_length() {
+            self.size_needed.saturating_sub(self.size)
+        } else {
+            MOT_DG_SIZE_MAX - self.size
+        };
+        let copy_len = remaining.min(MOT_DG_SIZE_MAX - self.size).min(data.len());
         self.buffer[self.size..self.size + copy_len].copy_from_slice(&data[..copy_len]);
         self.size += copy_len;
+
+        if copy_len < data.len() {
+            tracing::trace!(
+                "MOT DG subfield trimmed: kept={} dropped={} target_size={}",
+                copy_len,
+                data.len() - copy_len,
+                self.size_needed
+            );
+        }
     }
 
     fn is_complete_group_ready(&self) -> bool {
@@ -292,5 +310,17 @@ mod tests {
             dec.get_data_group().is_empty(),
             "partial MOT groups must not be handed to the manager"
         );
+    }
+
+    #[test]
+    fn test_mot_decoder_ignores_trailing_padding_after_announced_dgli_length() {
+        let mut dec = MotDecoder::new();
+        let dg = build_dg_with_crc(&[0x90, 0x91, 0x92, 0x93, 0x94]);
+
+        dec.set_len(dg.len());
+
+        assert!(!dec.process_subfield(true, &dg[..4]));
+        assert!(dec.process_subfield(false, &[dg[4], dg[5], dg[6], 0xAA, 0xBB]));
+        assert_eq!(dec.get_data_group(), dg);
     }
 }
