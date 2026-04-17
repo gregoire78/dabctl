@@ -94,6 +94,7 @@ pub struct StatusThreadConfig {
     pub signal_noise: Arc<AtomicI16>,
     pub fic_ok: Arc<AtomicI32>,
     pub fic_total: Arc<AtomicI32>,
+    pub fic_quality_percent: Arc<AtomicI16>,
     pub freq_offset_hz: Arc<AtomicI32>,
     pub tuned_freq_hz: i32,
     pub gain_tenths: Arc<AtomicI32>,
@@ -146,17 +147,11 @@ impl AudioCounters {
     pub fn snapshot_and_reset(
         &self,
         snr: i16,
-        fib_ok: i32,
-        fib_total: i32,
+        fib_quality: i32,
         freq_offset_hz: i32,
         tuned_freq_hz: i32,
         gain_db_x10: i32,
     ) -> AudioStatusSnapshot {
-        let fib_quality = if fib_total > 0 {
-            fib_ok * 100 / fib_total
-        } else {
-            0
-        };
         let sync_ok = self.sync_ok.swap(0, Ordering::SeqCst);
         let offset_hz = if sync_ok > 0 { freq_offset_hz } else { 0 };
         let mppm = if sync_ok > 0 && tuned_freq_hz > 0 {
@@ -200,6 +195,7 @@ pub fn spawn_status_thread(counters: AudioCounters, config: StatusThreadConfig) 
             signal_noise,
             fic_ok,
             fic_total,
+            fic_quality_percent,
             freq_offset_hz,
             tuned_freq_hz,
             gain_tenths,
@@ -210,10 +206,11 @@ pub fn spawn_status_thread(counters: AudioCounters, config: StatusThreadConfig) 
         while status_run.load(Ordering::SeqCst) {
             let gain_t = gain_tenths.load(Ordering::Relaxed);
             let gain_db_x10 = if gain_t >= 0 { gain_t } else { 0 };
+            let _ = fic_ok.swap(0, Ordering::SeqCst);
+            let _ = fic_total.swap(0, Ordering::SeqCst);
             let snapshot = counters.snapshot_and_reset(
                 signal_noise.load(Ordering::SeqCst),
-                fic_ok.swap(0, Ordering::SeqCst),
-                fic_total.swap(0, Ordering::SeqCst),
+                i32::from(fic_quality_percent.load(Ordering::SeqCst)),
                 freq_offset_hz.load(Ordering::Relaxed),
                 tuned_freq_hz,
                 gain_db_x10,
@@ -762,13 +759,21 @@ mod tests {
         counters.frames_in.store(12, Ordering::SeqCst);
         counters.sync_ok.store(4, Ordering::SeqCst);
         counters.sync_fail.store(2, Ordering::SeqCst);
-        let snap = counters.snapshot_and_reset(14, 8, 10, -35, 199_360_000, 207);
+        let snap = counters.snapshot_and_reset(14, 80, -35, 199_360_000, 207);
         assert_eq!(snap.frames, 12);
         assert_eq!(snap.sync_ok, 4);
         assert_eq!(snap.sync_fail, 2);
         assert_eq!(snap.freq_offset_hz, -35);
+        assert_eq!(snap.fib_quality, 80);
         assert_eq!(counters.frames_in.load(Ordering::SeqCst), 0);
         assert_eq!(counters.sync_ok.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn snapshot_and_reset_keeps_nonzero_fic_confidence_through_blackout() {
+        let counters = AudioCounters::new();
+        let snap = counters.snapshot_and_reset(13, 70, 0, 199_360_000, 207);
+        assert_eq!(snap.fib_quality, 70);
     }
 
     #[test]
