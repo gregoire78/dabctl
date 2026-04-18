@@ -80,6 +80,7 @@ impl MetadataWriter {
         }
     }
 
+    #[allow(dead_code)]
     pub fn save_slide_to_dir(&mut self, dir: &Path, name: &str, payload: &[u8]) -> Result<()> {
         let path = dir.join(name);
         std::fs::write(path, payload)?;

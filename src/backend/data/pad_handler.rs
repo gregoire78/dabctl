@@ -31,4 +31,25 @@ impl PadHandler {
     pub fn last_dynamic_label(&self) -> Option<&str> {
         self.last_dynamic_label.as_deref()
     }
+
+    pub fn take_last_slide(&mut self) -> Option<Slide> {
+        self.last_slide.take()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PadHandler, Slide};
+
+    #[test]
+    fn takes_last_slide_once() {
+        let mut handler = PadHandler::default();
+        handler.accept_slide(Slide::new("cover.jpg", "image/jpeg", vec![1, 2, 3]));
+
+        let slide = handler
+            .take_last_slide()
+            .expect("slide should be available");
+        assert_eq!(slide.content_name, "cover.jpg");
+        assert!(handler.take_last_slide().is_none());
+    }
 }

@@ -35,7 +35,7 @@ impl DecoderFactory {
             AacDecoderKind::FdkAac => {
                 #[cfg(feature = "fdk-aac")]
                 {
-                    Box::new(fdk_aac::FdkAacDecoder)
+                    Box::new(fdk_aac::FdkAacDecoder::default())
                 }
                 #[cfg(not(feature = "fdk-aac"))]
                 {
