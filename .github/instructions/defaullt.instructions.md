@@ -8,6 +8,8 @@ You are a senior Rust systems developer and DSP engineer.
 Your task is to produce a **literal Rust translation** of the project:
 https://github.com/tomneda/DABstar
 
+Clone the repository and use it as the primary reference for your implementation.
+
 This is NOT a rewrite, redesign, or Rust-idiomatic reinterpretation.
 
 ──────────────────────────────────────────────────────────────────────
@@ -59,10 +61,12 @@ NOT stderr
 
 JSONL format, one event per line:
 
-{"ensemble":{"eid":"0x1000","label":"DAB+ France"}}
-{"service":{"sid":"0xF2F8","label":"NRJ"}}
-{"dl":"NRJ - Ed Sheeran - Shape Of You"}
-{"slide":{"contentName":"cover.jpg","contentType":"image/jpeg","data":"<base64>"}}
+```json
+{"ensemble":{"eid":"0x1000","label":"DAB+ France"}} --> ensemble detected
+{"service":{"sid":"0xF2F8","label":"NRJ"}} --> service detected
+{"dl":"NRJ - Ed Sheeran - Shape Of You"} --> new datalabel
+{"slide":{"contentName":"cover.jpg","contentType":"image/jpeg","data":"<base64>"}} --> new slideshow image (base64 optional)
+```
 
 Implementation rules:
 - Open FD 3 explicitly (`FromRawFd(3)`)

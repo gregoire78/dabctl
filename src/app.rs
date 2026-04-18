@@ -1,4 +1,8 @@
 use std::fs;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use anyhow::{anyhow, Result};
 use tracing::info;
@@ -40,7 +44,13 @@ impl DabRadio {
             "starting DABstar-style receive path"
         );
 
+        let running = Arc::new(AtomicBool::new(true));
+        let running_ctrlc = Arc::clone(&running);
+        let _ = ctrlc::set_handler(move || {
+            running_ctrlc.store(false, Ordering::SeqCst);
+        });
+
         let mut processor = DabProcessor::new(config);
-        processor.run(&mut self.metadata, &mut self.pcm)
+        processor.run(&mut self.metadata, &mut self.pcm, running)
     }
 }
