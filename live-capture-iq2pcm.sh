@@ -22,7 +22,7 @@ cd "$(dirname "$0")/test-local" || { echo "[ERREUR] Impossible de changer de ré
 # Construire en release et lancer les tests avant la capture
 echo "[build] Compilation en release..."
 pushd .. > /dev/null
-rtk cargo test --lib || { echo "[ERREUR] Tests unitaires échoués"; exit 1; }
+rtk cargo test || { echo "[ERREUR] Tests unitaires échoués"; exit 1; }
 rtk cargo build --release --features fdk-aac || { echo "[ERREUR] Build release échoué"; exit 1; }
 popd > /dev/null
 
