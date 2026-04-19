@@ -1214,8 +1214,9 @@ impl OfdmProcessor {
         let mut buffers = OfdmRunBuffers::new(self.carriers, self.t_null, self.t_u, self.t_s);
         let mut control = SyncLoopControl::new(self.threshold_1, self.threshold_2);
 
-        // DABstar warms the signal-level estimator with a short burst of raw
-        // useful-symbol reads before entering the state machine.
+        // eti-cmdline warms the long-term level estimator for roughly half a
+        // frame before entering acquisition, so the null-dip thresholds are
+        // based on real RF amplitude immediately from startup.
         self.s_level = 0.0;
         self.coarse_corrector = 0;
         self.fine_corrector = 0.0;
@@ -1226,7 +1227,7 @@ impl OfdmProcessor {
         self.reference_phase.fill(Complex32::new(0.0, 0.0));
         self.r1_buf.fill(Complex32::new(0.0, 0.0));
         if self
-            .discard_samples(device, 20 * self.t_u, &mut buffers.block_buf)
+            .discard_samples(device, self.t_f / 2, &mut buffers.block_buf)
             .is_err()
         {
             return;

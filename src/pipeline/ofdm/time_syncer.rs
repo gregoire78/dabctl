@@ -15,7 +15,9 @@ pub enum TimeSyncState {
 
 const SYNC_BUFFER_SIZE: usize = 4096;
 const LEVEL_SEARCH_SIZE: usize = 50;
-const NULL_DIP_START_RATIO: f32 = 0.55;
+// eti-cmdline acquisition waits for the 50-sample mean to fall below
+// 0.50 × s_level before accepting the start of a null dip.
+const NULL_DIP_START_RATIO: f32 = 0.50;
 const NULL_DIP_END_RATIO: f32 = 0.75;
 
 pub struct TimeSyncer {
@@ -155,12 +157,25 @@ mod tests {
     fn time_syncer_uses_direct_threshold_crossing_like_dabstar() {
         let mut syncer = TimeSyncer::new(4096, 50);
         let mut levels = vec![1.0f32; 64];
-        levels.extend(std::iter::repeat_n(0.0f32, 24));
+        levels.extend(std::iter::repeat_n(0.0f32, 50));
         levels.extend(std::iter::repeat_n(1.0f32, 128));
         let mut iter = levels.into_iter();
 
         let state = syncer.read_samples_until_end_of_level_drop(1.0, 100, 80, || iter.next());
 
         assert_eq!(state, Some(TimeSyncState::TimeSyncEstablished));
+    }
+
+    #[test]
+    fn time_syncer_rejects_shallow_startup_dip() {
+        let mut syncer = TimeSyncer::new(4096, 50);
+        let mut levels = vec![1.0f32; 64];
+        levels.extend(std::iter::repeat_n(0.53f32, 300));
+        levels.extend(std::iter::repeat_n(1.0f32, 128));
+        let mut iter = levels.into_iter();
+
+        let state = syncer.read_samples_until_end_of_level_drop(1.0, 256, 400, || iter.next());
+
+        assert_eq!(state, Some(TimeSyncState::NoDipFound));
     }
 }
