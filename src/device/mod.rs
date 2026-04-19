@@ -1,6 +1,7 @@
 pub mod ffi;
 
 use anyhow::{anyhow, bail, Result};
+use tracing::{debug, info};
 
 const DAB_SAMPLE_RATE_HZ: u32 = 2_048_000;
 
@@ -17,10 +18,31 @@ pub struct DeviceOptions {
 
 pub struct RtlSdrDevice {
     raw: *mut ffi::rtlsdr_dev_t,
+    agc_mode: &'static str,
+    center_freq_hz: u32,
+    read_calls: u64,
+    last_tuner_gain_tenths_db: Option<i32>,
+    agc_logging_enabled: bool,
 }
 
 impl RtlSdrDevice {
     pub fn open(options: &DeviceOptions) -> Result<Self> {
+        let agc_mode = agc_mode_label(options);
+        let requested_gain_db = options
+            .gain
+            .map(|gain| user_gain_to_tenths_db(gain) as f32 / 10.0);
+
+        info!(
+            device_index = options.index,
+            center_freq_hz = options.center_freq_hz,
+            agc_mode,
+            requested_gain_db = ?requested_gain_db,
+            hardware_agc = options.hardware_agc,
+            driver_agc = options.driver_agc,
+            software_agc = options.software_agc,
+            "configuring RTL-SDR gain control"
+        );
+
         let raw = with_suppressed_stderr(options.silent, || -> Result<*mut ffi::rtlsdr_dev_t> {
             let count = unsafe { ffi::rtlsdr_get_device_count() };
             if count == 0 {
@@ -75,7 +97,12 @@ impl RtlSdrDevice {
                 )?;
             }
 
-            let _software_agc_requested = options.software_agc;
+            if options.software_agc {
+                info!(
+                    agc_mode,
+                    "software AGC requested; enabling live AGC telemetry for the receive path"
+                );
+            }
 
             checked(
                 unsafe { ffi::rtlsdr_reset_buffer(raw) },
@@ -85,7 +112,46 @@ impl RtlSdrDevice {
             Ok(raw)
         })?;
 
-        Ok(Self { raw })
+        let current_gain = current_tuner_gain_tenths_db(raw);
+        if let Some(gain_tenths_db) = current_gain {
+            info!(
+                agc_mode,
+                tuner_gain_db = tenths_db_to_db(gain_tenths_db),
+                "RTL-SDR gain control ready"
+            );
+        } else {
+            info!(agc_mode, "RTL-SDR gain control ready");
+        }
+
+        Ok(Self {
+            raw,
+            agc_mode,
+            center_freq_hz: options.center_freq_hz,
+            read_calls: 0,
+            last_tuner_gain_tenths_db: current_gain,
+            agc_logging_enabled: options.hardware_agc || options.driver_agc || options.software_agc,
+        })
+    }
+
+    pub fn center_freq_hz(&self) -> u32 {
+        self.center_freq_hz
+    }
+
+    pub fn set_center_freq_hz(&mut self, center_freq_hz: u32) -> Result<()> {
+        checked(
+            unsafe { ffi::rtlsdr_set_center_freq(self.raw, center_freq_hz) },
+            "rtlsdr_set_center_freq",
+        )?;
+        self.center_freq_hz = center_freq_hz;
+        debug!(center_freq_hz, "updated RTL-SDR center frequency");
+        Ok(())
+    }
+
+    pub fn reset_buffer(&mut self) -> Result<()> {
+        checked(
+            unsafe { ffi::rtlsdr_reset_buffer(self.raw) },
+            "rtlsdr_reset_buffer",
+        )
     }
 
     pub fn read_sync(&mut self, buf: &mut [u8]) -> Result<usize> {
@@ -102,7 +168,40 @@ impl RtlSdrDevice {
             "rtlsdr_read_sync",
         )?;
 
-        usize::try_from(n_read).map_err(|_| anyhow!("rtlsdr_read_sync returned a negative length"))
+        let n_read = usize::try_from(n_read)
+            .map_err(|_| anyhow!("rtlsdr_read_sync returned a negative length"))?;
+
+        self.read_calls = self.read_calls.saturating_add(1);
+        if self.agc_logging_enabled {
+            let current_gain = current_tuner_gain_tenths_db(self.raw);
+            let gain_changed = current_gain != self.last_tuner_gain_tenths_db;
+            let should_log =
+                self.read_calls <= 4 || self.read_calls.is_multiple_of(16) || gain_changed;
+
+            if should_log {
+                if let Some(gain_tenths_db) = current_gain {
+                    debug!(
+                        agc_mode = self.agc_mode,
+                        read_call = self.read_calls,
+                        bytes = n_read,
+                        tuner_gain_db = tenths_db_to_db(gain_tenths_db),
+                        gain_changed,
+                        "AGC tuner state"
+                    );
+                } else {
+                    debug!(
+                        agc_mode = self.agc_mode,
+                        read_call = self.read_calls,
+                        bytes = n_read,
+                        gain_changed,
+                        "AGC tuner state"
+                    );
+                }
+                self.last_tuner_gain_tenths_db = current_gain;
+            }
+        }
+
+        Ok(n_read)
     }
 }
 
@@ -119,6 +218,29 @@ fn checked(code: i32, api: &str) -> Result<()> {
         bail!("{api} failed with status {code}");
     }
     Ok(())
+}
+
+fn agc_mode_label(options: &DeviceOptions) -> &'static str {
+    if options.hardware_agc {
+        "hardware-agc"
+    } else if options.driver_agc {
+        "driver-agc"
+    } else if options.software_agc {
+        "software-agc"
+    } else if options.gain.is_some() {
+        "manual-gain"
+    } else {
+        "tuner-auto"
+    }
+}
+
+fn current_tuner_gain_tenths_db(raw: *mut ffi::rtlsdr_dev_t) -> Option<i32> {
+    let gain = unsafe { ffi::rtlsdr_get_tuner_gain(raw) };
+    (gain >= 0).then_some(gain)
+}
+
+fn tenths_db_to_db(gain_tenths_db: i32) -> f32 {
+    gain_tenths_db as f32 / 10.0
 }
 
 fn user_gain_to_tenths_db(gain: u8) -> i32 {

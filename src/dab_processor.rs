@@ -28,19 +28,79 @@ fn prs_threshold_for_lock_state(locked: bool) -> f32 {
     }
 }
 
-fn frame_uses_non_tii_null(frame_index: u64) -> bool {
-    (frame_index & 0x7) < 4
+fn frame_uses_non_tii_null(cif_count: Option<u16>, frame_index: u64) -> bool {
+    let cycle = cif_count.map(u64::from).unwrap_or(frame_index);
+    (cycle & 0x7) < 4
 }
 
 fn coarse_afc_should_apply(correction_hz: i32) -> bool {
     correction_hz != 0
 }
 
-fn coarse_afc_requires_reacquisition(_correction_hz: i32) -> bool {
-    // DABstar applies the updated BB offset and continues decoding the
-    // current frame. It only skips clock-error integration for frames where a
-    // non-zero coarse step was applied.
-    false
+fn coarse_afc_requires_reacquisition(correction_hz: i32) -> bool {
+    // In the buffered dabctl live path, any non-zero coarse PRS correction must
+    // restart acquisition with the updated BB offset. Continuing the same frame
+    // leaves the symbol/phase history inconsistent and quickly collapses lock.
+    correction_hz != 0
+}
+
+fn should_transfer_correction_to_rf(
+    fic_ratio_percent: usize,
+    frames_processed: u64,
+    bb_freq_offs_applied_hz: i32,
+    rf_freq_shift_used: bool,
+) -> bool {
+    // In the buffered CLI path, tiny residual BB corrections are safer to keep
+    // in software. Only consider a one-time RF takeover once lock is already
+    // strong and the residual offset is materially large.
+    const MIN_RF_HANDOFF_HZ: i32 = 250;
+    fic_ratio_percent >= 90
+        && frames_processed >= 6
+        && !rf_freq_shift_used
+        && bb_freq_offs_applied_hz.abs() >= MIN_RF_HANDOFF_HZ
+}
+
+fn normalized_cp_coherence(freq_corr: Complex32, energy_sum: f32) -> f32 {
+    if energy_sum > 1.0e-12 {
+        freq_corr.norm() / energy_sum
+    } else {
+        0.0
+    }
+}
+
+// DABstar evaluates the next sync symbol from a TU-sized preview that starts
+// one guard interval before the nominal boundary so the useful-part peak lands
+// near TG inside the correlator.
+const TRACKING_PRS_SEARCH_BACKOFF: usize = TG;
+const MAX_TRACKING_PRS_MISSES: u32 = 3;
+
+fn fine_afc_gain(_locked_frames: u32, cp_coherence: f32) -> f32 {
+    if cp_coherence < 0.02 {
+        0.0
+    } else if cp_coherence < 0.08 {
+        0.35
+    } else {
+        // DABstar applies the cyclic-prefix phase correction at full scale.
+        // Keep that behavior when coherence is healthy, and only damp it in
+        // marginal conditions where the estimate is noisy.
+        1.0
+    }
+}
+
+fn tracked_frame_sample_count(prs_peak: Option<usize>, search_base: usize) -> Option<usize> {
+    prs_peak.map(|peak| search_base + peak)
+}
+
+fn should_reacquire_after_prs_miss(prs_miss_count: u32) -> bool {
+    prs_miss_count >= MAX_TRACKING_PRS_MISSES
+}
+
+fn preview_rot_phase(rot_phase: f32, freq_hz: f32, sample_offset: usize) -> f32 {
+    const SAMPLE_RATE: f32 = 2_048_000.0;
+    let phase_step = -2.0 * std::f32::consts::PI * freq_hz / SAMPLE_RATE;
+    let two_pi = 2.0 * std::f32::consts::PI;
+    let phase = rot_phase + phase_step * sample_offset as f32;
+    (phase + std::f32::consts::PI).rem_euclid(two_pi) - std::f32::consts::PI
 }
 
 /// Rotate `src` into `dst` applying baseband frequency `freq_hz` continuously.
@@ -49,10 +109,12 @@ fn coarse_afc_requires_reacquisition(_correction_hz: i32) -> bool {
 fn rotate_into(src: &[Complex32], dst: &mut [Complex32], rot_phase: &mut f32, freq_hz: f32) {
     const SAMPLE_RATE: f32 = 2_048_000.0;
     let phase_step = -2.0 * std::f32::consts::PI * freq_hz / SAMPLE_RATE;
+    let two_pi = 2.0 * std::f32::consts::PI;
     for (out, s) in dst.iter_mut().zip(src.iter()) {
         *out = *s * Complex32::new(rot_phase.cos(), rot_phase.sin());
         *rot_phase += phase_step;
     }
+    *rot_phase = (*rot_phase + std::f32::consts::PI).rem_euclid(two_pi) - std::f32::consts::PI;
 }
 
 #[derive(Debug, Clone)]
@@ -116,12 +178,23 @@ pub struct DabProcessor {
     ofdm_decoder: OfdmDecoder,
     /// Smoothed sample clock error in Hz (DABstar's mClockErrHz).
     clock_err_hz: f32,
-    /// Baseband frequency correction (applied per-symbol during demodulation).
+    /// Floating accumulator of the residual BB frequency correction, matching
+    /// DABstar's mFreqOffsSyncSymb.
     bb_freq_offs_hz: f32,
+    /// Integer Hz value actually applied by the software mixer, matching
+    /// DABstar's mFreqOffsBBHz.
+    bb_freq_offs_applied_hz: i32,
+    /// DABstar hands a stable coarse correction over to RF once the FIC is
+    /// healthy; do that once in the CLI path too.
+    rf_freq_shift_used: bool,
     /// Persistent BB mixer phase accumulator, matching DABstar's SampleReader
     /// mixer continuity across getSamples() calls.
     bb_rot_phase: f32,
-    /// Pre-allocated work buffer for per-symbol BB rotation (size = TS).
+    /// Number of contiguous frames processed since the last acquisition/reset.
+    locked_frame_count: u32,
+    /// Number of consecutive PRS tracking misses while nominal framing is kept.
+    prs_miss_count: u32,
+    /// Pre-allocated work buffer for BB rotation of OFDM and null symbols.
     work_buf: Vec<num_complex::Complex32>,
 }
 
@@ -136,8 +209,12 @@ impl DabProcessor {
             ofdm_decoder: OfdmDecoder::default(),
             clock_err_hz: 0.0,
             bb_freq_offs_hz: 0.0,
+            bb_freq_offs_applied_hz: 0,
+            rf_freq_shift_used: false,
             bb_rot_phase: 0.0,
-            work_buf: vec![num_complex::Complex32::new(0.0, 0.0); TS],
+            locked_frame_count: 0,
+            prs_miss_count: 0,
+            work_buf: vec![num_complex::Complex32::new(0.0, 0.0); 2_656],
             config,
         }
     }
@@ -164,6 +241,9 @@ impl DabProcessor {
         let mut reader = SampleReader::new(device);
         reader.set_dc_and_iq_correction(true, false);
         self.bb_rot_phase = 0.0;
+        self.locked_frame_count = 0;
+        self.prs_miss_count = 0;
+        self.rf_freq_shift_used = false;
         let mut ofdm_started = false;
         let mut last_dynamic_label = String::new();
         let mut ensemble_announced = false;
@@ -174,8 +254,6 @@ impl DabProcessor {
         // symbols).  read_iq_block() takes a *byte* count; each complex
         // sample is 2 IQ bytes.
         const FRAME_SAMPLES: usize = 196_608;
-        const FRAME_ALIGN_SEARCH: usize = 6 * TS;
-        const FRAME_TRACK_TOLERANCE: usize = 2_048;
 
         // ── Phase 1: initial sync ──────────────────────────────────────
         // Use frame-sized reads and accumulate a few frames, matching the
@@ -199,6 +277,7 @@ impl DabProcessor {
                 buf.drain(..drop);
             }
 
+            self.time_syncer.set_signal_level(reader.signal_level());
             match self.time_syncer.push(&buf) {
                 Some(prs_start) => {
                     let refined_prs_start = if buf.len() >= prs_start + TU {
@@ -240,30 +319,111 @@ impl DabProcessor {
         // Track the next PRS near the expected boundary so small sample-clock
         // drift is absorbed without allowing large false jumps.
         let mut frames_processed: u64 = 0;
+        let mut pending_rf_handoff_hz: Option<i32> = None;
         while running.load(Ordering::SeqCst) {
-            while buf.len() >= FRAME_SAMPLES + FRAME_ALIGN_SEARCH && running.load(Ordering::SeqCst)
-            {
-                let search_start = FRAME_SAMPLES.saturating_sub(FRAME_ALIGN_SEARCH);
-                let search_end = (FRAME_SAMPLES + FRAME_ALIGN_SEARCH).min(buf.len());
-                let sample_count = self
-                    .time_syncer
-                    .track_near(
-                        &buf[search_start..search_end],
-                        FRAME_ALIGN_SEARCH,
-                        FRAME_TRACK_TOLERANCE,
-                    )
-                    .map(|rel| search_start + rel)
-                    .unwrap_or(FRAME_SAMPLES);
-                let sample_count = if buf.len() >= sample_count + TU {
+            while buf.len() >= FRAME_SAMPLES + TU && running.load(Ordering::SeqCst) {
+                // Once locked, DABstar does not rescan for a fresh null symbol each
+                // frame. It evaluates the next PRS from a short preview window
+                // just before the nominal boundary and tracks the local PRS peak
+                // there without re-running a full null search.
+                let prs_search_base = FRAME_SAMPLES.saturating_sub(TRACKING_PRS_SEARCH_BACKOFF);
+                let mut prs_preview_phase = preview_rot_phase(
+                    self.bb_rot_phase,
+                    self.bb_freq_offs_applied_hz as f32,
+                    prs_search_base,
+                );
+                rotate_into(
+                    &buf[prs_search_base..(prs_search_base + TU)],
+                    &mut self.work_buf[..TU],
+                    &mut prs_preview_phase,
+                    self.bb_freq_offs_applied_hz as f32,
+                );
+                let sample_count = if let Some(sample_count) = tracked_frame_sample_count(
                     self.phase_reference
                         .correlate_with_phase_ref_and_find_max_peak(
-                            &buf[sample_count..(sample_count + TU)],
+                            &self.work_buf[..TU],
                             prs_threshold_for_lock_state(true),
-                        )
-                        .map(|peak| sample_count + peak.saturating_sub(TG))
-                        .unwrap_or(sample_count)
-                } else {
+                        ),
+                    prs_search_base,
+                ) {
+                    self.prs_miss_count = 0;
                     sample_count
+                } else {
+                    self.prs_miss_count = self.prs_miss_count.saturating_add(1);
+                    if should_reacquire_after_prs_miss(self.prs_miss_count) {
+                        debug!(
+                            frames_processed,
+                            prs_search_base,
+                            prs_miss_count = self.prs_miss_count,
+                            "lost PRS tracking; restarting time sync like DABstar"
+                        );
+                        self.ofdm_decoder.reset();
+                        self.time_syncer = TimeSyncer::default();
+                        self.locked_frame_count = 0;
+                        self.prs_miss_count = 0;
+                        ofdm_started = false;
+                        buf.drain(..FRAME_SAMPLES.min(buf.len()));
+                        while running.load(Ordering::SeqCst) {
+                            debug!(bytes = 2 * FRAME_SAMPLES, "reading initial IQ block");
+                            let iq = match reader.read_iq_block(2 * FRAME_SAMPLES) {
+                                Ok(iq) => iq,
+                                Err(err) => {
+                                    warn!(error = %err, "stopping: RTL-SDR read failure during initial sync");
+                                    return Ok(());
+                                }
+                            };
+                            debug!(samples = iq.len(), "initial IQ read completed");
+                            buf.extend_from_slice(&iq);
+
+                            if buf.len() > 4 * FRAME_SAMPLES {
+                                let drop = buf.len() - 4 * FRAME_SAMPLES;
+                                buf.drain(..drop);
+                            }
+
+                            self.time_syncer.set_signal_level(reader.signal_level());
+                            match self.time_syncer.push(&buf) {
+                                Some(prs_start) => {
+                                    let refined_prs_start = if buf.len() >= prs_start + TU {
+                                        self.phase_reference
+                                            .correlate_with_phase_ref_and_find_max_peak(
+                                                &buf[prs_start..(prs_start + TU)],
+                                                prs_threshold_for_lock_state(false),
+                                            )
+                                            .map(|peak| prs_start + peak.saturating_sub(TG))
+                                            .unwrap_or(prs_start)
+                                    } else {
+                                        prs_start
+                                    };
+                                    info!(
+                                        prs_offset = refined_prs_start,
+                                        buf_complex_samples = buf.len(),
+                                        "initial DAB frame sync acquired"
+                                    );
+                                    buf.drain(..refined_prs_start);
+                                    if buf.len() > FRAME_SAMPLES {
+                                        buf.truncate(FRAME_SAMPLES);
+                                    }
+                                    break;
+                                }
+                                None => {
+                                    debug!(
+                                        buf_complex_samples = buf.len(),
+                                        "no DAB null-symbol found yet; continuing startup stream"
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                        frames_processed += 1;
+                        continue;
+                    }
+                    debug!(
+                        frames_processed,
+                        prs_search_base,
+                        prs_miss_count = self.prs_miss_count,
+                        "transient PRS miss; keeping nominal frame boundary"
+                    );
+                    FRAME_SAMPLES
                 };
                 let frame_end = sample_count.min(buf.len());
                 let frame = &buf[..frame_end];
@@ -278,7 +438,7 @@ impl DabProcessor {
                     &frame[..TS],
                     &mut self.work_buf,
                     &mut self.bb_rot_phase,
-                    self.bb_freq_offs_hz,
+                    self.bb_freq_offs_applied_hz as f32,
                 );
                 let symbol_0_bins = self.ofdm_decoder.symbol_0_bins(&self.work_buf);
                 self.ofdm_decoder
@@ -293,15 +453,26 @@ impl DabProcessor {
                             coarse_correction_hz = correction_hz;
                             self.bb_freq_offs_hz += correction_hz as f32;
                             self.bb_freq_offs_hz = self.bb_freq_offs_hz.clamp(-35_000.0, 35_000.0);
+                            self.bb_freq_offs_applied_hz = self.bb_freq_offs_hz.round() as i32;
                             self.clock_err_hz = 0.0;
                             debug!(
                                 correction_hz,
                                 bb_freq_offs_hz = self.bb_freq_offs_hz,
+                                bb_freq_offs_applied_hz = self.bb_freq_offs_applied_hz,
                                 "applied coarse PRS frequency correction"
                             );
                         }
                     }
                 }
+                if should_transfer_correction_to_rf(
+                    self.fic_decoder.decode_ratio_percent(),
+                    frames_processed,
+                    self.bb_freq_offs_applied_hz,
+                    self.rf_freq_shift_used,
+                ) {
+                    pending_rf_handoff_hz = Some(self.bb_freq_offs_applied_hz);
+                }
+
                 if coarse_afc_requires_reacquisition(coarse_correction_hz) {
                     debug!(
                         frames_processed,
@@ -309,7 +480,62 @@ impl DabProcessor {
                         bb_freq_offs_hz = self.bb_freq_offs_hz,
                         "coarse correction changed; restarting on next frame like DABstar"
                     );
+                    self.ofdm_decoder.reset();
+                    self.time_syncer = TimeSyncer::default();
+                    self.locked_frame_count = 0;
+                    ofdm_started = false;
                     buf.drain(..sample_count.min(buf.len()));
+                    while running.load(Ordering::SeqCst) {
+                        debug!(bytes = 2 * FRAME_SAMPLES, "reading initial IQ block");
+                        let iq = match reader.read_iq_block(2 * FRAME_SAMPLES) {
+                            Ok(iq) => iq,
+                            Err(err) => {
+                                warn!(error = %err, "stopping: RTL-SDR read failure during initial sync");
+                                return Ok(());
+                            }
+                        };
+                        debug!(samples = iq.len(), "initial IQ read completed");
+                        buf.extend_from_slice(&iq);
+
+                        if buf.len() > 4 * FRAME_SAMPLES {
+                            let drop = buf.len() - 4 * FRAME_SAMPLES;
+                            buf.drain(..drop);
+                        }
+
+                        self.time_syncer.set_signal_level(reader.signal_level());
+                        match self.time_syncer.push(&buf) {
+                            Some(prs_start) => {
+                                let refined_prs_start = if buf.len() >= prs_start + TU {
+                                    self.phase_reference
+                                        .correlate_with_phase_ref_and_find_max_peak(
+                                            &buf[prs_start..(prs_start + TU)],
+                                            prs_threshold_for_lock_state(false),
+                                        )
+                                        .map(|peak| prs_start + peak.saturating_sub(TG))
+                                        .unwrap_or(prs_start)
+                                } else {
+                                    prs_start
+                                };
+                                info!(
+                                    prs_offset = refined_prs_start,
+                                    buf_complex_samples = buf.len(),
+                                    "initial DAB frame sync acquired"
+                                );
+                                buf.drain(..refined_prs_start);
+                                if buf.len() > FRAME_SAMPLES {
+                                    buf.truncate(FRAME_SAMPLES);
+                                }
+                                break;
+                            }
+                            None => {
+                                debug!(
+                                    buf_complex_samples = buf.len(),
+                                    "no DAB null-symbol found yet; continuing startup stream"
+                                );
+                                continue;
+                            }
+                        }
+                    }
                     frames_processed += 1;
                     continue;
                 }
@@ -318,6 +544,7 @@ impl DabProcessor {
                 // `self.bb_rot_phase` continues from the prior symbol and frame,
                 // matching DABstar's continuous per-sample mixer.
                 let mut frame_freq_corr = Complex32::new(0.0, 0.0);
+                let mut frame_cp_energy = 0.0f32;
 
                 for ofdm_symbol_idx in 1usize..76 {
                     if !running.load(Ordering::SeqCst) {
@@ -335,7 +562,7 @@ impl DabProcessor {
                         &frame[symbol_start..symbol_end],
                         &mut self.work_buf,
                         &mut self.bb_rot_phase,
-                        self.bb_freq_offs_hz,
+                        self.bb_freq_offs_applied_hz as f32,
                     );
                     let symbol = self.work_buf.as_slice();
 
@@ -343,6 +570,7 @@ impl DabProcessor {
                         let a = symbol[idx];
                         let b = symbol[idx - TU];
                         frame_freq_corr += a * b.conj(); // eval phase shift in cyclic prefix part
+                        frame_cp_energy += a.norm_sqr() + b.norm_sqr();
                     }
 
                     let phase_corr = self.phase_reference.analyze(symbol);
@@ -379,12 +607,19 @@ impl DabProcessor {
                     }
                 }
 
-                if frame.len() >= 76 * TS + 2_656 && frame_uses_non_tii_null(frames_processed) {
+                if frame.len() >= 76 * TS + 2_656
+                    && frame_uses_non_tii_null(self.fib_decoder.cif_count(), frames_processed)
+                {
                     let null_start = 76 * TS;
                     let null_end = null_start + 2_656;
-                    // Null symbol: power measurement only, rotation not needed.
+                    rotate_into(
+                        &frame[null_start..null_end],
+                        &mut self.work_buf,
+                        &mut self.bb_rot_phase,
+                        self.bb_freq_offs_applied_hz as f32,
+                    );
                     self.ofdm_decoder
-                        .store_null_symbol_without_tii(&frame[null_start..null_end]);
+                        .store_null_symbol_without_tii(&self.work_buf[..(null_end - null_start)]);
                 }
 
                 if !coarse_afc_should_apply(coarse_correction_hz) {
@@ -393,8 +628,8 @@ impl DabProcessor {
                     self.clock_err_hz = 0.9 * self.clock_err_hz + 0.1 * clamped;
                 }
 
-                // DABstar: always integrate the full cyclic-prefix phase error (gain=1.0).
-                // limit_symmetrically to ±20° then convert rad → Hz at 1000 Hz/carrier.
+                // Use the DABstar cyclic-prefix phase estimate, but gate and damp
+                // the update in the buffered CLI path when coherence is weak.
                 let frame_phase_offset_rad = if frame_freq_corr.norm_sqr() > 1.0e-12 {
                     frame_freq_corr.arg()
                 } else {
@@ -403,24 +638,57 @@ impl DabProcessor {
                 let phase_limit_rad = 20.0_f32.to_radians();
                 let limited_phase_offset_rad =
                     frame_phase_offset_rad.clamp(-phase_limit_rad, phase_limit_rad);
+                let cp_coherence = normalized_cp_coherence(frame_freq_corr, frame_cp_energy);
+                let fine_gain = fine_afc_gain(self.locked_frame_count, cp_coherence);
                 self.bb_freq_offs_hz +=
-                    limited_phase_offset_rad / (2.0 * std::f32::consts::PI) * 1_000.0;
+                    fine_gain * limited_phase_offset_rad / (2.0 * std::f32::consts::PI) * 1_000.0;
                 self.bb_freq_offs_hz = self.bb_freq_offs_hz.clamp(-35_000.0, 35_000.0);
-                // bb_freq_offs_hz is applied per-symbol at processing time; no
-                // reader.set_bb_freq_offset_hz() call needed.
+                self.bb_freq_offs_applied_hz = self.bb_freq_offs_hz.round() as i32;
 
                 debug!(
                     frames_processed,
                     sample_count,
                     clock_err_hz = self.clock_err_hz,
                     bb_freq_offs_hz = self.bb_freq_offs_hz,
+                    bb_freq_offs_applied_hz = self.bb_freq_offs_applied_hz,
                     frame_phase_offset_rad,
                     limited_phase_offset_rad,
+                    cp_coherence,
+                    fine_gain,
                     "tracked next OFDM frame boundary"
                 );
 
                 buf.drain(..sample_count.min(buf.len()));
                 frames_processed += 1;
+                self.locked_frame_count = self.locked_frame_count.saturating_add(1);
+            }
+
+            if let Some(rf_shift_hz) = pending_rf_handoff_hz.take() {
+                let shifted_center = (u64::from(reader.center_freq_hz()) as i64
+                    + i64::from(rf_shift_hz))
+                .clamp(0, u32::MAX as i64) as u32;
+                if let Err(err) = reader.set_center_freq_hz(shifted_center) {
+                    warn!(error = %err, shifted_center, "failed to transfer BB frequency correction to RF");
+                } else if let Err(err) = reader.reset_buffer() {
+                    warn!(error = %err, "failed to reset RTL-SDR buffer after RF retune");
+                } else {
+                    self.rf_freq_shift_used = true;
+                    self.bb_freq_offs_hz = 0.0;
+                    self.bb_freq_offs_applied_hz = 0;
+                    self.bb_rot_phase = 0.0;
+                    self.clock_err_hz = 0.0;
+                    self.ofdm_decoder.reset();
+                    self.time_syncer = TimeSyncer::default();
+                    self.locked_frame_count = 0;
+                    self.prs_miss_count = 0;
+                    ofdm_started = false;
+                    buf.clear();
+                    info!(
+                        shifted_center,
+                        rf_shift_hz, "transferred stable coarse frequency correction to RTL-SDR"
+                    );
+                    continue;
+                }
             }
 
             // Read one more frame of complex IQ (= 2 * FRAME_SAMPLES bytes).
@@ -436,7 +704,10 @@ impl DabProcessor {
             // Metadata updates (once per read iteration).
             if !ensemble_announced {
                 if let Some(label) = self.fib_decoder.ensemble_label() {
-                    metadata.write_ensemble(0, label)?;
+                    metadata.write_ensemble(
+                        u32::from(self.fib_decoder.ensemble_id().unwrap_or(0)),
+                        label,
+                    )?;
                     ensemble_announced = true;
                 }
             }
@@ -486,11 +757,15 @@ impl DabProcessor {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    use num_complex::Complex32;
 
     use super::{
-        coarse_afc_requires_reacquisition, coarse_afc_should_apply, frame_uses_non_tii_null,
-        prs_threshold_for_lock_state,
+        coarse_afc_requires_reacquisition, coarse_afc_should_apply, fine_afc_gain,
+        frame_uses_non_tii_null, normalized_cp_coherence, preview_rot_phase,
+        prs_threshold_for_lock_state, should_reacquire_after_prs_miss,
+        should_transfer_correction_to_rf, tracked_frame_sample_count, TRACKING_PRS_SEARCH_BACKOFF,
     };
+    use crate::ofdm::ofdm_decoder::TG;
 
     #[test]
     fn uses_dabstar_prs_thresholds() {
@@ -501,18 +776,26 @@ mod tests {
     #[test]
     fn follows_dabstar_non_tii_null_cadence() {
         for frame in 0..4 {
-            assert!(frame_uses_non_tii_null(frame));
+            assert!(frame_uses_non_tii_null(None, frame));
         }
         for frame in 4..8 {
-            assert!(!frame_uses_non_tii_null(frame));
+            assert!(!frame_uses_non_tii_null(None, frame));
         }
     }
 
     #[test]
-    fn coarse_afc_applies_without_forcing_reacquisition() {
+    fn prefers_real_cif_count_for_null_tii_phase() {
+        assert!(frame_uses_non_tii_null(Some(3), 7));
+        assert!(!frame_uses_non_tii_null(Some(5), 0));
+    }
+
+    #[test]
+    fn coarse_afc_applies_and_forces_reacquisition_on_nonzero_step() {
         assert!(coarse_afc_should_apply(37));
         assert!(!coarse_afc_should_apply(0));
-        assert!(!coarse_afc_requires_reacquisition(37));
+        assert!(coarse_afc_requires_reacquisition(37));
+        assert!(coarse_afc_requires_reacquisition(-4));
+        assert!(!coarse_afc_requires_reacquisition(0));
     }
 
     #[test]
@@ -532,9 +815,61 @@ mod tests {
     }
 
     #[test]
-    fn dabstar_coarse_afc_does_not_force_reacquisition() {
-        assert!(!coarse_afc_requires_reacquisition(1));
-        assert!(!coarse_afc_requires_reacquisition(-37));
+    fn coarse_afc_restart_is_required_after_frequency_step() {
+        assert!(coarse_afc_requires_reacquisition(1));
+        assert!(coarse_afc_requires_reacquisition(-37));
         assert!(!coarse_afc_requires_reacquisition(0));
+    }
+
+    #[test]
+    fn rf_handoff_is_deferred_until_stable_and_large() {
+        assert!(!should_transfer_correction_to_rf(100, 6, 26, false));
+        assert!(!should_transfer_correction_to_rf(70, 10, 600, false));
+        assert!(!should_transfer_correction_to_rf(100, 2, 600, false));
+        assert!(!should_transfer_correction_to_rf(100, 10, 600, true));
+        assert!(should_transfer_correction_to_rf(100, 10, 600, false));
+    }
+
+    #[test]
+    fn normalized_cp_coherence_is_zero_without_energy() {
+        assert_eq!(normalized_cp_coherence(Complex32::new(1.0, 0.0), 0.0), 0.0);
+    }
+
+    #[test]
+    fn fine_afc_gain_is_gated_but_dabstar_strength_when_coherent() {
+        assert_eq!(fine_afc_gain(0, 0.01), 0.0);
+        assert!(fine_afc_gain(0, 0.04) > 0.0);
+        assert_eq!(fine_afc_gain(0, 0.10), 1.0);
+        assert_eq!(fine_afc_gain(25, 0.10), 1.0);
+    }
+
+    #[test]
+    fn centered_prs_tracking_allows_early_frame_adjustment() {
+        const FRAME_SAMPLES: usize = 196_608;
+        const SEARCH_BASE: usize = FRAME_SAMPLES - TG;
+        assert_eq!(TRACKING_PRS_SEARCH_BACKOFF, TG);
+        assert_eq!(
+            tracked_frame_sample_count(Some(384), SEARCH_BASE),
+            Some(FRAME_SAMPLES - 120)
+        );
+        assert_eq!(
+            tracked_frame_sample_count(Some(504), SEARCH_BASE),
+            Some(FRAME_SAMPLES)
+        );
+        assert_eq!(tracked_frame_sample_count(None, SEARCH_BASE), None);
+    }
+
+    #[test]
+    fn transient_prs_misses_do_not_force_immediate_reacquisition() {
+        assert!(!should_reacquire_after_prs_miss(1));
+        assert!(!should_reacquire_after_prs_miss(2));
+        assert!(should_reacquire_after_prs_miss(3));
+    }
+
+    #[test]
+    fn preview_phase_matches_live_mixer_step() {
+        let phase0 = preview_rot_phase(0.0, 1_000.0, 1_024);
+        assert!(phase0.is_finite());
+        assert!(phase0.abs() > 0.001);
     }
 }
