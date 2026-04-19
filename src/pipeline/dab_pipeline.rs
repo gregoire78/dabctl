@@ -205,7 +205,18 @@ impl CifAssembler {
     }
 
     fn note_sync_loss(&mut self) {
+        // ETSI EN 300 401 §12.3 time de-interleaving spans 16 CIFs. Once the
+        // OFDM block sequence breaks, the circular history is no longer valid:
+        // keeping it would mix pre-loss and post-resync MSC bits for up to 16
+        // CIFs and produce long bursts of RS / Fire-code failures.
         self.minor = 0;
+        self.amount = 0;
+        self.index_out = 0;
+        self.temp.fill(0);
+        for cif in &mut self.cif_vector {
+            cif.fill(0);
+        }
+        self.fib_vector.fill([0u8; 96]);
         self.sync_just_lost = true;
     }
 
@@ -1098,14 +1109,21 @@ mod tests {
         let mut assembler = CifAssembler::new(bits_per_block);
         assembler.update_cif_counter(0, 0);
 
-        for _ in 0..15 {
+        for _ in 0..16 {
             let _ = assembler.finish_cif(&vec![0; 18 * bits_per_block]);
         }
 
         assembler.note_sync_loss();
+
+        for _ in 0..15 {
+            assert!(assembler
+                .finish_cif(&vec![1; 18 * bits_per_block])
+                .is_none());
+        }
+
         let first = assembler
             .finish_cif(&vec![1; 18 * bits_per_block])
-            .expect("first post-loss CIF should emit");
+            .expect("first rewarmed post-loss CIF should emit");
         assert!(first.sync_lost);
 
         let second = assembler

@@ -37,8 +37,9 @@ const GAP_SEARCH_WIDTH: usize = 10;
 const OFFSET_CONF_FACTOR: f32 = 5.0;
 
 /// Number of carrier positions searched in `estimate_offset()`.
-/// DABstar uses `SEARCHRANGE = 2 * 70`, i.e. a ±70-bin coarse search.
-const SEARCH_RANGE: usize = 2 * 70;
+/// eti-cmdline keeps the coarse carrier-offset scan tight around DC
+/// (`SEARCH_RANGE = 2 * 35`), i.e. a ±35-bin search.
+const SEARCH_RANGE: usize = 2 * 35;
 
 pub struct PhaseReference {
     t_u: usize,
@@ -393,12 +394,12 @@ mod tests {
     }
 
     #[test]
-    fn estimate_offset_detects_large_carrier_shift_within_dabstar_window() {
+    fn estimate_offset_detects_large_carrier_shift_within_search_window() {
         let pr = make_phase_ref(1);
         let t_u = DabParams::new(1).t_u as usize;
 
         let mut shifted_ref = vec![Complex32::new(0.0, 0.0); t_u];
-        let shift: isize = 50;
+        let shift: isize = 30;
         for (idx, sample) in pr.ref_table.iter().copied().enumerate() {
             let dst = ((idx as isize + shift).rem_euclid(t_u as isize)) as usize;
             shifted_ref[dst] = sample;
@@ -413,10 +414,7 @@ mod tests {
         }
 
         let estimated = pr.estimate_offset(&shifted_ref);
-        assert!(
-            estimated != 100,
-            "large but valid coarse shift should be detected"
-        );
+        assert_ne!(estimated, PhaseReference::IDX_NOT_FOUND);
         let expected_hz = shift as i32 * DabParams::new(1).carrier_diff;
         assert!(
             (estimated - expected_hz).abs() <= 2_000,
