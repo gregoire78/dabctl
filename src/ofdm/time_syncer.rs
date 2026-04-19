@@ -7,6 +7,11 @@ const TS: usize = TU + TG;
 
 // DABstar uses a short envelope average for null detection.
 const WINDOW: usize = 50;
+const EDGE_CONFIRM: usize = 8;
+const MIN_DIP_SPAN: usize = NULL_SYMBOL_SAMPLES / 3;
+const STARTUP_MIN_DIP_SPAN: usize = (NULL_SYMBOL_SAMPLES * 3) / 4;
+const MAX_STARTUP_NULL_RATIO: f32 = 0.45;
+const MAX_TRACKING_NULL_RATIO: f32 = 0.82;
 
 // DABstar-style frame synchronisation: find the null symbol by locating the
 // contiguous low-power region, then refine the PRS start with cyclic-prefix
@@ -15,13 +20,22 @@ const WINDOW: usize = 50;
 pub struct TimeSyncer {
     /// Last known PRS start index (used for sanity-checking).
     last_prs_start: Option<usize>,
+    /// DABstar-style long-term mean signal envelope from the sample reader.
+    signal_level_hint: f32,
 }
 
 impl TimeSyncer {
+    pub fn set_signal_level(&mut self, signal_level: f32) {
+        if signal_level.is_finite() && signal_level > 1.0e-9 {
+            self.signal_level_hint = signal_level;
+        }
+    }
+
     pub fn push(&mut self, samples: &[Complex32]) -> Option<usize> {
         self.detect(samples, None, 128)
     }
 
+    #[allow(dead_code)]
     pub fn track_near(
         &mut self,
         samples: &[Complex32],
@@ -82,93 +96,133 @@ impl TimeSyncer {
         let scan_start = search_start.max(WINDOW / 2);
         let scan_end = search_end.max(scan_start);
 
-        let search_peak = avg[scan_start..=scan_end]
-            .iter()
-            .copied()
-            .fold(0.0f32, f32::max);
-        if search_peak <= 1.0e-12 {
+        let s_level = estimate_signal_level(&avg, scan_start, scan_end, self.signal_level_hint);
+        if s_level <= 1.0e-12 {
             return expected_prs_start;
         }
 
-        let start_threshold = 0.55 * search_peak;
-        let end_threshold = 0.75 * search_peak;
+        let start_threshold = 0.55 * s_level;
+        let end_threshold = 0.75 * s_level;
+        let locked_tracking = expected_prs_start.is_some();
 
-        let mut dip_start = None;
+        let mut best_start = None;
+        let mut approx_prs_start = None;
+        let mut dip_span = 0usize;
+        let mut null_avg = 0.0f32;
+        let signal_avg = s_level;
+        let mut ratio = 1.0f32;
+
         let mut i = scan_start;
         while i <= scan_end {
-            if avg[i] <= start_threshold {
-                dip_start = Some(i);
+            while i <= scan_end && avg[i] > start_threshold {
+                i += 1;
+            }
+            if i > scan_end {
                 break;
             }
-            i += 1;
-        }
 
-        let Some(best_start) = dip_start else {
-            return expected_prs_start;
-        };
-
-        let max_dip_end =
-            (best_start + NULL_SYMBOL_SAMPLES + WINDOW).min(n.saturating_sub(TS).saturating_sub(1));
-        let mut rise_index = None;
-        let mut i = best_start;
-        while i <= max_dip_end {
-            if avg[i] >= end_threshold {
-                rise_index = Some(i);
+            let candidate_start = i;
+            let mut below_run = 0usize;
+            while i <= scan_end {
+                if avg[i] <= start_threshold {
+                    below_run += 1;
+                    if below_run >= EDGE_CONFIRM {
+                        break;
+                    }
+                } else {
+                    below_run = 0;
+                }
+                i += 1;
+            }
+            if i > scan_end {
                 break;
             }
-            i += 1;
-        }
 
-        let Some(rise_index) = rise_index else {
-            return expected_prs_start;
-        };
-        let approx_prs_start = rise_index;
+            let dip_start = candidate_start.saturating_sub((WINDOW * 65) / 100);
+            let max_dip_end = (dip_start + NULL_SYMBOL_SAMPLES + WINDOW)
+                .min(n.saturating_sub(TS).saturating_sub(1));
 
-        let null_end = (best_start + NULL_SYMBOL_SAMPLES).min(n);
-        let null_avg =
-            avg[best_start..null_end].iter().copied().sum::<f32>() / (null_end - best_start) as f32;
-        let signal_start = approx_prs_start.min(n.saturating_sub(1));
-        let signal_end = (signal_start + NULL_SYMBOL_SAMPLES).min(n);
-        let signal_avg = if signal_end > signal_start {
-            avg[signal_start..signal_end].iter().copied().sum::<f32>()
-                / (signal_end - signal_start) as f32
-        } else {
-            search_peak
-        };
-        let dip_span = rise_index.saturating_sub(best_start);
+            let mut above_run = 0usize;
+            let mut rise = None;
+            let mut local_min = f32::MAX;
+            let mut j = i;
+            while j <= max_dip_end {
+                local_min = local_min.min(avg[j]);
+                if avg[j] >= end_threshold {
+                    above_run += 1;
+                    if above_run >= EDGE_CONFIRM {
+                        rise = Some(j + 1 - EDGE_CONFIRM);
+                        break;
+                    }
+                } else {
+                    above_run = 0;
+                }
+                j += 1;
+            }
 
-        let locked_tracking = expected_prs_start.is_some();
-        let ratio = if signal_avg > 1.0e-12 {
-            null_avg / signal_avg
-        } else {
-            1.0
-        };
+            let Some(rise_index) = rise else {
+                i = candidate_start.saturating_add(EDGE_CONFIRM);
+                continue;
+            };
 
-        let dip_too_short = dip_span < (WINDOW * 4);
-        let dip_too_weak = ratio > 0.90;
+            let candidate_span = rise_index.saturating_sub(dip_start);
+            let candidate_ratio = if s_level > 1.0e-12 {
+                local_min / s_level
+            } else {
+                1.0
+            };
 
-        // Preserve DABstar-style timing continuity: a transient or nearly flat
-        // dip must not override the expected frame boundary, and during initial
-        // acquisition it must not create a false first lock either.
-        if dip_too_short || dip_too_weak {
             tracing::debug!(
-                best_start,
-                approx_prs_start,
-                prs_start = expected_prs_start.unwrap_or(approx_prs_start),
-                dip_span,
-                null_avg = null_avg as f32,
+                best_start = dip_start,
+                approx_prs_start = rise_index,
+                prs_start = expected_prs_start.unwrap_or(rise_index),
+                dip_span = candidate_span,
+                null_avg = local_min,
                 signal_avg = signal_avg as f32,
-                ratio = ratio as f32,
+                ratio = candidate_ratio,
                 expected_prs = ?expected_prs_start,
                 prev = ?self.last_prs_start,
                 "time sync null detection"
             );
+
+            let min_dip_span = if locked_tracking {
+                MIN_DIP_SPAN
+            } else {
+                STARTUP_MIN_DIP_SPAN
+            };
+            let max_null_ratio = if locked_tracking {
+                MAX_TRACKING_NULL_RATIO
+            } else {
+                MAX_STARTUP_NULL_RATIO
+            };
+
+            if candidate_span < min_dip_span || candidate_ratio > max_null_ratio {
+                i = rise_index.max(candidate_start).saturating_add(EDGE_CONFIRM);
+                continue;
+            }
+
+            best_start = Some(dip_start);
+            approx_prs_start = Some(rise_index);
+            dip_span = candidate_span;
+            null_avg = local_min;
+            ratio = candidate_ratio;
+            break;
+        }
+
+        let Some(best_start) = best_start else {
             if let Some(expected_prs) = expected_prs_start {
                 self.last_prs_start = Some(expected_prs);
                 return Some(expected_prs);
             }
             return None;
-        }
+        };
+        let Some(approx_prs_start) = approx_prs_start else {
+            if let Some(expected_prs) = expected_prs_start {
+                self.last_prs_start = Some(expected_prs);
+                return Some(expected_prs);
+            }
+            return None;
+        };
 
         let refine_radius = if locked_tracking {
             search_radius.min(512)
@@ -190,9 +244,9 @@ impl TimeSyncer {
             approx_prs_start,
             prs_start,
             dip_span,
-            null_avg = null_avg as f32,
-            signal_avg = signal_avg as f32,
-            ratio = ratio as f32,
+            null_avg,
+            signal_avg,
+            ratio,
             expected_prs = ?expected_prs_start,
             prev = ?self.last_prs_start,
             "time sync null detection"
@@ -200,6 +254,34 @@ impl TimeSyncer {
 
         self.last_prs_start = Some(prs_start);
         Some(prs_start)
+    }
+}
+
+fn estimate_signal_level(
+    avg: &[f32],
+    scan_start: usize,
+    scan_end: usize,
+    signal_level_hint: f32,
+) -> f32 {
+    if signal_level_hint.is_finite() && signal_level_hint > 1.0e-9 {
+        return signal_level_hint;
+    }
+
+    let stride = ((scan_end.saturating_sub(scan_start) + 1) / 1024).max(1);
+    let mut sum = 0.0f32;
+    let mut peak = 0.0f32;
+    let mut count = 0usize;
+    for idx in (scan_start..=scan_end).step_by(stride) {
+        let value = avg[idx];
+        sum += value;
+        peak = peak.max(value);
+        count += 1;
+    }
+
+    if count == 0 {
+        peak
+    } else {
+        (sum / count as f32).max(0.8 * peak)
     }
 }
 
@@ -318,25 +400,22 @@ mod tests {
     }
 
     #[test]
-    fn accepts_realistic_shallow_null_dip() {
+    fn rejects_shallow_startup_null_like_dip() {
         let mut samples = vec![Complex32::new(1.0, 0.0); 196_608];
         for sample in &mut samples[4000..(4000 + 2656)] {
             *sample = Complex32::new(0.53, 0.0);
         }
 
         let mut syncer = TimeSyncer::default();
-        let start = syncer
-            .push(&samples)
-            .expect("shallow dip should still sync");
+        let start = syncer.push(&samples);
         assert!(
-            (6600..6800).contains(&start),
-            "expected PRS start near 6656, got {}",
-            start
+            start.is_none(),
+            "shallow startup dip must not false-lock: {start:?}"
         );
     }
 
     #[test]
-    fn prefers_first_valid_null_edge_over_later_deeper_dip() {
+    fn prefers_later_real_null_over_earlier_shallow_dip() {
         let mut samples = vec![Complex32::new(1.0, 0.0); 196_608];
 
         for sample in &mut samples[4000..(4000 + 2656)] {
@@ -349,10 +428,32 @@ mod tests {
         let mut syncer = TimeSyncer::default();
         let start = syncer
             .push(&samples)
-            .expect("the first valid null edge should be used");
+            .expect("the later real null should still be found");
+        assert!(
+            (14500..14900).contains(&start),
+            "expected PRS start near later real null at 14656, got {}",
+            start
+        );
+    }
+
+    #[test]
+    fn skips_short_false_notch_and_finds_later_real_null() {
+        let mut samples = vec![Complex32::new(1.0, 0.0); 196_608];
+
+        for sample in &mut samples[300..360] {
+            *sample = Complex32::new(0.0, 0.0);
+        }
+        for sample in &mut samples[4000..(4000 + 2656)] {
+            *sample = Complex32::new(0.0, 0.0);
+        }
+
+        let mut syncer = TimeSyncer::default();
+        let start = syncer
+            .push(&samples)
+            .expect("later full null should still be found after a short notch");
         assert!(
             (6500..6900).contains(&start),
-            "expected PRS start near first dip at 6656, got {}",
+            "expected PRS start near later real null at 6656, got {}",
             start
         );
     }

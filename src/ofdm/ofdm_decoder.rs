@@ -38,6 +38,16 @@ impl Default for OfdmDecoder {
 }
 
 impl OfdmDecoder {
+    pub fn reset(&mut self) {
+        self.phase_reference.fill(Complex32::new(1.0, 0.0));
+        self.initialized = false;
+        self.mean_value = 1.0;
+        self.mean_power_vector.fill(0.0);
+        self.mean_sigma_sq_vector.fill(0.0);
+        self.mean_null_power_without_tii.fill(0.0);
+        self.integ_abs_phase_vector.fill(0.0);
+    }
+
     pub fn symbol_0_bins(&self, samples: &[Complex32]) -> Vec<Complex32> {
         self.fft_symbol(samples, 0.0)
     }
@@ -269,5 +279,60 @@ mod tests {
         let mut decoder = OfdmDecoder::default();
         decoder.store_null_symbol_without_tii(&symbol);
         assert!(decoder.mean_null_power_without_tii.iter().any(|v| *v > 0.0));
+    }
+
+    #[test]
+    fn symbol_0_fft_uses_tg_shifted_tu_window() {
+        let mut symbol0 = vec![Complex32::new(1.0, 0.0); TS];
+        for sample in &mut symbol0[..TG] {
+            *sample = Complex32::new(2.0, 0.0);
+        }
+
+        let decoder = OfdmDecoder::default();
+        let bins = decoder.symbol_0_bins(&symbol0);
+        assert!(
+            (bins[0].re - TU as f32).abs() < 1.0,
+            "unexpected DC bin: {}",
+            bins[0].re
+        );
+    }
+
+    #[test]
+    fn null_fft_uses_tg_shifted_window() {
+        let mut null_symbol = vec![Complex32::new(0.0, 0.0); 2_656];
+        for sample in &mut null_symbol[TG..(TG + TU)] {
+            *sample = Complex32::new(1.0, 0.0);
+        }
+
+        let mut decoder = OfdmDecoder::default();
+        decoder.store_null_symbol_without_tii(&null_symbol);
+
+        let expected = 0.1 * (TU as f32) * (TU as f32);
+        assert!(
+            (decoder.mean_null_power_without_tii[0] - expected).abs() < 10.0,
+            "unexpected null DC power: {}",
+            decoder.mean_null_power_without_tii[0]
+        );
+    }
+
+    #[test]
+    fn reset_clears_integrated_decoder_state() {
+        let mut decoder = OfdmDecoder::default();
+        let symbol = vec![Complex32::new(0.05, -0.02); TS];
+        decoder.store_null_symbol_without_tii(&symbol);
+        decoder.mean_value = 12.0;
+        decoder.integ_abs_phase_vector[0] = 0.3;
+        decoder.mean_power_vector[0] = 5.0;
+        decoder.mean_sigma_sq_vector[0] = 7.0;
+
+        decoder.reset();
+
+        assert_eq!(decoder.mean_value, 1.0);
+        assert!(!decoder.initialized);
+        assert_eq!(decoder.phase_reference[0], Complex32::new(1.0, 0.0));
+        assert_eq!(decoder.integ_abs_phase_vector[0], 0.0);
+        assert_eq!(decoder.mean_power_vector[0], 0.0);
+        assert_eq!(decoder.mean_sigma_sq_vector[0], 0.0);
+        assert_eq!(decoder.mean_null_power_without_tii[0], 0.0);
     }
 }

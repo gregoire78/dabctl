@@ -39,7 +39,9 @@ pub struct AudioServiceInfo {
 // Literal but compact FIG service database handling used for CLI service selection.
 #[derive(Default)]
 pub struct FibDecoder {
+    ensemble_id: Option<u16>,
     ensemble_label: Option<String>,
+    cif_count: Option<u16>,
     subchannels: HashMap<u8, SubChannelInfo>,
     services: BTreeMap<u32, ServiceRecord>,
 }
@@ -74,8 +76,16 @@ impl FibDecoder {
         self.services.len()
     }
 
+    pub fn ensemble_id(&self) -> Option<u16> {
+        self.ensemble_id
+    }
+
     pub fn ensemble_label(&self) -> Option<&str> {
         self.ensemble_label.as_deref()
+    }
+
+    pub fn cif_count(&self) -> Option<u16> {
+        self.cif_count
     }
 
     pub fn service_label_for_sid(&self, sid: u32) -> Option<&str> {
@@ -125,10 +135,24 @@ impl FibDecoder {
         let extension = fig[1] & 0x1F;
         let pd_flag = (fig[1] >> 5) & 0x01;
         match extension {
+            0 => self.process_fig0_ext0(fig),
             1 => self.process_fig0_ext1(fig),
             2 => self.process_fig0_ext2(fig, pd_flag),
             _ => {}
         }
+    }
+
+    fn process_fig0_ext0(&mut self, fig: &[u8]) {
+        if fig.len() < 7 {
+            return;
+        }
+
+        let eid = get_bits(fig, 16, 16) as u16;
+        let cif_count_hi = get_bits(fig, 35, 5) as u16;
+        let cif_count_lo = get_bits(fig, 40, 8) as u16;
+
+        self.ensemble_id = Some(eid);
+        self.cif_count = Some(cif_count_hi.saturating_mul(250) + cif_count_lo);
     }
 
     fn process_fig1(&mut self, fig: &[u8]) {
@@ -623,6 +647,24 @@ mod tests {
     fn derives_expected_eep_a_bitrates() {
         assert_eq!(derive_eep_bit_rate(0, 2, 84), 112);
         assert_eq!(derive_eep_bit_rate(0, 3, 32), 64);
+    }
+
+    #[test]
+    fn parses_fig0_ensemble_information_and_cif_count() {
+        let mut fib = [0xFFu8; 32];
+        fib[0] = 0x06;
+        fib[1] = 0x00;
+        fib[2] = 0x12;
+        fib[3] = 0x34;
+        fib[4] = 0x07;
+        fib[5] = 0x2A;
+        fib[6] = 0x00;
+
+        let mut decoder = FibDecoder::default();
+        decoder.process_fib(&fib);
+
+        assert_eq!(decoder.ensemble_id(), Some(0x1234));
+        assert_eq!(decoder.cif_count(), Some(7 * 250 + 0x2A));
     }
 
     #[test]
