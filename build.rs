@@ -15,6 +15,7 @@ fn main() {
 
     let builder = bindgen::Builder::default()
         .header(header.to_string_lossy())
+        .clang_arg(format!("-I{}", vendor_dir.join("include").display()))
         .allowlist_function("rtlsdr_.*")
         .allowlist_type("rtlsdr_.*")
         .allowlist_var("RTLSDR_.*")
