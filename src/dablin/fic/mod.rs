@@ -170,7 +170,7 @@ impl FicDecoder {
             13 => {
                 if !self.seen_fig0_13_log {
                     self.seen_fig0_13_log = true;
-                    tracing::info!("FIG0/13 seen: pd={} payload_len={}", pd, payload.len());
+                    tracing::debug!("FIG0/13 seen: pd={} payload_len={}", pd, payload.len());
                 }
                 self.parse_fig0_13(payload, pd)
             }
@@ -375,7 +375,7 @@ impl FicDecoder {
                     }
 
                     if !ca_flag && !dg_flag && dscty == 60 {
-                        tracing::info!(
+                        tracing::trace!(
                             "FIG0/13 SLS UA SID={:#06x} xpad_app_type={} ua_len={}",
                             sid,
                             xpad_app_type,
