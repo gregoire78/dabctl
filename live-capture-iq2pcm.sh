@@ -58,6 +58,7 @@ sudo sh -c '
     --slide-dir ./slides \
     --slide-base64 \
     --aac-decoder fdk \
+    --aac-gap silence \
   2>"$LOG_FILE" \
 | ffmpeg -y \
     -f s16le -ar 48000 -ac 2 \
