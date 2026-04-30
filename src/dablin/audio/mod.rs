@@ -122,24 +122,11 @@ impl AacDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dablin::dabplus::AudioUnit;
-
-    /// Stub decoder that always fails to decode.
-    struct AlwaysFailDecoder;
-
-    impl AlwaysFailDecoder {
-        fn decode(&mut self, _au: &AudioUnit) -> Option<Vec<i16>> {
-            None
-        }
-    }
 
     #[test]
     fn test_silence_on_gap_freeze_returns_none() {
-        // When gap policy = freeze and decode fails → None
         let gap = AacGap::Freeze;
-        let au = AudioUnit { data: vec![0u8; 16] };
-        // Simulate decode failure
-        let result: Option<Vec<i16>> = None; // simulated failure
+        let result: Option<Vec<i16>> = None;
         let output = match result {
             Some(pcm) => Some(pcm),
             None => match gap {
@@ -152,18 +139,13 @@ mod tests {
 
     #[test]
     fn test_silence_on_gap_silence_returns_zeros() {
-        // When gap policy = silence and decode fails → PCM zeros
         let gap = AacGap::Silence;
-        let au = AudioUnit { data: vec![0u8; 16] };
-        // Simulate decode failure
         let result: Option<Vec<i16>> = None;
-        let channels = 2usize;
-        let samples_per_frame = AAC_SAMPLES_PER_FRAME;
         let output = match result {
             Some(pcm) => Some(pcm),
             None => match gap {
                 AacGap::Freeze => None,
-                AacGap::Silence => Some(vec![0i16; samples_per_frame * channels]),
+                AacGap::Silence => Some(vec![0i16; AAC_SAMPLES_PER_FRAME * 2]),
             },
         };
         let pcm = output.unwrap();
@@ -173,19 +155,14 @@ mod tests {
 
     #[test]
     fn test_silence_frame_is_exact_length() {
-        // Silence must produce exactly samples_per_frame × channels samples
-        let n_channels = 2;
-        let silence: Vec<i16> = vec![0i16; AAC_SAMPLES_PER_FRAME * n_channels];
+        let silence = vec![0i16; AAC_SAMPLES_PER_FRAME * 2];
         assert_eq!(silence.len(), 1024 * 2);
         assert!(silence.iter().all(|&s| s == 0));
     }
 
     #[test]
     fn test_silence_values_are_zero() {
-        // Zero-valued PCM samples represent digital silence
         let silence = vec![0i16; 64];
-        for s in &silence {
-            assert_eq!(*s, 0);
-        }
+        assert!(silence.iter().all(|&s| s == 0));
     }
 }
