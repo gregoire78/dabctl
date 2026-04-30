@@ -85,6 +85,9 @@ pub fn run(args: DablinArgs) -> Result<()> {
     let mut emitted_service_sid: Option<u32> = None;
     let mut emitted_service_label: Option<String> = None;
 
+    // ── --list-services wait counter ─────────────────────────────────────────
+    let mut list_services_frames: u32 = 0;
+
     // ── AAC decoder ──────────────────────────────────────────────────────────
     let mut aac: Option<AacDecoder> = None;
 
@@ -148,6 +151,20 @@ pub fn run(args: DablinArgs) -> Result<()> {
             fic.process_fic(&frame.fic);
         }
 
+        // ── --list-services: wait until all labels are known (or 500 frames) ──
+        if args.list_services {
+            if !fic.services.is_empty() {
+                let all_known = fic.ensemble.label.is_some()
+                    && fic.services.iter().all(|s| s.label.is_some());
+                if all_known || list_services_frames >= 500 {
+                    print_services(&fic);
+                    return Ok(());
+                }
+                list_services_frames += 1;
+            }
+            continue;
+        }
+
         // ── Service selection (deferred until FIC is populated) ───────────────
         if selected_scid.is_none() && !fic.services.is_empty() {
             let service = select_service(&fic, &args);
@@ -186,18 +203,9 @@ pub fn run(args: DablinArgs) -> Result<()> {
                         aac = init_aac_decoder(&args.aac_decoder, &args.aac_gap);
                     }
                 }
-                None if args.list_services => {
-                    // Already printed services, will exit below
-                }
                 None => {
                     // Not yet found, keep accumulating FIC
                 }
-            }
-
-            // Handle --list-services
-            if args.list_services && !fic.services.is_empty() {
-                print_services(&fic);
-                return Ok(());
             }
         }
 
@@ -388,7 +396,11 @@ fn init_aac_decoder(backend: &AacDecoderChoice, gap: &AacGap) -> Option<AacDecod
 
 /// Print the list of discovered services to stderr (for --list-services).
 fn print_services(fic: &FicDecoder) {
-    eprintln!("Ensemble: EId={:#06x} label={:?}", fic.ensemble.eid, fic.ensemble.label);
+    eprintln!(
+        "Ensemble: EId={:#06x} label={}",
+        fic.ensemble.eid,
+        fic.ensemble.label.as_deref().unwrap_or("(no label)")
+    );
     for svc in &fic.services {
         let subch_ids: Vec<u8> = svc.components.iter().map(|c| c.subch_id).collect();
         let dabplus_marks: Vec<&str> = subch_ids
