@@ -24,7 +24,7 @@ cd "$(dirname "$0")/test-local" || {
 # Build + tests avant lancement
 echo "[build] Tests unitaires…"
 pushd .. > /dev/null
-rtk cargo test --lib || {
+rtk cargo test || {
   echo "[ERREUR] Tests échoués"
   exit 1
 }
