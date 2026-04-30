@@ -98,6 +98,9 @@ pub struct FicDecoder {
     pub dabplus_subch_ids: Vec<u8>,
     /// X-PAD app type used for MOT slideshow, per sub-channel.
     pub mot_app_types: Vec<(u8, u8)>,
+    /// X-PAD app type used for MOT slideshow, per service SID.
+    pub mot_app_types_by_sid: Vec<(u32, u8)>,
+    seen_fig0_13_log: bool,
 }
 
 impl FicDecoder {
@@ -164,7 +167,13 @@ impl FicDecoder {
             0 => self.parse_fig0_0(payload),
             1 => self.parse_fig0_1(payload),
             2 => self.parse_fig0_2(payload, pd),
-            13 => self.parse_fig0_13(payload, pd),
+            13 => {
+                if !self.seen_fig0_13_log {
+                    self.seen_fig0_13_log = true;
+                    tracing::info!("FIG0/13 seen: pd={} payload_len={}", pd, payload.len());
+                }
+                self.parse_fig0_13(payload, pd)
+            }
             _ => {}
         }
     }
@@ -319,47 +328,68 @@ impl FicDecoder {
 
     /// FIG 0/13: User application information (identifies DAB+)
     fn parse_fig0_13(&mut self, data: &[u8], pd: u8) {
-        let sid_len = if pd == 0 { 2 } else { 4 };
-        let mut pos = 0;
-        while pos + sid_len + 1 < data.len() {
-            pos += sid_len; // skip SID
-            let num_comp = (data[pos] & 0x0f) as usize;
-            pos += 1;
-            for _ in 0..num_comp {
-                if pos + 4 > data.len() {
-                    break;
-                }
-                let subch_id = data[pos] & 0x3f;
-                let sc_type = (data[pos] >> 6) & 0x03;
-                let num_ua = (data[pos + 1] >> 4) & 0x0f;
-                pos += 2;
-                for _ in 0..num_ua {
-                    if pos + 2 > data.len() {
-                        break;
-                    }
-                    let ua_type = ((data[pos] as u16) << 3) | ((data[pos + 1] >> 5) as u16);
-                    let ua_data_len = (data[pos + 1] & 0x1f) as usize;
-                    let ua_data_start = pos + 2;
-                    let ua_data_end = ua_data_start + ua_data_len;
-                    if ua_data_end > data.len() {
-                        break;
-                    }
-                    pos += 2 + ua_data_len;
+        // dablin handles programme services here (16-bit SID).
+        // If P/D indicates long IDs, ignore for now.
+        if pd != 0 {
+            return;
+        }
 
-                        // UA type 0x002 = MOT (slideshow), UA type 0x003 = DAB+
-                        // User application 0x003 marks a sub-channel as DAB+
-                        if ua_type == 0x003 && sc_type == 0 && !self.dabplus_subch_ids.contains(&subch_id) {
-                            self.dabplus_subch_ids.push(subch_id);
+        let mut pos = 0;
+        while pos + 3 <= data.len() {
+            let sid = ((data[pos] as u32) << 8) | data[pos + 1] as u32;
+            pos += 2;
+
+            let _scids = data[pos] >> 4;
+            let num_scids_uas = (data[pos] & 0x0f) as usize;
+            pos += 1;
+
+            for _ in 0..num_scids_uas {
+                if pos + 2 > data.len() {
+                    return;
+                }
+
+                let ua_type = ((data[pos] as u16) << 3) | ((data[pos + 1] >> 5) as u16);
+                let ua_data_len = (data[pos + 1] & 0x1f) as usize;
+                pos += 2;
+
+                if pos + ua_data_len > data.len() {
+                    return;
+                }
+
+                let ua = &data[pos..pos + ua_data_len];
+                pos += ua_data_len;
+
+                // UA type 0x002 = MOT slideshow in X-PAD.
+                if ua_type == 0x002 {
+                    // Fallback defaults from dablin's GetSLSAppType()
+                    let mut ca_flag = false;
+                    let mut xpad_app_type: u8 = 12;
+                    let mut dg_flag = false;
+                    let mut dscty: u8 = 60;
+
+                    if ua.len() >= 2 {
+                        ca_flag = (ua[0] & 0x80) != 0;
+                        xpad_app_type = ua[0] & 0x1f;
+                        dg_flag = (ua[1] & 0x80) != 0;
+                        dscty = ua[1] & 0x3f;
+                    }
+
+                    if !ca_flag && !dg_flag && dscty == 60 {
+                        tracing::info!(
+                            "FIG0/13 SLS UA SID={:#06x} xpad_app_type={} ua_len={}",
+                            sid,
+                            xpad_app_type,
+                            ua.len()
+                        );
+                        if let Some(item) = self.mot_app_types_by_sid.iter_mut().find(|(s, _)| *s == sid) {
+                            item.1 = xpad_app_type;
+                        } else {
+                            self.mot_app_types_by_sid.push((sid, xpad_app_type));
                         }
 
-                        // UA type 0x002 with MOT in X-PAD gives slideshow app type.
-                        if ua_type == 0x002 && sc_type == 0 && ua_data_len >= 2 {
-                            let ua = &data[ua_data_start..ua_data_end];
-                            let ca_flag = (ua[0] & 0x80) != 0;
-                            let xpad_app_type = ua[0] & 0x1f;
-                            let dg_flag = (ua[1] & 0x80) != 0;
-                            let dscty = ua[1] & 0x3f;
-                            if !ca_flag && !dg_flag && dscty == 60 {
+                        if let Some(svc) = self.services.iter().find(|s| s.sid == sid) {
+                            for comp in &svc.components {
+                                let subch_id = comp.subch_id;
                                 if let Some(item) = self.mot_app_types.iter_mut().find(|(id, _)| *id == subch_id) {
                                     item.1 = xpad_app_type;
                                 } else {
@@ -367,6 +397,7 @@ impl FicDecoder {
                                 }
                             }
                         }
+                    }
                 }
             }
         }
@@ -457,6 +488,14 @@ impl FicDecoder {
         self.mot_app_types
             .iter()
             .find(|(id, _)| *id == subch_id)
+            .map(|(_, t)| *t)
+    }
+
+    /// Returns X-PAD MOT app type for a service SID.
+    pub fn mot_app_type_for_sid(&self, sid: u32) -> Option<u8> {
+        self.mot_app_types_by_sid
+            .iter()
+            .find(|(s, _)| *s == sid)
             .map(|(_, t)| *t)
     }
 }

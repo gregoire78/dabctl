@@ -159,6 +159,13 @@ pub fn run(args: DablinArgs) -> Result<()> {
                         if let Some(stc) = frame.stc.iter().find(|e| e.scid == scid) {
                             let buf = SubchannelBuffer::new(scid, stc.stl);
                             debug!("Sub-channel SCID={} STL={} ({} bytes/CIF)", scid, stc.stl, buf.cif_bytes());
+                            info!(
+                                "PAD MOT app type for SCID {}: {:?}, SID {:#06x}: {:?}",
+                                scid,
+                                fic.mot_app_type(scid),
+                                svc.sid,
+                                fic.mot_app_type_for_sid(svc.sid)
+                            );
                             subch_buf = Some(buf);
 
                             // Approximate service bitrate from sub-channel size:
@@ -264,20 +271,25 @@ pub fn run(args: DablinArgs) -> Result<()> {
             for au in result.units {
                 // Try extracting PAD events from untouched AU data first.
                 if let Some(scid) = selected_scid {
-                    let mot_app_type = fic.mot_app_type(scid);
+                    let mot_app_type = selected_sid
+                        .and_then(|sid| fic.mot_app_type_for_sid(sid))
+                        .or_else(|| fic.mot_app_type(scid));
                     let pad_events = pad_decoder.process_au(&au.data, mot_app_type);
-                    if let Some(m) = meta.as_mut() {
-                        if let Some(dl) = pad_events.dynamic_label {
+                    if let Some(dl) = pad_events.dynamic_label {
+                        if let Some(m) = meta.as_mut() {
                             m.emit_dynamic_label(&dl);
                         }
-                        if let Some(slide) = pad_events.slide {
-                            if let Some(dir) = slide_dir {
-                                let path = dir.join(&slide.content_name);
-                                if let Err(e) = std::fs::write(&path, &slide.data) {
-                                    warn!("Cannot write slide file {:?}: {}", path, e);
-                                }
-                            }
+                    }
 
+                    if let Some(slide) = pad_events.slide {
+                        if let Some(dir) = slide_dir {
+                            let path = dir.join(&slide.content_name);
+                            if let Err(e) = std::fs::write(&path, &slide.data) {
+                                warn!("Cannot write slide file {:?}: {}", path, e);
+                            }
+                        }
+
+                        if let Some(m) = meta.as_mut() {
                             let data_base64 = if args.slide_base64 {
                                 base64::engine::general_purpose::STANDARD.encode(&slide.data)
                             } else {
