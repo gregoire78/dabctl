@@ -62,6 +62,8 @@ Options:
 - --aac-gap <freeze|silence>     Behavior on missing/invalid AAC frames
                                   - freeze  : default, preserve legacy behavior
                                   - silence : emit PCM silence to keep stream alive
+- --slide-dir <PATH>             Save decoded MOT slideshow images to directory
+- --slide-base64                 Include slide payload as base64 in FD3 JSONL events
 - --silent                       Disable stderr logging
 
 Rules:
@@ -114,6 +116,7 @@ Example:
 {"ensemble":{"eid":"0x1000","label":"DAB+ France"}}
 {"service":{"sid":"0xF2F8","label":"NRJ"}}
 {"dl":"NRJ - Ed Sheeran - Shape Of You"}
+{"bitrate":88}
 {"slide":{"contentName":"cover.jpg","contentType":"image/jpeg","data":"<base64>"}}
 
 ──────────────────────────────────────────────────────────────────────

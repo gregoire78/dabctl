@@ -67,6 +67,8 @@ Optional:
 - --aac-gap <freeze|silence>      Behavior on missing/invalid AAC frames
                                   - freeze   : default, preserve current behavior
                                   - silence  : emit PCM silence instead of freezing
+- --slide-dir <PATH>              Save decoded MOT slideshow images to directory
+- --slide-base64                  Include slide payload as base64 in FD3 JSONL events
 - --silent                        Disable stderr logging
 
 Rules:
@@ -121,6 +123,7 @@ Example events:
 {"service":{"sid":"0xF2F8","label":"France Inter"}}
 {"dl":"France Inter - Le Journal"}
 {"bitrate":128}
+{"slide":{"contentName":"slide-000001.jpg","contentType":"image/jpeg","data":"<base64>"}}
 
 ──────────────────────────────────────────────────────────────────────
 AUDIO DECODING (AAC GAP POLICY – CRITICAL)
