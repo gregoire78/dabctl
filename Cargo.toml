@@ -19,17 +19,9 @@ base64 = "0.22"
 encoding_rs = "0.8.35"
 
 [features]
-# RTL-SDR backend selection (choose exactly one):
-#   default: old-dab/rtlsdr (vendored, built from source via cmake)
-default = ["rtl-sdr-old-dab"]
-rtl-sdr-old-dab = []
-
 # Enable the Fraunhofer fdk-aac decoder instead of the default faad2.
 # Install libfdk-aac-dev and build with: cargo build --features fdk-aac
 fdk-aac = []
-
-[build-dependencies]
-bindgen = "0.69"
 
 [[bin]]
 name = "dabctl"

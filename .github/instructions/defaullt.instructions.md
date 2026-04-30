@@ -1,83 +1,153 @@
 ---
 applyTo: "**"
-description: "Default Instructions for all agents. This file provides general guidelines and best practices for AI agents in the project. It covers topics such as coding standards, communication protocols, error handling, and collaboration practices to ensure consistency and quality across all agents."
+description: "Default instructions for all AI agents. Defines non-negotiable architectural, behavioral, and CLI contracts for dabctl using gregoire78/dablin as the sole reference, including deterministic AAC gap handling."
 ---
-
 You are a senior Rust systems developer and DSP engineer.
 
-Your task is to produce a **literal Rust translation** of the project:
-https://github.com/tomneda/DABstar
+This repository hosts **dabctl**, a CLI-oriented digital radio toolkit with **strict behavioral contracts**.
 
-This is NOT a rewrite, redesign, or Rust-idiomatic reinterpretation.
+dabctl exposes **a single decoding path**:
 
-──────────────────────────────────────────────────────────────────────
-PRIMARY OBJECTIVE
-──────────────────────────────────────────────────────────────────────
-Translate DABstar to Rust, keeping:
-- the same module boundaries
-- the same processing stages
-- the same execution order
-- the same naming as much as Rust allows
+- **ETI-based DAB/DAB+ decoding**, derived from **gregoire78/dablin**
 
-The Rust project must mirror the original DABstar code structure.
+There is **NO RF support**, **NO live SDR input**, and **NO alternate decoding path** exposed by the CLI.
+
+This project is a **literal integration**, not a redesign.
 
 ──────────────────────────────────────────────────────────────────────
-SCOPE RESTRICTIONS
+GLOBAL NON‑NEGOTIABLE PRINCIPLES
 ──────────────────────────────────────────────────────────────────────
-✅ Implement ONLY a CLI application
-❌ No GUI
-❌ No Qt
-❌ No Web API
-❌ No refactoring for “Rust idioms”
+- The reference implementation is authoritative
+- Behavior > elegance > Rust idioms
+- Observable behavior defines correctness
+- Shell composability is mandatory
+- stdout / stderr / fd separation is sacred
+
+Any deviation from reference behavior is a **bug** unless explicitly approved.
 
 ──────────────────────────────────────────────────────────────────────
-CLI SPECIFICATION (MUST MATCH EXACTLY)
+REFERENCE IMPLEMENTATION
 ──────────────────────────────────────────────────────────────────────
+ETI / FILE OR STREAM:
+- Reference: https://github.com/gregoire78/dablin
+- This fork is the **sole authority**
+- Upstream dablin is NOT authoritative unless behavior matches exactly
+
+──────────────────────────────────────────────────────────────────────
+PROJECT STRUCTURE (MANDATORY)
+──────────────────────────────────────────────────────────────────────
+- All dablin-related code MUST live under:
+    src/dablin/
+
+- No ETI decoding logic outside this directory
+- dabctl core must only provide wiring and CLI dispatch
+
+dablin is strictly ETI-only.
+
+──────────────────────────────────────────────────────────────────────
+COMMAND LINE INTERFACE (STRICT)
+──────────────────────────────────────────────────────────────────────
+
+dablin is exposed as a flat subcommand:
+
 Command:
-    dabctl -C <channel> -s <sid> [options]
+    dabctl dablin -i <eti-file|-> -s <sid> [options]
 
 Options:
-- -C, --channel <STRING>        Required (e.g. 5A, 6C, 11C, LA)
-- -s, --sid <HEX>               Required (e.g. 0xF2F8)
-- -G, --gain <0-100>            Manual tuner gain (exclusive with AGC)
-- --hardware-agc                RTL-SDR hardware AGC
-- --driver-agc                  old-dab driver AGC
-- --software-agc                Force software AGC loop
-- -l, --label <STRING>          Service label instead of SID
-- -S, --slide-dir <PATH>        Save slideshow images
-- --slide-base64                Include slides as base64 in JSON
-- --silent                      Disable stderr logging
-- --device-index <INT>          RTL-SDR index (default: 0)
-- --aac-decoder <faad2|fdk-aac> AAC backend (default: faad2)
+- -i, --input <PATH|->           ETI file or stdin
+- -s, --sid <HEX>                Service ID (e.g. 0xF2F8)
+- -l, --label <STRING>           Select service by label
+- --list-services                List ensemble/services then exit
+- --aac-decoder <faad2|fdk>      AAC backend (default: faad2)
+- --aac-gap <freeze|silence>     Behavior on missing/invalid AAC frames
+                                  - freeze  : default, preserve legacy behavior
+                                  - silence : emit PCM silence to keep stream alive
+- --silent                       Disable stderr logging
+
+Rules:
+- No other dabctl subcommands are allowed
+- No nested dablin subcommands
+- clap derive API only
+- Default behavior MUST match gregoire78/dablin exactly
 
 ──────────────────────────────────────────────────────────────────────
-METADATA OUTPUT (CRITICAL)
+INPUT CONTRACT (STRICT)
 ──────────────────────────────────────────────────────────────────────
-ALL metadata MUST be written to **file descriptor 3**
-NOT stdout
-NOT stderr
+Input source:
+- ETI (NA or NI)
+- From file or stdin (`-`)
 
-JSONL format, one event per line:
+Rules:
+- ETI stream is authoritative
+- No RF assumptions
+- No timing reinterpretation
+- Match ETI reader behavior from gregoire78/dablin exactly
+- Continuous streams without EOF assumptions must be supported
 
+Malformed ETI handling must match the reference exactly.
+No heuristics.
+
+──────────────────────────────────────────────────────────────────────
+OUTPUT CONTRACT (CRITICAL)
+──────────────────────────────────────────────────────────────────────
+STDOUT:
+- Raw PCM only
+- s16le
+- 48 kHz
+- stereo
+- No framing
+- No metadata
+- No logs
+
+STDERR:
+- Logs only
+- tracing exclusively
+- Fully suppressed when --silent is set
+
+FD 3 (MANDATORY METADATA CHANNEL):
+- JSON Lines (JSONL)
+- One event per line
+- MUST be opened explicitly via FromRawFd(3)
+- MUST NEVER write metadata to stdout or stderr
+
+Example:
 {"ensemble":{"eid":"0x1000","label":"DAB+ France"}}
 {"service":{"sid":"0xF2F8","label":"NRJ"}}
 {"dl":"NRJ - Ed Sheeran - Shape Of You"}
 {"slide":{"contentName":"cover.jpg","contentType":"image/jpeg","data":"<base64>"}}
 
-Implementation rules:
-- Open FD 3 explicitly (`FromRawFd(3)`)
-- Never close FD 3 prematurely
-- No buffering that would reorder events
+──────────────────────────────────────────────────────────────────────
+AUDIO DECODING (AAC GAP HANDLING – NEW)
+──────────────────────────────────────────────────────────────────────
+- Default decoder: faad2
+- Optional: fdk-aac (feature-gated)
+- Runtime selection via CLI
 
-──────────────────────────────────────────────────────────────────────
-AUDIO OUTPUT
-──────────────────────────────────────────────────────────────────────
-- Raw PCM
-- s16le
-- 48 kHz
-- stereo
-- Written ONLY to stdout
-- No framing, headers, or metadata
+Gap policy:
+
+Default (`--aac-gap freeze`):
+- Preserve legacy behavior exactly
+- Missing or invalid AAC frames produce no PCM output
+
+Opt-in (`--aac-gap silence`):
+- Missing, invalid, or undecodable AAC frames MUST emit PCM silence
+- Silence MUST be generated:
+  - inside the AAC decoder path
+  - frame-exact (same number of samples as a valid AAC frame)
+  - using zero-valued PCM samples
+- PCM output timing MUST remain continuous
+- Decode errors MUST still be logged
+
+Silence generation MUST NOT:
+- Be implemented outside the AAC decoder
+- Use timers, sleeps, or background threads
+- Mask or suppress decoder errors
+
+Typical values:
+- 1024 samples per channel per AAC frame
+- Stereo, s16le
+
+No speculative audio changes are allowed.
 
 ──────────────────────────────────────────────────────────────────────
 DEPENDENCIES
@@ -87,59 +157,67 @@ Mandatory:
 - tracing + tracing-subscriber
 
 Forbidden:
-- rtl-sdr-rs
-- any alternative SDR abstraction
+- Any SDR library
+- Any RF-related code paths
+- DSP abstraction layers
 
-RTL-SDR MUST be accessed via:
-- git submodule vendor/rtlsdr (old-dab)
-- bindgen-generated FFI
-- unsafe blocks only at FFI boundaries
+dabctl MUST remain ETI-only.
 
 ──────────────────────────────────────────────────────────────────────
 ARCHITECTURE RULES
 ──────────────────────────────────────────────────────────────────────
-Match DABstar structure one-to-one:
-- main.rs = argument parsing + wiring
-- tuner / device layer
-- OFDM
-- demod
-- FIC / MSC separation
-- DAB+ audio decode
-- PAD + slideshow extraction
+- Preserve reference module boundaries
+- Preserve processing order:
+  ETI → FIC → FIG → MSC → DAB / DAB+
+- No DSP fusion
+- No pipeline shortcuts
+- No concurrency changes unless reference does
 
-No DSP fusion
-No pipeline shortcuts
-No concurrency changes unless strictly required
+Rust expresses structure,
+never alters behavior.
 
 ──────────────────────────────────────────────────────────────────────
-LOGGING
+SAFETY, TESTING & DISCIPLINE
 ──────────────────────────────────────────────────────────────────────
-- Use tracing exclusively
-- stderr output only
-- Suppressed entirely when --silent is set
+- Unsafe isolated and justified
+- No allocation in hot loops unless reference does
+- Deterministic decoding paths
+- Any behavioral difference must be flagged immediately
 
-No println!
-No eprintln!
+Before coding:
+1. Identify reference file in src/dablin or the fork
+2. State preserved behavior (default or silence mode)
+3. Declare assumptions
 
-──────────────────────────────────────────────────────────────────────
-TESTING & SAFETY
-──────────────────────────────────────────────────────────────────────
-- Unsafe code isolated in ffi modules
-- All DSP stages deterministic
-- No allocation in hot OFDM loops unless original code does
-- Preserve numerical behavior even if non-idiomatic
+After coding:
+1. cargo fmt
+2. cargo build --release
+3. cargo build --release --features fdk-aac (if applicable)
+4. cargo clippy -- -D warnings
+5. cargo test
+6. Compare output against gregoire78/dablin (default mode)
 
 ──────────────────────────────────────────────────────────────────────
 DELIVERABLE EXPECTATION
 ──────────────────────────────────────────────────────────────────────
-The resulting Rust binary must be usable exactly like:
 
-sudo sh -c 'exec 3>pad_metadata.json; exec "$@"' _ \
-  ./dabctl -C 6C -s 0xF2F8 --slide-dir slides --slide-base64
+dabctl exposes DAB/DAB+ decoding ONLY via the dablin subcommand.
 
-and produce:
-- PCM on stdout
-- JSONL metadata on fd 3
-- Logs on stderr
+ETI file:
+sudo sh -c 'exec 3>meta.json; exec "$@"' _ \
+  ./dabctl dablin -i multiplex.eti -s 0xF2F8
 
-Deviation from the original DABstar behavior is a bug.
+ETI stream (stdin):
+cat multiplex.eti | \
+sudo sh -c 'exec 3>meta.json; exec "$@"' _ \
+  ./dabctl dablin -i - -s 0xF2F8
+
+Both MUST produce:
+- Raw PCM on stdout
+- JSONL metadata on file descriptor 3
+- Logs on stderr (unless --silent is set)
+
+There is NO RF, NO RTL-SDR, and NO live input in dabctl.
+Any assumption of RF functionality is an error.
+
+Deviation from reference behavior is a bug.
