@@ -48,9 +48,9 @@ echo "[dablin] Ctrl-C pour arrêter"
 
 # Pipeline ETI → DAB/DAB+ → PCM
 # FD 3 réservé aux métadonnées PAD
-sudo RUST_LOG="info,dablin=${RUST_LOG:-info}" sh -c '
+sudo sh -c '
   exec 3>pad_metadata.json
-  exec "$@"
+  RUST_LOG=info exec "$@"
 ' _ \
   ../target/release/dabctl dablin \
     -i "$ETI_FILE" \
