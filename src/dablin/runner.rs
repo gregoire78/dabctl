@@ -12,6 +12,8 @@
 //!     → FD 3  (JSONL metadata)
 
 use std::io::{self, BufReader, Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
 use base64::Engine;
@@ -39,6 +41,16 @@ pub fn run(args: DablinArgs) -> Result<()> {
                     .add_directive(tracing::Level::INFO.into()),
             )
             .init();
+    }
+
+    // ── Ctrl+C handler ───────────────────────────────────────────────────────
+    let running = Arc::new(AtomicBool::new(true));
+    {
+        let r = Arc::clone(&running);
+        ctrlc::set_handler(move || {
+            r.store(false, Ordering::Relaxed);
+        })
+        .expect("Error setting Ctrl+C handler");
     }
 
     // ── Open input ───────────────────────────────────────────────────────────
@@ -94,6 +106,12 @@ pub fn run(args: DablinArgs) -> Result<()> {
     let mut frame_count = 0u64;
 
     loop {
+        // Exit gracefully on Ctrl+C
+        if !running.load(Ordering::Relaxed) {
+            info!("Interrupted, exiting");
+            break;
+        }
+
         // Read one ETI-NI frame (6144 bytes)
         match reader.read_exact(&mut frame_buf) {
             Ok(()) => {}
@@ -135,31 +153,16 @@ pub fn run(args: DablinArgs) -> Result<()> {
             let service = select_service(&fic, &args);
             match service {
                 Some(svc) => {
-                    info!(
-                        "Selected service: SID={:#06x} label={:?}",
-                        svc.sid,
-                        svc.label.as_deref()
-                    );
                     if let Some(comp) = svc.components.first() {
                         let scid = comp.subch_id;
                         selected_scid = Some(scid);
                         selected_sid = Some(svc.sid);
 
-                        // Emit metadata events
-                        if let Some(m) = meta.as_mut() {
-                            m.emit_ensemble(fic.ensemble.eid, fic.ensemble.label.as_deref());
-                            m.emit_service(svc.sid, svc.label.as_deref());
-                            emitted_ensemble_eid = Some(fic.ensemble.eid);
-                            emitted_ensemble_label = fic.ensemble.label.clone();
-                            emitted_service_sid = Some(svc.sid);
-                            emitted_service_label = svc.label.clone();
-                        }
-
                         // Find STL for the selected sub-channel
                         if let Some(stc) = frame.stc.iter().find(|e| e.scid == scid) {
                             let buf = SubchannelBuffer::new(scid, stc.stl);
                             debug!("Sub-channel SCID={} STL={} ({} bytes/CIF)", scid, stc.stl, buf.cif_bytes());
-                            info!(
+                            debug!(
                                 "PAD MOT app type for SCID {}: {:?}, SID {:#06x}: {:?}",
                                 scid,
                                 fic.mot_app_type(scid),
@@ -199,23 +202,39 @@ pub fn run(args: DablinArgs) -> Result<()> {
         }
 
         // ── Metadata refresh (labels can arrive after initial service selection) ──
-        if let (Some(m), Some(sid)) = (meta.as_mut(), selected_sid) {
+        if let Some(sid) = selected_sid {
             let current_ensemble_label = fic.ensemble.label.clone();
-            if emitted_ensemble_eid != Some(fic.ensemble.eid)
-                || emitted_ensemble_label != current_ensemble_label
-            {
-                m.emit_ensemble(fic.ensemble.eid, current_ensemble_label.as_deref());
-                emitted_ensemble_eid = Some(fic.ensemble.eid);
-                emitted_ensemble_label = current_ensemble_label;
-            }
 
+            // Emit service only once the label is known
             if let Some(svc) = fic.services.iter().find(|s| s.sid == sid) {
                 let current_service_label = svc.label.clone();
-                if emitted_service_sid != Some(sid) || emitted_service_label != current_service_label {
-                    m.emit_service(sid, current_service_label.as_deref());
+                if current_service_label.is_some()
+                    && (emitted_service_sid != Some(sid) || emitted_service_label != current_service_label)
+                {
+                    if emitted_service_sid == Some(sid) && emitted_service_label.is_none() {
+                        info!("Service label resolved: SID={:#06x} label={:?}", sid, current_service_label.as_deref());
+                    }
+                    if let Some(m) = meta.as_mut() {
+                        m.emit_service(sid, current_service_label.as_deref());
+                    }
                     emitted_service_sid = Some(sid);
                     emitted_service_label = current_service_label;
+                } else if emitted_service_sid.is_none() {
+                    // Track that we've seen this service even without label yet
+                    emitted_service_sid = Some(sid);
                 }
+            }
+
+            // Emit ensemble only once the label is known
+            if current_ensemble_label.is_some()
+                && (emitted_ensemble_eid != Some(fic.ensemble.eid)
+                    || emitted_ensemble_label != current_ensemble_label)
+            {
+                if let Some(m) = meta.as_mut() {
+                    m.emit_ensemble(fic.ensemble.eid, current_ensemble_label.as_deref());
+                }
+                emitted_ensemble_eid = Some(fic.ensemble.eid);
+                emitted_ensemble_label = current_ensemble_label;
             }
         }
 
