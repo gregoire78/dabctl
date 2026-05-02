@@ -8,24 +8,28 @@ use crate::dablin::eti::EtiFrame;
 /// Extracts the raw data bytes for a given sub-channel ID from an ETI frame.
 ///
 /// Returns `Some(&[u8])` when the sub-channel is present, `None` otherwise.
-pub fn extract_subchannel(frame: &EtiFrame, target_scid: u8) -> Option<&[u8]> {
+/// The returned slice points directly into the original ETI buffer — no copy.
+pub fn extract_subchannel<'a>(frame: &EtiFrame<'a>, target_scid: u8) -> Option<&'a [u8]> {
     for (i, entry) in frame.stc.iter().enumerate() {
         if entry.scid == target_scid {
-            return frame.streams.get(i).map(|v| v.as_slice());
+            return frame.streams.get(i).copied();
         }
     }
     None
 }
 
 /// Sub-channel stream assembler.
-#[allow(dead_code)]
 ///
-/// Buffers CIF-by-CIF data for a single sub-channel and emits
-/// complete DAB+ super frames (5 CIFs = 120 ms) for decoding.
+/// Buffers incoming CIF data for a single sub-channel and emits complete
+/// DAB+ super frames (5 CIFs = 120 ms) for Reed-Solomon + FireCode decoding.
+///
+/// The backing `Vec` is pre-allocated to 6×cif_bytes at construction;
+/// no further heap allocations occur during normal streaming.
+#[allow(dead_code)]
 pub struct SubchannelBuffer {
     scid: u8,
     cif_bytes: usize,
-    /// Accumulated raw bytes from ETI frames
+    /// Accumulated raw bytes from ETI frames (bounded to ≤6×cif_bytes)
     buffer: Vec<u8>,
 }
 
@@ -36,10 +40,11 @@ impl SubchannelBuffer {
     /// `stl_cus` is the sub-channel stream length in Capacity Units (STL field).
     /// One CU = 8 bytes in the ETI stream.
     pub fn new(scid: u8, stl_cus: u16) -> Self {
+        let cif_bytes = stl_cus as usize * 8;
         Self {
             scid,
-            cif_bytes: stl_cus as usize * 8,
-            buffer: Vec::with_capacity(stl_cus as usize * 8 * 6),
+            cif_bytes,
+            buffer: Vec::with_capacity(cif_bytes * 6),
         }
     }
 
@@ -63,17 +68,15 @@ impl SubchannelBuffer {
         self.cif_bytes * 5
     }
 
-    /// Attempt to peek/extract one super frame from the buffer (dablin sliding window).
+    /// Attempt to peek one super frame from the buffer (dablin sliding window).
     ///
-    /// Returns `Some(Vec<u8>)` with the last 5 CIFs worth of bytes if available.
-    /// The returned data is NOT consumed — call `advance_one_cif()` or `consume_superframe()`.
-    pub fn try_peek_superframe(&self) -> Option<Vec<u8>> {
+    /// Returns a slice if at least one superframe worth of bytes is available.
+    pub fn try_peek_superframe_slice(&self) -> Option<&[u8]> {
         let sf_size = self.superframe_size();
-        if self.buffer.len() >= sf_size {
-            Some(self.buffer[..sf_size].to_vec())
-        } else {
-            None
+        if self.buffer.len() < sf_size {
+            return None;
         }
+        Some(&self.buffer[..sf_size])
     }
 
     /// Attempt to drain one super frame from the buffer.
@@ -82,29 +85,31 @@ impl SubchannelBuffer {
     /// is available, otherwise `None`.
     pub fn try_pop_superframe(&mut self) -> Option<Vec<u8>> {
         let sf_size = self.superframe_size();
+        if self.buffer.len() < sf_size {
+            return None;
+        }
+        let result = self.buffer[..sf_size].to_vec();
+        self.buffer.drain(..sf_size);
+        Some(result)
+    }
+
+    /// Consume (discard) one complete super frame from the buffer.
+    pub fn consume_superframe(&mut self) {
+        let sf_size = self.superframe_size();
         if self.buffer.len() >= sf_size {
-            let sf: Vec<u8> = self.buffer.drain(..sf_size).collect();
-            Some(sf)
-        } else {
-            None
+            self.buffer.drain(..sf_size);
         }
     }
 
     /// Advance one CIF (used in sliding-window sync to shift by one frame).
     pub fn advance_one_cif(&mut self) {
-        let cif = self.cif_bytes;
-        if self.buffer.len() >= cif {
-            self.buffer.drain(..cif);
+        if self.buffer.len() >= self.cif_bytes {
+            self.buffer.drain(..self.cif_bytes);
         }
     }
 
     /// Number of bytes currently buffered.
     pub fn len(&self) -> usize {
-        self.buffer.len()
-    }
-
-    /// Number of bytes currently buffered (alias for clarity in runner).
-    pub fn buffer_len(&self) -> usize {
         self.buffer.len()
     }
 
@@ -121,10 +126,16 @@ impl SubchannelBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dablin::eti::{EtiFrame};
-    use crate::dablin::eti::StcEntry;
+    use arrayvec::ArrayVec;
+    use crate::dablin::eti::{EtiFrame, StcEntry};
 
-    fn make_frame_with_stream(scid: u8, data: Vec<u8>) -> EtiFrame {
+    // Helper: builds a synthetic EtiFrame backed by a static buffer.
+    // The `data` slice must outlive the returned frame (caller owns the backing store).
+    fn make_frame_with_stream<'a>(scid: u8, data: &'a [u8]) -> EtiFrame<'a> {
+        let mut stc = ArrayVec::new();
+        stc.push(StcEntry { scid, sad: 0, tpl: 0x22, stl: 33 });
+        let mut streams = ArrayVec::new();
+        streams.push(data);
         EtiFrame {
             err: 0,
             fct: 0,
@@ -133,24 +144,25 @@ mod tests {
             fp: 0,
             mid: 1,
             fl: 40,
-            stc: vec![StcEntry { scid, sad: 0, tpl: 0x22, stl: 33 }],
+            stc,
             mnsc: 0,
-            fic: vec![],
-            streams: vec![data],
+            fic: &[],
+            streams,
         }
     }
 
     #[test]
     fn test_extract_subchannel_found() {
         let payload: Vec<u8> = (0..264u16).map(|i| (i & 0xff) as u8).collect();
-        let frame = make_frame_with_stream(3, payload.clone());
+        let frame = make_frame_with_stream(3, &payload);
         let extracted = extract_subchannel(&frame, 3).unwrap();
         assert_eq!(extracted, payload.as_slice());
     }
 
     #[test]
     fn test_extract_subchannel_not_found() {
-        let frame = make_frame_with_stream(3, vec![0u8; 264]);
+        let data = vec![0u8; 264];
+        let frame = make_frame_with_stream(3, &data);
         assert!(extract_subchannel(&frame, 99).is_none());
     }
 

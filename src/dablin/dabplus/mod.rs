@@ -67,15 +67,16 @@ pub struct SuperframeResult {
     pub format: Option<SuperframeFormat>,
 }
 
-/// Process a DAB+ super frame buffer (5 CIFs of sub-channel data).
+/// Process a DAB+ super frame buffer in-place (5 CIFs of sub-channel data).
 ///
+/// `sf` MUST be a copy owned by the caller — RS correction modifies it in place.
 /// Matches dablin's SuperframeFilter::Feed() logic:
 ///   1. Validate size: sf_len % 120 == 0
-///   2. RS decode (subch_index = sf_len / 120)
+///   2. RS decode in-place (subch_index = sf_len / 120)
 ///   3. FireCode check on RS-decoded bytes
 ///   4. AU extraction
-pub fn process_superframe(raw: &[u8]) -> SuperframeResult {
-    let sf_len = raw.len();
+pub fn process_superframe_inplace(sf: &mut [u8]) -> SuperframeResult {
+    let sf_len = sf.len();
     if sf_len == 0 || !sf_len.is_multiple_of(120) {
         tracing::warn!("DAB+ superframe size {} not divisible by 120", sf_len);
         return SuperframeResult {
@@ -86,9 +87,8 @@ pub fn process_superframe(raw: &[u8]) -> SuperframeResult {
         };
     }
 
-    // 1. Reed-Solomon decoding (BEFORE FireCode check, like dablin)
-    let mut sf = raw.to_vec();
-    let rs_corrected = match rs_decode_superframe(&mut sf) {
+    // 1. Reed-Solomon decoding in-place (caller already owns the buffer)
+    let rs_corrected = match rs_decode_superframe(sf) {
         Ok(n) => n,
         Err(n) => {
             tracing::debug!("RS: {} uncorrectable codewords, continuing best-effort", n);
@@ -97,7 +97,7 @@ pub fn process_superframe(raw: &[u8]) -> SuperframeResult {
     };
 
     // 2. FireCode check AFTER RS (matches dablin CheckSync())
-    let firecode_ok = check_firecode(&sf);
+    let firecode_ok = check_firecode(sf);
     if !firecode_ok {
         tracing::debug!("DAB+ FireCode mismatch after RS - dropping super frame");
         tracing::debug!("  sf[0..11] after RS: {:02X?}", &sf[..11.min(sf.len())]);
@@ -117,7 +117,7 @@ pub fn process_superframe(raw: &[u8]) -> SuperframeResult {
         ps_flag:              (sf[2] & 0x08) != 0,
         mpeg_surround_config: sf[2] & 0x07,
     };
-    let units = extract_audio_units_dablin(&sf, sf_len);
+    let units = extract_audio_units_dablin(sf, sf_len);
 
     SuperframeResult {
         units,
@@ -205,8 +205,8 @@ mod tests {
     #[test]
     fn test_process_superframe_bad_firecode() {
         // Super frame with size not divisible by 120 → early rejection
-        let sf = vec![0u8; 121];
-        let result = process_superframe(&sf);
+        let mut sf = vec![0u8; 121];
+        let result = process_superframe_inplace(&mut sf);
         assert!(!result.firecode_ok);
         assert!(result.units.is_empty());
     }
@@ -218,7 +218,7 @@ mod tests {
         let mut sf = vec![0u8; 1320]; // 5 x 264 bytes (STL=33)
         sf[0] = 0x00;
         sf[1] = 0x00;
-        let result = process_superframe(&sf);
+        let result = process_superframe_inplace(&mut sf);
         assert!(result.firecode_ok);
     }
 }

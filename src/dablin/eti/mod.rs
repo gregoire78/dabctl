@@ -10,6 +10,8 @@
 //!   ..        : MST (FL × 4 bytes: FIC data + sub-channel streams + padding)
 //!   ..        : Frame padding (0x55) to reach 6144 bytes
 
+use arrayvec::ArrayVec;
+
 /// Total ETI-NI frame size in bytes (Mode I)
 pub const ETI_FRAME_SIZE: usize = 6144;
 
@@ -31,10 +33,10 @@ pub struct StcEntry {
     pub stl: u16,
 }
 
-/// Parsed ETI-NI frame
+/// Parsed ETI-NI frame (zero-copy: `fic` and `streams` are slices into the raw ETI buffer)
 #[allow(dead_code)]
 #[derive(Debug)]
-pub struct EtiFrame {
+pub struct EtiFrame<'a> {
     /// Error byte (0 = no errors)
     pub err: u8,
     /// Frame count timer (0-249, increments each CIF)
@@ -49,14 +51,14 @@ pub struct EtiFrame {
     pub mid: u8,
     /// Frame length (MST in 32-bit words)
     pub fl: u16,
-    /// Sub-channel characterization table
-    pub stc: Vec<StcEntry>,
+    /// Sub-channel characterization table (stack-allocated, max 64 entries per spec)
+    pub stc: ArrayVec<StcEntry, 64>,
     /// Minor Network Status Change
     pub mnsc: u16,
-    /// FIC data (3 FIBs × 32 bytes for Mode I)
-    pub fic: Vec<u8>,
-    /// Sub-channel stream data, one Vec per STC entry (in STC order)
-    pub streams: Vec<Vec<u8>>,
+    /// FIC data (slice into raw ETI buffer — no allocation)
+    pub fic: &'a [u8],
+    /// Sub-channel stream data slices (no allocation — each points into the raw ETI buffer)
+    pub streams: ArrayVec<&'a [u8], 64>,
 }
 
 /// Error type for ETI parsing
@@ -112,8 +114,9 @@ impl FsyncState {
 
 /// Parse a single 6144-byte ETI-NI frame.
 ///
-/// Returns an `EtiFrame` with all header fields and data slices populated.
-pub fn parse_frame(raw: &[u8]) -> Result<EtiFrame, EtiError> {
+/// Returns an `EtiFrame<'_>` whose `fic` and `streams` fields are zero-copy
+/// slices into `raw` — no heap allocation is performed.
+pub fn parse_frame(raw: &[u8]) -> Result<EtiFrame<'_>, EtiError> {
     if raw.len() < ETI_FRAME_SIZE {
         return Err(EtiError::FrameTooShort {
             expected: ETI_FRAME_SIZE,
@@ -138,11 +141,12 @@ pub fn parse_frame(raw: &[u8]) -> Result<EtiFrame, EtiError> {
     let fl_hi = (raw[6] & 0x07) as u16;
     let fl = (fl_hi << 8) | raw[7] as u16;
 
-    // Parse STC entries
+    // Parse STC entries (stack-allocated — no heap allocation)
     let stc_start = 8usize;
     let stc_bytes = nst as usize * 4;
-    let mut stc = Vec::with_capacity(nst as usize);
+    let mut stc = ArrayVec::<StcEntry, 64>::new();
     for i in 0..nst as usize {
+        if stc.is_full() { break; }  // safety: DAB spec max = 64 SCIDs
         let base = stc_start + i * 4;
         let b = &raw[base..base + 4];
         let scid = b[0] >> 2;
@@ -159,25 +163,26 @@ pub fn parse_frame(raw: &[u8]) -> Result<EtiFrame, EtiError> {
 
     // MST starts after EOH
     let mst_start = eoh_start + 4;
-    // FIC data
+    // FIC data — zero-copy slice into raw
     let fic_fibs = if ficf { FIBS_PER_FRAME[mid as usize - 1] } else { 0 };
     let fic_size = fic_fibs * 32;
-    let fic = if ficf && mst_start + fic_size <= raw.len() {
-        raw[mst_start..mst_start + fic_size].to_vec()
+    let fic: &[u8] = if ficf && mst_start + fic_size <= raw.len() {
+        &raw[mst_start..mst_start + fic_size]
     } else {
-        Vec::new()
+        &[]  // &'static [u8] coerces to &'a [u8] via covariance
     };
 
-    // Sub-channel stream data (packed sequentially in STC order)
-    let mut streams = Vec::with_capacity(nst as usize);
+    // Sub-channel stream data — zero-copy slices into raw (no per-stream allocation)
+    let mut streams = ArrayVec::<&[u8], 64>::new();
     let mut stream_offset = mst_start + fic_size;
     for entry in &stc {
+        if streams.is_full() { break; }
         let stream_size = entry.stl as usize * 8;
         let end = stream_offset + stream_size;
-        let stream = if end <= raw.len() {
-            raw[stream_offset..end].to_vec()
+        let stream: &[u8] = if end <= raw.len() {
+            &raw[stream_offset..end]
         } else {
-            Vec::new()
+            &[]
         };
         streams.push(stream);
         stream_offset = end;

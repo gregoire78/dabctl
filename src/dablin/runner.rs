@@ -20,7 +20,7 @@ use base64::Engine;
 
 use crate::cli::{AacDecoder as AacDecoderChoice, AacGap, DablinArgs};
 use crate::dablin::audio::AacDecoder;
-use crate::dablin::dabplus::process_superframe;
+use crate::dablin::dabplus::process_superframe_inplace;
 use crate::dablin::eti::{parse_frame, FsyncState, ETI_FRAME_SIZE};
 use crate::dablin::fic::{FicDecoder, ServiceInfo};
 use crate::dablin::metadata::MetadataEmitter;
@@ -74,8 +74,6 @@ pub fn run(args: DablinArgs) -> Result<()> {
             warn!("Cannot create slide-dir {:?}: {}", dir, e);
         }
     }
-    let _slide_base64 = args.slide_base64; // reserved for MOT PAD decoding
-
     // ── FIC decoder ──────────────────────────────────────────────────────────
     let mut fic = FicDecoder::new();
     let mut selected_scid: Option<u8> = None;
@@ -99,6 +97,16 @@ pub fn run(args: DablinArgs) -> Result<()> {
 
     // ── FSYNC state ──────────────────────────────────────────────────────────
     let mut fsync_state = FsyncState::new();
+
+    // ── FIC freeze tracking ───────────────────────────────────────────────────
+    // Once ensemble label + selected service label are known, stop calling
+    // process_fic() on every frame and only re-parse on MNSC changes (live remux).
+    let mut fic_stable = false;
+    let mut last_mnsc: u16 = 0xFFFF; // sentinel: forces parse on the very first frame
+
+    // ── Superframe work buffer ────────────────────────────────────────────────
+    // Pre-allocated once; resized on first valid superframe; reused every iteration.
+    let mut sf_work_buf: Vec<u8> = Vec::new();
 
     // ── PCM stdout ───────────────────────────────────────────────────────────
     let stdout = io::stdout();
@@ -146,9 +154,29 @@ pub fn run(args: DablinArgs) -> Result<()> {
 
         frame_count += 1;
 
-        // ── FIC processing ────────────────────────────────────────────────────
+        // ── FIC processing (with freeze once stable) ──────────────────────────
         if frame.ficf && !frame.fic.is_empty() {
-            fic.process_fic(&frame.fic);
+            let mnsc_changed = frame.mnsc != last_mnsc;
+            last_mnsc = frame.mnsc;
+
+            if !fic_stable || mnsc_changed {
+                if mnsc_changed && fic_stable {
+                    info!("MNSC changed ({:#06x}), re-parsing FIC", frame.mnsc);
+                }
+                fic.process_fic(frame.fic);
+
+                // Check stability: ensemble label known + selected service label known
+                if !fic_stable {
+                    let svc_stable = selected_sid
+                        .and_then(|sid| fic.services.iter().find(|s| s.sid == sid))
+                        .map(|s| s.label.is_some())
+                        .unwrap_or(false);
+                    if fic.ensemble.label.is_some() && svc_stable {
+                        fic_stable = true;
+                        debug!("FIC stable — entering MNSC-watch-only mode");
+                    }
+                }
+            }
         }
 
         // ── --list-services: wait until all labels are known (or 500 frames) ──
@@ -168,43 +196,38 @@ pub fn run(args: DablinArgs) -> Result<()> {
         // ── Service selection (deferred until FIC is populated) ───────────────
         if selected_scid.is_none() && !fic.services.is_empty() {
             let service = select_service(&fic, &args);
-            match service {
-                Some(svc) => {
-                    if let Some(comp) = svc.components.first() {
-                        let scid = comp.subch_id;
-                        selected_scid = Some(scid);
-                        selected_sid = Some(svc.sid);
+            if let Some(svc) = service {
+                if let Some(comp) = svc.components.first() {
+                    let scid = comp.subch_id;
+                    selected_scid = Some(scid);
+                    selected_sid = Some(svc.sid);
 
-                        // Find STL for the selected sub-channel
-                        if let Some(stc) = frame.stc.iter().find(|e| e.scid == scid) {
-                            let buf = SubchannelBuffer::new(scid, stc.stl);
-                            debug!("Sub-channel SCID={} STL={} ({} bytes/CIF)", scid, stc.stl, buf.cif_bytes());
-                            debug!(
-                                "PAD MOT app type for SCID {}: {:?}, SID {:#06x}: {:?}",
-                                scid,
-                                fic.mot_app_type(scid),
-                                svc.sid,
-                                fic.mot_app_type_for_sid(svc.sid)
-                            );
-                            subch_buf = Some(buf);
+                    // Find STL for the selected sub-channel
+                    if let Some(stc) = frame.stc.iter().find(|e| e.scid == scid) {
+                        let buf = SubchannelBuffer::new(scid, stc.stl);
+                        debug!("Sub-channel SCID={} STL={} ({} bytes/CIF)", scid, stc.stl, buf.cif_bytes());
+                        debug!(
+                            "PAD MOT app type for SCID {}: {:?}, SID {:#06x}: {:?}",
+                            scid,
+                            fic.mot_app_type(scid),
+                            svc.sid,
+                            fic.mot_app_type_for_sid(svc.sid)
+                        );
+                        subch_buf = Some(buf);
 
-                            // Approximate service bitrate from sub-channel size:
-                            // 1 CIF every 24 ms, 1 CU = 64 bits per CIF.
-                            // kbps = floor(STL * 64 / 24)
-                            if let Some(m) = meta.as_mut() {
-                                let kbps = (u32::from(stc.stl) * 64) / 24;
-                                m.emit_bitrate(kbps);
-                            }
-                        } else {
-                            warn!("Sub-channel SCID={} not found in STC", scid);
+                        // Approximate service bitrate from sub-channel size:
+                        // 1 CIF every 24 ms, 1 CU = 64 bits per CIF.
+                        // kbps = floor(STL * 64 / 24)
+                        if let Some(m) = meta.as_mut() {
+                            let kbps = (u32::from(stc.stl) * 64) / 24;
+                            m.emit_bitrate(kbps);
                         }
-
-                        // Initialize AAC decoder
-                        aac = init_aac_decoder(&args.aac_decoder, &args.aac_gap);
+                    } else {
+                        warn!("Sub-channel SCID={} not found in STC", scid);
                     }
-                }
-                None => {
-                    // Not yet found, keep accumulating FIC
+
+                    // Initialize AAC decoder
+                    aac = init_aac_decoder(&args.aac_decoder, &args.aac_gap);
                 }
             }
         }
@@ -268,13 +291,22 @@ pub fn run(args: DablinArgs) -> Result<()> {
         buf.push_cif(cif_data);
 
         // ── DAB+ super frame decoding ─────────────────────────────────────────
-        // Use sliding window like dablin: if FireCode fails, advance one CIF
-        while buf.buffer_len() >= buf.superframe_size() {
-            let sf_data = match buf.try_peek_superframe() {
+        // Sliding-window sync: on FireCode failure, advance one CIF and retry.
+        // sf_work_buf holds a mutable copy of the peeked superframe for in-place RS.
+        while buf.len() >= buf.superframe_size() {
+            let sf_size = buf.superframe_size();
+
+            let slice = match buf.try_peek_superframe_slice() {
                 Some(d) => d,
                 None => break,
             };
-            let result = process_superframe(&sf_data);
+
+            if sf_work_buf.len() != sf_size {
+                sf_work_buf.resize(sf_size, 0);
+            }
+            sf_work_buf.copy_from_slice(slice);
+
+            let result = process_superframe_inplace(&mut sf_work_buf);
 
             if !result.firecode_ok {
                 debug!("DAB+ FireCode mismatch – advancing one CIF");
@@ -282,8 +314,7 @@ pub fn run(args: DablinArgs) -> Result<()> {
                 continue;
             }
 
-            // Valid sync – consume the full superframe
-            buf.try_pop_superframe();
+            buf.consume_superframe();
 
             if result.rs_corrected > 0 {
                 debug!("RS corrected {} codewords", result.rs_corrected);
