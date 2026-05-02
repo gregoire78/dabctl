@@ -44,7 +44,7 @@ pub struct EnsembleInfo {
 pub struct SubchannelOrg {
     pub subch_id: u8,
     pub start_addr: u16,
-    pub size: u16,     // in CUs
+    pub size: u16, // in CUs
     pub protection: ProtectionProfile,
 }
 
@@ -381,7 +381,11 @@ impl FicDecoder {
                             xpad_app_type,
                             ua.len()
                         );
-                        if let Some(item) = self.mot_app_types_by_sid.iter_mut().find(|(s, _)| *s == sid) {
+                        if let Some(item) = self
+                            .mot_app_types_by_sid
+                            .iter_mut()
+                            .find(|(s, _)| *s == sid)
+                        {
                             item.1 = xpad_app_type;
                         } else {
                             self.mot_app_types_by_sid.push((sid, xpad_app_type));
@@ -390,7 +394,11 @@ impl FicDecoder {
                         if let Some(svc) = self.services.iter().find(|s| s.sid == sid) {
                             for comp in &svc.components {
                                 let subch_id = comp.subch_id;
-                                if let Some(item) = self.mot_app_types.iter_mut().find(|(id, _)| *id == subch_id) {
+                                if let Some(item) = self
+                                    .mot_app_types
+                                    .iter_mut()
+                                    .find(|(id, _)| *id == subch_id)
+                                {
                                     item.1 = xpad_app_type;
                                 } else {
                                     self.mot_app_types.push((subch_id, xpad_app_type));
@@ -604,8 +612,9 @@ mod tests {
             0x06_u8, // type=0, len=6 (ext byte + SID 2b + num_comp 1b + comp 2b)
             0x02,    // ext=2
             0xf2, 0xf8, // SID = 0xF2F8
-            0x01,    // num_comp = 1
-            0x00, 0x06, // TMID=0 (stream audio, ascty=0=DAB), subch_id=(0x06>>2)=1, PS=(0x06&0x02)≠0=primary
+            0x01, // num_comp = 1
+            0x00,
+            0x06, // TMID=0 (stream audio, ascty=0=DAB), subch_id=(0x06>>2)=1, PS=(0x06&0x02)≠0=primary
         ];
         let fib = make_fib(&fig_bytes);
         let mut decoder = FicDecoder::new();
@@ -656,7 +665,7 @@ mod tests {
         // End marker (0xff = type 7, len 31) should terminate parsing
         let fig_bytes = [
             0x05_u8, 0x00, 0xf0, 0x43, 0x12, 0xa0, // FIG 0/0
-            0xff,    // end marker
+            0xff, // end marker
             0x05, 0x02, 0xf2, 0xf8, 0x01, // garbage after end marker (should be ignored)
         ];
         let fib = make_fib(&fig_bytes);

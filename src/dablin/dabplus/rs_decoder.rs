@@ -90,9 +90,8 @@ pub fn rs_decode_superframe(superframe: &mut [u8]) -> Result<usize, usize> {
             rs_packet[pos] = superframe[col + pos * subch_index];
         }
 
-        let corr_count = unsafe {
-            decode_rs_char(rs, rs_packet.as_mut_ptr(), std::ptr::null_mut(), 0)
-        };
+        let corr_count =
+            unsafe { decode_rs_char(rs, rs_packet.as_mut_ptr(), std::ptr::null_mut(), 0) };
 
         if corr_count == -1 {
             total_failed += 1;

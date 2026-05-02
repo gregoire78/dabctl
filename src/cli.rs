@@ -52,6 +52,13 @@ pub struct DablinArgs {
     /// Include slide data as base64 in FD3 metadata
     #[arg(long = "slide-base64")]
     pub slide_base64: bool,
+
+    /// Export WAV, slides and metadata for all DAB+ services to this directory
+    #[arg(
+        long = "all-services-out",
+        conflicts_with_all = ["sid", "label", "list_services", "slide_dir"]
+    )]
+    pub all_services_out: Option<String>,
 }
 
 /// AAC decoder backend selection
@@ -78,7 +85,8 @@ mod tests {
 
     #[test]
     fn test_parse_dablin_basic() {
-        let cli = Cli::try_parse_from(["dabctl", "dablin", "-i", "test.eti", "-s", "0xF2F8"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["dabctl", "dablin", "-i", "test.eti", "-s", "0xF2F8"]).unwrap();
         match cli.command {
             Commands::Dablin(args) => {
                 assert_eq!(args.input, "test.eti");
@@ -92,12 +100,17 @@ mod tests {
     #[test]
     fn test_parse_dablin_silence_gap() {
         let cli = Cli::try_parse_from([
-            "dabctl", "dablin",
-            "-i", "-",
-            "-s", "0xF2F8",
-            "--aac-gap", "silence",
+            "dabctl",
+            "dablin",
+            "-i",
+            "-",
+            "-s",
+            "0xF2F8",
+            "--aac-gap",
+            "silence",
             "--silent",
-        ]).unwrap();
+        ])
+        .unwrap();
         match cli.command {
             Commands::Dablin(args) => {
                 assert_eq!(args.input, "-");
@@ -109,7 +122,8 @@ mod tests {
 
     #[test]
     fn test_parse_dablin_list_services() {
-        let cli = Cli::try_parse_from(["dabctl", "dablin", "-i", "test.eti", "--list-services"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["dabctl", "dablin", "-i", "test.eti", "--list-services"]).unwrap();
         match cli.command {
             Commands::Dablin(args) => {
                 assert!(args.list_services);
@@ -119,11 +133,45 @@ mod tests {
 
     #[test]
     fn test_parse_dablin_by_label() {
-        let cli = Cli::try_parse_from(["dabctl", "dablin", "-i", "test.eti", "-l", "France Inter"]).unwrap();
+        let cli = Cli::try_parse_from(["dabctl", "dablin", "-i", "test.eti", "-l", "France Inter"])
+            .unwrap();
         match cli.command {
             Commands::Dablin(args) => {
                 assert_eq!(args.label, Some("France Inter".to_string()));
             }
         }
+    }
+
+    #[test]
+    fn test_parse_dablin_all_services_out() {
+        let cli = Cli::try_parse_from([
+            "dabctl",
+            "dablin",
+            "-i",
+            "test.eti",
+            "--all-services-out",
+            "out",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Dablin(args) => {
+                assert_eq!(args.all_services_out, Some("out".to_string()));
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_dablin_all_services_out_conflicts_with_sid() {
+        let cli = Cli::try_parse_from([
+            "dabctl",
+            "dablin",
+            "-i",
+            "test.eti",
+            "--all-services-out",
+            "out",
+            "-s",
+            "0xF2F8",
+        ]);
+        assert!(cli.is_err());
     }
 }

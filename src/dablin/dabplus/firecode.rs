@@ -12,8 +12,8 @@ fn firecode_crc(data: &[u8]) -> u16 {
     // Fire code polynomial: x^16 + x^14 + x^13 + x^12 + x^11 + x^5 + x^3 + x^2 + x + 1
     // Feedback taps: bits 16, 14, 13, 12, 11, 5, 3, 2, 1, 0 (0-indexed from LSB)
     // In 16-bit register: taps at 14, 13, 12, 11, 5, 3, 2, 1, 0 (after shifting out bit 15)
-        // Taps at positions: 14,13,12,11,5,3,2,1,0 (bit 0 = x^0 implicit via feedback)
-        const POLY: u16 = 0b0111_1000_0010_1111;
+    // Taps at positions: 14,13,12,11,5,3,2,1,0 (bit 0 = x^0 implicit via feedback)
+    const POLY: u16 = 0b0111_1000_0010_1111;
 
     let mut crc: u16 = 0;
     for &byte in data {
@@ -22,7 +22,7 @@ fn firecode_crc(data: &[u8]) -> u16 {
             let feedback = (crc >> 15) ^ input_bit;
             crc <<= 1; // u16 wraps automatically at 16 bits
             if feedback != 0 {
-                            crc ^= POLY; // POLY already has bit 0 set (0x2F has bit 0 = 1)
+                crc ^= POLY; // POLY already has bit 0 set (0x2F has bit 0 = 1)
             }
         }
     }

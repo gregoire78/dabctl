@@ -11,12 +11,17 @@
 //!     → stdout (raw PCM s16le 48 kHz stereo)
 //!     → FD 3  (JSONL metadata)
 
-use std::io::{self, BufReader, Read, Write};
+use anyhow::{Context, Result};
+use base64::Engine;
+use serde_json::json;
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use anyhow::{Context, Result};
 use tracing::{debug, info, warn};
-use base64::Engine;
+use rayon::prelude::*;
 
 use crate::cli::{AacDecoder as AacDecoderChoice, AacGap, DablinArgs};
 use crate::dablin::audio::AacDecoder;
@@ -27,9 +32,101 @@ use crate::dablin::metadata::MetadataEmitter;
 use crate::dablin::msc::{extract_subchannel, SubchannelBuffer};
 use crate::dablin::pad::PadDecoder;
 
+struct WavWriter {
+    file: std::fs::File,
+    data_len: u32,
+}
+
+impl WavWriter {
+    fn create(path: &Path) -> Result<Self> {
+        let mut file = std::fs::File::create(path)
+            .with_context(|| format!("cannot create WAV file: {}", path.display()))?;
+        write_wav_header(&mut file, 0)?;
+        Ok(Self { file, data_len: 0 })
+    }
+
+    fn write_pcm(&mut self, pcm: &[i16]) -> Result<()> {
+        let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
+        self.file.write_all(&bytes)?;
+        let written = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
+        self.data_len = self.data_len.saturating_add(written);
+        Ok(())
+    }
+
+    fn finalize(&mut self) -> Result<()> {
+        self.file.seek(SeekFrom::Start(0))?;
+        write_wav_header(&mut self.file, self.data_len)?;
+        self.file.flush()?;
+        Ok(())
+    }
+}
+
+fn write_wav_header(file: &mut std::fs::File, data_len: u32) -> Result<()> {
+    let riff_size = 36u32.saturating_add(data_len);
+    let byte_rate = 48_000u32 * 2u32 * 2u32;
+    let block_align = 2u16 * 2u16;
+
+    file.write_all(b"RIFF")?;
+    file.write_all(&riff_size.to_le_bytes())?;
+    file.write_all(b"WAVE")?;
+    file.write_all(b"fmt ")?;
+    file.write_all(&16u32.to_le_bytes())?;
+    file.write_all(&1u16.to_le_bytes())?;
+    file.write_all(&2u16.to_le_bytes())?;
+    file.write_all(&48_000u32.to_le_bytes())?;
+    file.write_all(&byte_rate.to_le_bytes())?;
+    file.write_all(&block_align.to_le_bytes())?;
+    file.write_all(&16u16.to_le_bytes())?;
+    file.write_all(b"data")?;
+    file.write_all(&data_len.to_le_bytes())?;
+    Ok(())
+}
+
+fn write_jsonl(writer: &mut BufWriter<std::fs::File>, value: serde_json::Value) {
+    match serde_json::to_string(&value) {
+        Ok(line) => {
+            if let Err(e) = writeln!(writer, "{}", line) {
+                warn!("metadata file write error: {}", e);
+            }
+        }
+        Err(e) => warn!("metadata JSON serialize error: {}", e),
+    }
+}
+
+fn sanitize_for_path(label: &str) -> String {
+    let mut out = String::with_capacity(label.len());
+    for c in label.chars() {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+            out.push(c);
+        } else if c.is_whitespace() {
+            out.push('_');
+        }
+    }
+    let trimmed = out.trim_matches('_');
+    if trimmed.is_empty() {
+        "no-label".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+struct ServiceDumpContext {
+    sid: u32,
+    scid: u8,
+    out_dir_rel: String,
+    wav: WavWriter,
+    meta: BufWriter<std::fs::File>,
+    slide_dir: PathBuf,
+    subch_buf: SubchannelBuffer,
+    aac: Option<AacDecoder>,
+    pad_decoder: PadDecoder,
+    sf_work_buf: Vec<u8>,
+    emitted_ensemble_label: Option<String>,
+    emitted_service_label: Option<String>,
+}
+
 /// Entry point for `dabctl dablin …`
 pub fn run(args: DablinArgs) -> Result<()> {
-    // ── Logging ──────────────────────────────────────────────────────────────
     if !args.silent {
         use std::io::IsTerminal;
         let ansi = std::io::stderr().is_terminal();
@@ -43,7 +140,6 @@ pub fn run(args: DablinArgs) -> Result<()> {
             .init();
     }
 
-    // ── Ctrl+C handler ───────────────────────────────────────────────────────
     let running = Arc::new(AtomicBool::new(true));
     {
         let r = Arc::clone(&running);
@@ -53,7 +149,6 @@ pub fn run(args: DablinArgs) -> Result<()> {
         .expect("Error setting Ctrl+C handler");
     }
 
-    // ── Open input ───────────────────────────────────────────────────────────
     let reader: Box<dyn Read> = if args.input == "-" {
         Box::new(io::stdin())
     } else {
@@ -63,18 +158,18 @@ pub fn run(args: DablinArgs) -> Result<()> {
     };
     let mut reader = BufReader::with_capacity(ETI_FRAME_SIZE * 4, reader);
 
-    // ── Open metadata channel (FD 3) ─────────────────────────────────────────
-    // FD 3 may not be open in test environments, so we use an Option.
+    if let Some(out_dir) = args.all_services_out.as_deref() {
+        return run_all_services(&args, &mut reader, &running, Path::new(out_dir));
+    }
+
     let mut meta: Option<MetadataEmitter> = MetadataEmitter::open().ok();
 
-    // ── Slide output configuration ────────────────────────────────────────────
     let slide_dir = args.slide_dir.as_deref().map(std::path::Path::new);
     if let Some(dir) = slide_dir {
         if let Err(e) = std::fs::create_dir_all(dir) {
             warn!("Cannot create slide-dir {:?}: {}", dir, e);
         }
     }
-    // ── FIC decoder ──────────────────────────────────────────────────────────
     let mut fic = FicDecoder::new();
     let mut selected_scid: Option<u8> = None;
     let mut selected_sid: Option<u32> = None;
@@ -83,47 +178,26 @@ pub fn run(args: DablinArgs) -> Result<()> {
     let mut emitted_service_sid: Option<u32> = None;
     let mut emitted_service_label: Option<String> = None;
 
-    // ── --list-services wait counter ─────────────────────────────────────────
     let mut list_services_frames: u32 = 0;
-
-    // ── AAC decoder ──────────────────────────────────────────────────────────
     let mut aac: Option<AacDecoder> = None;
-
-    // ── Sub-channel buffer ───────────────────────────────────────────────────
     let mut subch_buf: Option<SubchannelBuffer> = None;
-
-    // ── PAD decoder ──────────────────────────────────────────────────────────
     let mut pad_decoder = PadDecoder::new();
-
-    // ── FSYNC state ──────────────────────────────────────────────────────────
     let mut fsync_state = FsyncState::new();
-
-    // ── FIC freeze tracking ───────────────────────────────────────────────────
-    // Once ensemble label + selected service label are known, stop calling
-    // process_fic() on every frame and only re-parse on MNSC changes (live remux).
+    // FIC freeze: re-parse only on MNSC changes once labels are known.
     let mut fic_stable = false;
-    let mut last_mnsc: u16 = 0xFFFF; // sentinel: forces parse on the very first frame
-
-    // ── Superframe work buffer ────────────────────────────────────────────────
-    // Pre-allocated once; resized on first valid superframe; reused every iteration.
+    let mut last_mnsc: u16 = 0xFFFF;
     let mut sf_work_buf: Vec<u8> = Vec::new();
-
-    // ── PCM stdout ───────────────────────────────────────────────────────────
     let stdout = io::stdout();
     let mut out = stdout.lock();
-
-    // ── ETI frame read loop ──────────────────────────────────────────────────
     let mut frame_buf = vec![0u8; ETI_FRAME_SIZE];
     let mut frame_count = 0u64;
 
     loop {
-        // Exit gracefully on Ctrl+C
         if !running.load(Ordering::Relaxed) {
             info!("Interrupted, exiting");
             break;
         }
 
-        // Read one ETI-NI frame (6144 bytes)
         match reader.read_exact(&mut frame_buf) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
@@ -133,7 +207,6 @@ pub fn run(args: DablinArgs) -> Result<()> {
             Err(e) => return Err(e).context("ETI read error"),
         }
 
-        // Parse frame header
         let frame = match parse_frame(&frame_buf) {
             Ok(f) => f,
             Err(e) => {
@@ -144,17 +217,15 @@ pub fn run(args: DablinArgs) -> Result<()> {
             }
         };
 
-        // FSYNC validation
         let fsync = [frame_buf[1], frame_buf[2], frame_buf[3]];
         if !fsync_state.check(fsync) {
             warn!("FSYNC mismatch at frame {}, re-syncing", frame_count);
             fsync_state.reset();
-            fsync_state.check(fsync); // accept as new reference
+            fsync_state.check(fsync);
         }
 
         frame_count += 1;
 
-        // ── FIC processing (with freeze once stable) ──────────────────────────
         if frame.ficf && !frame.fic.is_empty() {
             let mnsc_changed = frame.mnsc != last_mnsc;
             last_mnsc = frame.mnsc;
@@ -165,7 +236,6 @@ pub fn run(args: DablinArgs) -> Result<()> {
                 }
                 fic.process_fic(frame.fic);
 
-                // Check stability: ensemble label known + selected service label known
                 if !fic_stable {
                     let svc_stable = selected_sid
                         .and_then(|sid| fic.services.iter().find(|s| s.sid == sid))
@@ -179,11 +249,10 @@ pub fn run(args: DablinArgs) -> Result<()> {
             }
         }
 
-        // ── --list-services: wait until all labels are known (or 500 frames) ──
         if args.list_services {
             if !fic.services.is_empty() {
-                let all_known = fic.ensemble.label.is_some()
-                    && fic.services.iter().all(|s| s.label.is_some());
+                let all_known =
+                    fic.ensemble.label.is_some() && fic.services.iter().all(|s| s.label.is_some());
                 if all_known || list_services_frames >= 500 {
                     print_services(&fic);
                     return Ok(());
@@ -193,7 +262,6 @@ pub fn run(args: DablinArgs) -> Result<()> {
             continue;
         }
 
-        // ── Service selection (deferred until FIC is populated) ───────────────
         if selected_scid.is_none() && !fic.services.is_empty() {
             let service = select_service(&fic, &args);
             if let Some(svc) = service {
@@ -202,10 +270,14 @@ pub fn run(args: DablinArgs) -> Result<()> {
                     selected_scid = Some(scid);
                     selected_sid = Some(svc.sid);
 
-                    // Find STL for the selected sub-channel
                     if let Some(stc) = frame.stc.iter().find(|e| e.scid == scid) {
                         let buf = SubchannelBuffer::new(scid, stc.stl);
-                        debug!("Sub-channel SCID={} STL={} ({} bytes/CIF)", scid, stc.stl, buf.cif_bytes());
+                        debug!(
+                            "Sub-channel SCID={} STL={} ({} bytes/CIF)",
+                            scid,
+                            stc.stl,
+                            buf.cif_bytes()
+                        );
                         debug!(
                             "PAD MOT app type for SCID {}: {:?}, SID {:#06x}: {:?}",
                             scid,
@@ -215,9 +287,6 @@ pub fn run(args: DablinArgs) -> Result<()> {
                         );
                         subch_buf = Some(buf);
 
-                        // Approximate service bitrate from sub-channel size:
-                        // 1 CIF every 24 ms, 1 CU = 64 bits per CIF.
-                        // kbps = floor(STL * 64 / 24)
                         if let Some(m) = meta.as_mut() {
                             let kbps = (u32::from(stc.stl) * 64) / 24;
                             m.emit_bitrate(kbps);
@@ -226,24 +295,26 @@ pub fn run(args: DablinArgs) -> Result<()> {
                         warn!("Sub-channel SCID={} not found in STC", scid);
                     }
 
-                    // Initialize AAC decoder
                     aac = init_aac_decoder(&args.aac_decoder, &args.aac_gap);
                 }
             }
         }
 
-        // ── Metadata refresh (labels can arrive after initial service selection) ──
         if let Some(sid) = selected_sid {
             let current_ensemble_label = fic.ensemble.label.clone();
 
-            // Emit service only once the label is known
             if let Some(svc) = fic.services.iter().find(|s| s.sid == sid) {
                 let current_service_label = svc.label.clone();
                 if current_service_label.is_some()
-                    && (emitted_service_sid != Some(sid) || emitted_service_label != current_service_label)
+                    && (emitted_service_sid != Some(sid)
+                        || emitted_service_label != current_service_label)
                 {
                     if emitted_service_sid == Some(sid) && emitted_service_label.is_none() {
-                        info!("Service label resolved: SID={:#06x} label={:?}", sid, current_service_label.as_deref());
+                        info!(
+                            "Service label resolved: SID={:#06x} label={:?}",
+                            sid,
+                            current_service_label.as_deref()
+                        );
                     }
                     if let Some(m) = meta.as_mut() {
                         m.emit_service(sid, current_service_label.as_deref());
@@ -251,12 +322,10 @@ pub fn run(args: DablinArgs) -> Result<()> {
                     emitted_service_sid = Some(sid);
                     emitted_service_label = current_service_label;
                 } else if emitted_service_sid.is_none() {
-                    // Track that we've seen this service even without label yet
                     emitted_service_sid = Some(sid);
                 }
             }
 
-            // Emit ensemble only once the label is known
             if current_ensemble_label.is_some()
                 && (emitted_ensemble_eid != Some(fic.ensemble.eid)
                     || emitted_ensemble_label != current_ensemble_label)
@@ -269,7 +338,6 @@ pub fn run(args: DablinArgs) -> Result<()> {
             }
         }
 
-        // ── MSC extraction ───────────────────────────────────────────────────
         let scid = match selected_scid {
             Some(s) => s,
             None => continue,
@@ -290,9 +358,6 @@ pub fn run(args: DablinArgs) -> Result<()> {
 
         buf.push_cif(cif_data);
 
-        // ── DAB+ super frame decoding ─────────────────────────────────────────
-        // Sliding-window sync: on FireCode failure, advance one CIF and retry.
-        // sf_work_buf holds a mutable copy of the peeked superframe for in-place RS.
         while buf.len() >= buf.superframe_size() {
             let sf_size = buf.superframe_size();
 
@@ -320,14 +385,11 @@ pub fn run(args: DablinArgs) -> Result<()> {
                 debug!("RS corrected {} codewords", result.rs_corrected);
             }
 
-            // Initialize AAC decoder with format on first valid superframe
             if let (Some(fmt), Some(aac_dec)) = (result.format.as_ref(), aac.as_mut()) {
                 aac_dec.init_format(fmt);
             }
 
-            // Decode each AU
             for au in result.units {
-                // Try extracting PAD events from untouched AU data first.
                 if let Some(scid) = selected_scid {
                     let mot_app_type = selected_sid
                         .and_then(|sid| fic.mot_app_type_for_sid(sid))
@@ -365,14 +427,8 @@ pub fn run(args: DablinArgs) -> Result<()> {
 
                 match aac_dec.decode(&au) {
                     Some(pcm) => {
-                        // Write raw s16le PCM to stdout
-                        let bytes: &[u8] = unsafe {
-                            std::slice::from_raw_parts(
-                                pcm.as_ptr() as *const u8,
-                                pcm.len() * 2,
-                            )
-                        };
-                        if let Err(e) = out.write_all(bytes) {
+                        let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
+                        if let Err(e) = out.write_all(&bytes) {
                             if e.kind() == io::ErrorKind::BrokenPipe {
                                 info!("stdout closed, exiting");
                                 return Ok(());
@@ -381,8 +437,7 @@ pub fn run(args: DablinArgs) -> Result<()> {
                         }
                     }
                     None => {
-                        // Freeze mode: no output on error
-                        debug!("AAC gap: freeze (no PCM output)");
+                        debug!("AAC gap: freeze");
                     }
                 }
             }
@@ -392,7 +447,360 @@ pub fn run(args: DablinArgs) -> Result<()> {
     Ok(())
 }
 
-/// Select a service based on CLI arguments.
+fn run_all_services(
+    args: &DablinArgs,
+    reader: &mut BufReader<Box<dyn Read>>,
+    running: &Arc<AtomicBool>,
+    out_root: &Path,
+) -> Result<()> {
+    std::fs::create_dir_all(out_root)
+        .with_context(|| format!("cannot create output directory: {}", out_root.display()))?;
+
+    let global_index_file = std::fs::File::create(out_root.join("global-index.jsonl"))
+        .with_context(|| {
+            format!(
+                "cannot create global index file: {}",
+                out_root.join("global-index.jsonl").display()
+            )
+        })?;
+    let mut global_index = BufWriter::new(global_index_file);
+    write_jsonl(
+        &mut global_index,
+        json!({
+            "run": {
+                "input": args.input.as_str(),
+                "aacDecoder": match &args.aac_decoder {
+                    AacDecoderChoice::Faad2 => "faad2",
+                    #[cfg(feature = "fdk-aac")]
+                    AacDecoderChoice::Fdk => "fdk",
+                },
+                "aacGap": match &args.aac_gap {
+                    AacGap::Freeze => "freeze",
+                    AacGap::Silence => "silence",
+                },
+                "slideBase64": args.slide_base64,
+            }
+        }),
+    );
+
+    let mut fic = FicDecoder::new();
+    let mut fsync_state = FsyncState::new();
+    let mut last_mnsc: u16 = 0xFFFF;
+    let mut frame_buf = vec![0u8; ETI_FRAME_SIZE];
+    let mut frame_count = 0u64;
+    let mut contexts: BTreeMap<u32, ServiceDumpContext> = BTreeMap::new();
+    let mut global_emitted_ensemble_label: Option<String> = None;
+
+    write_jsonl(
+        &mut global_index,
+        json!({"ensemble": {"eid": format!("{:#06x}", fic.ensemble.eid)}}),
+    );
+
+    loop {
+        if !running.load(Ordering::Relaxed) {
+            info!("Interrupted, finalizing all service files");
+            break;
+        }
+
+        match reader.read_exact(&mut frame_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                info!("ETI stream ended after {} frames", frame_count);
+                break;
+            }
+            Err(e) => return Err(e).context("ETI read error"),
+        }
+
+        let frame = match parse_frame(&frame_buf) {
+            Ok(f) => f,
+            Err(e) => {
+                warn!("ETI parse error frame {}: {}", frame_count, e);
+                fsync_state.reset();
+                frame_count += 1;
+                continue;
+            }
+        };
+
+        let fsync = [frame_buf[1], frame_buf[2], frame_buf[3]];
+        if !fsync_state.check(fsync) {
+            warn!("FSYNC mismatch at frame {}, re-syncing", frame_count);
+            fsync_state.reset();
+            fsync_state.check(fsync);
+        }
+
+        frame_count += 1;
+
+        if frame.ficf && !frame.fic.is_empty() {
+            let mnsc_changed = frame.mnsc != last_mnsc;
+            last_mnsc = frame.mnsc;
+            if mnsc_changed {
+                debug!("MNSC changed ({:#06x}), re-parsing FIC", frame.mnsc);
+            }
+            fic.process_fic(frame.fic);
+
+            if let Some(current_ensemble_label) = fic.ensemble.label.clone() {
+                if global_emitted_ensemble_label.as_deref() != Some(current_ensemble_label.as_str())
+                {
+                    write_jsonl(
+                        &mut global_index,
+                        json!({"ensemble": {"eid": format!("{:#06x}", fic.ensemble.eid), "label": current_ensemble_label}}),
+                    );
+                    global_emitted_ensemble_label = Some(current_ensemble_label);
+                }
+            }
+        }
+
+        for svc in &fic.services {
+            if svc.components.is_empty() {
+                continue;
+            }
+            let scid = svc.components[0].subch_id;
+            if !fic.is_dabplus(scid) {
+                continue;
+            }
+            if contexts.contains_key(&svc.sid) {
+                continue;
+            }
+
+            let stc = match frame.stc.iter().find(|e| e.scid == scid) {
+                Some(stc) => stc,
+                None => continue,
+            };
+
+            let sid_hex = format!("{:#06x}", svc.sid);
+            let label = svc.label.as_deref().unwrap_or("no-label");
+            let service_dir_name = format!("{}-{}", sid_hex, sanitize_for_path(label));
+            let service_dir = out_root.join(service_dir_name);
+            let out_dir_rel = service_dir
+                .strip_prefix(out_root)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| service_dir.to_string_lossy().to_string());
+            let slides_dir = service_dir.join("slides");
+            std::fs::create_dir_all(&slides_dir).with_context(|| {
+                format!("cannot create slides directory: {}", slides_dir.display())
+            })?;
+
+            let wav = WavWriter::create(&service_dir.join("audio.wav"))?;
+            let meta_file = std::fs::File::create(service_dir.join("metadata.jsonl"))
+                .with_context(|| format!("cannot create metadata file for SID {:#06x}", svc.sid))?;
+            let mut meta = BufWriter::new(meta_file);
+
+            let ensemble_label = fic.ensemble.label.clone();
+            if let Some(l) = ensemble_label.as_deref() {
+                write_jsonl(
+                    &mut meta,
+                    json!({"ensemble": {"eid": format!("{:#06x}", fic.ensemble.eid), "label": l}}),
+                );
+            } else {
+                write_jsonl(
+                    &mut meta,
+                    json!({"ensemble": {"eid": format!("{:#06x}", fic.ensemble.eid)}}),
+                );
+            }
+            if let Some(l) = svc.label.as_deref() {
+                write_jsonl(&mut meta, json!({"service": {"sid": sid_hex, "label": l}}));
+            } else {
+                write_jsonl(&mut meta, json!({"service": {"sid": sid_hex}}));
+            }
+            let kbps = (u32::from(stc.stl) * 64) / 24;
+            write_jsonl(&mut meta, json!({"bitrate": kbps}));
+            if let Some(l) = svc.label.as_deref() {
+                write_jsonl(
+                    &mut global_index,
+                    json!({
+                        "service": {
+                            "sid": sid_hex,
+                            "scid": scid,
+                            "label": l,
+                            "bitrate": kbps,
+                            "outDir": out_dir_rel.clone(),
+                            "wav": "audio.wav",
+                            "metadata": "metadata.jsonl",
+                            "slidesDir": "slides",
+                        }
+                    }),
+                );
+            } else {
+                write_jsonl(
+                    &mut global_index,
+                    json!({
+                        "service": {
+                            "sid": sid_hex,
+                            "scid": scid,
+                            "bitrate": kbps,
+                            "outDir": out_dir_rel.clone(),
+                            "wav": "audio.wav",
+                            "metadata": "metadata.jsonl",
+                            "slidesDir": "slides",
+                        }
+                    }),
+                );
+            }
+
+            let ctx = ServiceDumpContext {
+                sid: svc.sid,
+                scid,
+                out_dir_rel,
+                wav,
+                meta,
+                slide_dir: slides_dir,
+                subch_buf: SubchannelBuffer::new(scid, stc.stl),
+                aac: init_aac_decoder(&args.aac_decoder, &args.aac_gap),
+                pad_decoder: PadDecoder::new(),
+                sf_work_buf: Vec::new(),
+                emitted_ensemble_label: ensemble_label,
+                emitted_service_label: svc.label.clone(),
+            };
+
+            info!(
+                "Exporting SID={:#06x} SCID={} into {}",
+                svc.sid,
+                scid,
+                service_dir.display()
+            );
+            contexts.insert(svc.sid, ctx);
+        }
+
+        // Phase 1 (serial): label sync — must stay serial to write global_index.
+        for ctx in contexts.values_mut() {
+            if let Some(current_ensemble_label) = fic.ensemble.label.clone() {
+                if ctx.emitted_ensemble_label.as_deref() != Some(current_ensemble_label.as_str()) {
+                    write_jsonl(
+                        &mut ctx.meta,
+                        json!({"ensemble": {"eid": format!("{:#06x}", fic.ensemble.eid), "label": current_ensemble_label}}),
+                    );
+                    ctx.emitted_ensemble_label = Some(current_ensemble_label);
+                }
+            }
+
+            if let Some(svc) = fic.services.iter().find(|s| s.sid == ctx.sid) {
+                if let Some(current_service_label) = svc.label.clone() {
+                    if ctx.emitted_service_label.as_deref() != Some(current_service_label.as_str())
+                    {
+                        write_jsonl(
+                            &mut ctx.meta,
+                            json!({"service": {"sid": format!("{:#06x}", ctx.sid), "label": current_service_label}}),
+                        );
+                        ctx.emitted_service_label = Some(current_service_label);
+                        write_jsonl(
+                            &mut global_index,
+                            json!({
+                                "serviceUpdate": {
+                                    "sid": format!("{:#06x}", ctx.sid),
+                                    "label": ctx.emitted_service_label.as_deref(),
+                                    "outDir": ctx.out_dir_rel,
+                                }
+                            }),
+                        );
+                    }
+                }
+            }
+        }
+
+        // Phase 1b: clone CIF slices so the parallel phase needs no frame borrow.
+        let mut cif_per_service: HashMap<u32, Vec<u8>> = HashMap::new();
+        let mut mot_type_per_service: HashMap<u32, Option<u8>> = HashMap::new();
+        for (&sid, ctx) in contexts.iter() {
+            if let Some(cif) = extract_subchannel(&frame, ctx.scid) {
+                cif_per_service.insert(sid, cif.to_vec());
+            }
+            let mot = fic
+                .mot_app_type_for_sid(sid)
+                .or_else(|| fic.mot_app_type(ctx.scid));
+            mot_type_per_service.insert(sid, mot);
+        }
+        let slide_base64 = args.slide_base64;
+
+        // Phase 2 (parallel): superframe → AAC → WAV/JSONL, one thread per service.
+        let ctxs: Vec<&mut ServiceDumpContext> = contexts.values_mut().collect();
+        ctxs.into_par_iter().try_for_each(|ctx| -> Result<()> {
+            let _span = tracing::info_span!("service", sid = format!("{:#06x}", ctx.sid)).entered();
+            let Some(cif_data) = cif_per_service.get(&ctx.sid) else {
+                return Ok(());
+            };
+            let mot_app_type = mot_type_per_service.get(&ctx.sid).copied().flatten();
+
+            ctx.subch_buf.push_cif(cif_data);
+
+            while ctx.subch_buf.len() >= ctx.subch_buf.superframe_size() {
+                let sf_size = ctx.subch_buf.superframe_size();
+                let slice = match ctx.subch_buf.try_peek_superframe_slice() {
+                    Some(d) => d,
+                    None => break,
+                };
+
+                if ctx.sf_work_buf.len() != sf_size {
+                    ctx.sf_work_buf.resize(sf_size, 0);
+                }
+                ctx.sf_work_buf.copy_from_slice(slice);
+
+                let result = process_superframe_inplace(&mut ctx.sf_work_buf);
+                if !result.firecode_ok {
+                    ctx.subch_buf.advance_one_cif();
+                    continue;
+                }
+                ctx.subch_buf.consume_superframe();
+
+                if let Some(fmt) = result.format.as_ref() {
+                    if let Some(aac_dec) = ctx.aac.as_mut() {
+                        aac_dec.init_format(fmt);
+                    }
+                }
+
+                for au in result.units {
+                    let pad_events = ctx.pad_decoder.process_au(&au.data, mot_app_type);
+
+                    if let Some(dl) = pad_events.dynamic_label {
+                        write_jsonl(&mut ctx.meta, json!({"dl": dl}));
+                    }
+
+                    if let Some(slide) = pad_events.slide {
+                        let path = ctx.slide_dir.join(&slide.content_name);
+                        if let Err(e) = std::fs::write(&path, &slide.data) {
+                            warn!("Cannot write slide file {:?}: {}", path, e);
+                        }
+
+                        let data_base64 = if slide_base64 {
+                            base64::engine::general_purpose::STANDARD.encode(&slide.data)
+                        } else {
+                            String::new()
+                        };
+                        write_jsonl(
+                            &mut ctx.meta,
+                            json!({
+                                "slide": {
+                                    "contentName": slide.content_name,
+                                    "contentType": slide.content_type,
+                                    "data": data_base64,
+                                }
+                            }),
+                        );
+                    }
+
+                    if let Some(aac_dec) = ctx.aac.as_mut() {
+                        if let Some(pcm) = aac_dec.decode(&au) {
+                            ctx.wav.write_pcm(&pcm)?;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })?;
+    }
+
+    for ctx in contexts.values_mut() {
+        ctx.wav.finalize()?;
+        ctx.meta.flush()?;
+    }
+    write_jsonl(
+        &mut global_index,
+        json!({"summary": {"services": contexts.len(), "frames": frame_count}}),
+    );
+    global_index.flush()?;
+
+    Ok(())
+}
+
 fn select_service<'a>(fic: &'a FicDecoder, args: &DablinArgs) -> Option<&'a ServiceInfo> {
     if let Some(ref sid_str) = args.sid {
         return fic.find_by_sid(sid_str);
@@ -400,11 +808,9 @@ fn select_service<'a>(fic: &'a FicDecoder, args: &DablinArgs) -> Option<&'a Serv
     if let Some(ref label) = args.label {
         return fic.find_by_label(label);
     }
-    // Default: first service with components
     fic.services.iter().find(|s| !s.components.is_empty())
 }
 
-/// Initialize the AAC decoder backend.
 fn init_aac_decoder(backend: &AacDecoderChoice, gap: &AacGap) -> Option<AacDecoder> {
     match backend {
         AacDecoderChoice::Faad2 => {

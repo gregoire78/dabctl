@@ -5,9 +5,9 @@
 //!   - Each event is one JSON line terminated by `\n`
 //!   - NEVER writes to stdout or stderr
 
+use serde_json::json;
 use std::io::Write;
 use std::os::unix::io::FromRawFd;
-use serde_json::json;
 
 /// Metadata emitter backed by FD 3.
 #[allow(dead_code)]
@@ -44,7 +44,7 @@ impl MetadataEmitter {
     pub fn emit_ensemble(&mut self, eid: u16, label: Option<&str>) {
         let v = match label {
             Some(l) => json!({"ensemble": {"eid": format!("{:#06x}", eid), "label": l}}),
-            None    => json!({"ensemble": {"eid": format!("{:#06x}", eid)}}),
+            None => json!({"ensemble": {"eid": format!("{:#06x}", eid)}}),
         };
         self.emit(v);
     }
@@ -53,7 +53,7 @@ impl MetadataEmitter {
     pub fn emit_service(&mut self, sid: u32, label: Option<&str>) {
         let v = match label {
             Some(l) => json!({"service": {"sid": format!("{:#06x}", sid), "label": l}}),
-            None    => json!({"service": {"sid": format!("{:#06x}", sid)}}),
+            None => json!({"service": {"sid": format!("{:#06x}", sid)}}),
         };
         self.emit(v);
     }
@@ -118,4 +118,3 @@ mod tests {
         assert!(s.contains("\\u0001"));
     }
 }
-

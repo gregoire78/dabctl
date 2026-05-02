@@ -98,14 +98,8 @@ impl FdkDecoder {
         let mut buf_size = data.len() as u32;
         let mut bytes_valid = buf_size;
 
-        let fill_err = unsafe {
-            aacDecoder_Fill(
-                self.handle,
-                &mut buf_ptr,
-                &mut buf_size,
-                &mut bytes_valid,
-            )
-        };
+        let fill_err =
+            unsafe { aacDecoder_Fill(self.handle, &mut buf_ptr, &mut buf_size, &mut bytes_valid) };
         if fill_err != 0 {
             tracing::warn!("fdk-aac: Fill error {:#x}", fill_err);
             return None;
@@ -113,12 +107,7 @@ impl FdkDecoder {
 
         let mut pcm_buf = vec![0i16; MAX_BUF_SAMPLES];
         let dec_err = unsafe {
-            aacDecoder_DecodeFrame(
-                self.handle,
-                pcm_buf.as_mut_ptr(),
-                pcm_buf.len() as c_int,
-                0,
-            )
+            aacDecoder_DecodeFrame(self.handle, pcm_buf.as_mut_ptr(), pcm_buf.len() as c_int, 0)
         };
         if dec_err != 0 {
             tracing::warn!("fdk-aac: DecodeFrame error {:#x}", dec_err);
@@ -129,8 +118,12 @@ impl FdkDecoder {
         if info_ptr.is_null() {
             return None;
         }
-        let (frame_size, num_channels) =
-            unsafe { ((*info_ptr).frame_size as usize, (*info_ptr).num_channels as usize) };
+        let (frame_size, num_channels) = unsafe {
+            (
+                (*info_ptr).frame_size as usize,
+                (*info_ptr).num_channels as usize,
+            )
+        };
 
         let total_samples = frame_size * num_channels;
         if total_samples == 0 || total_samples > pcm_buf.len() {
@@ -147,3 +140,7 @@ impl Drop for FdkDecoder {
         unsafe { aacDecoder_Close(self.handle) };
     }
 }
+
+// Each FdkDecoder holds its own independent fdk-aac context handle.
+// SAFETY: same rationale as Faad2Decoder — one instance per Rayon worker thread.
+unsafe impl Send for FdkDecoder {}

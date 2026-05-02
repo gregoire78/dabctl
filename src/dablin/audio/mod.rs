@@ -9,8 +9,8 @@ pub mod faad2;
 pub mod fdk;
 
 use crate::cli::AacGap;
-use crate::dablin::dabplus::{AudioUnit, SuperframeFormat};
 use crate::dablin::audio::faad2::build_asc;
+use crate::dablin::dabplus::{AudioUnit, SuperframeFormat};
 
 /// Number of samples per AAC frame per channel (standard AAC-LC / HE-AAC).
 /// Used to compute the silence buffer size when gap policy = `silence`.
@@ -105,7 +105,7 @@ impl AacDecoder {
                 Some(pcm)
             }
             None => {
-                tracing::warn!("AAC decode error on AU");
+                tracing::debug!("AAC decode error on AU (see backend warning above)");
                 match self.gap_policy {
                     AacGap::Freeze => None,
                     AacGap::Silence => {

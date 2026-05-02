@@ -158,15 +158,16 @@ impl Faad2Decoder {
             return None;
         }
         let mut info = NeAACDecFrameInfo::default();
-        let pcm_ptr = unsafe {
-            NeAACDecDecode(
-                self.handle,
-                &mut info,
-                data.as_ptr(),
-                data.len() as c_ulong,
-            )
-        };
+        let pcm_ptr =
+            unsafe { NeAACDecDecode(self.handle, &mut info, data.as_ptr(), data.len() as c_ulong) };
         if info.error != 0 || pcm_ptr.is_null() {
+            if info.error != 0 {
+                tracing::warn!(
+                    "faad2: decode error {} (AU {} bytes)",
+                    info.error,
+                    data.len()
+                );
+            }
             return None;
         }
         let n_samples = info.samples as usize;
@@ -187,3 +188,9 @@ impl Drop for Faad2Decoder {
         }
     }
 }
+
+// Each Faad2Decoder holds its own independent faad2 context handle.
+// The handle is never shared between threads; only the owning thread touches it.
+// SAFETY: libfaad2 context is not thread-safe when shared, but here each
+// ServiceDumpContext owns exactly one instance used from a single Rayon worker.
+unsafe impl Send for Faad2Decoder {}

@@ -36,21 +36,29 @@ impl SuperframeFormat {
     /// Core sample rate index for AAC (used in AudioSpecificConfig)
     pub fn core_sr_index(&self) -> u8 {
         match (self.dac_rate, self.sbr_flag) {
-            (true,  true)  => 6, // 24 kHz
-            (true,  false) => 3, // 48 kHz
-            (false, true)  => 8, // 16 kHz
+            (true, true) => 6,   // 24 kHz
+            (true, false) => 3,  // 48 kHz
+            (false, true) => 8,  // 16 kHz
             (false, false) => 5, // 32 kHz
         }
     }
 
     /// Core channel config (1=mono, 2=stereo)
     pub fn core_ch_config(&self) -> u8 {
-        if self.aac_channel_mode || self.ps_flag { 2 } else { 1 }
+        if self.aac_channel_mode || self.ps_flag {
+            2
+        } else {
+            1
+        }
     }
 
     /// Extension (SBR) sample rate index
     pub fn ext_sr_index(&self) -> u8 {
-        if self.dac_rate { 3 } else { 5 } // 48 or 32 kHz
+        if self.dac_rate {
+            3
+        } else {
+            5
+        } // 48 or 32 kHz
     }
 }
 
@@ -111,10 +119,10 @@ pub fn process_superframe_inplace(sf: &mut [u8]) -> SuperframeResult {
 
     // 3. Extract audio access units
     let format = SuperframeFormat {
-        dac_rate:             (sf[2] & 0x40) != 0,
-        sbr_flag:             (sf[2] & 0x20) != 0,
-        aac_channel_mode:     (sf[2] & 0x10) != 0,
-        ps_flag:              (sf[2] & 0x08) != 0,
+        dac_rate: (sf[2] & 0x40) != 0,
+        sbr_flag: (sf[2] & 0x20) != 0,
+        aac_channel_mode: (sf[2] & 0x10) != 0,
+        ps_flag: (sf[2] & 0x08) != 0,
         mpeg_surround_config: sf[2] & 0x07,
     };
     let units = extract_audio_units_dablin(sf, sf_len);
@@ -147,9 +155,9 @@ fn extract_audio_units_dablin(sf: &[u8], sf_len: usize) -> Vec<AudioUnit> {
     let sbr_flag = (sf[2] & 0x20) != 0;
 
     let (num_aus, au_start_0) = match (dac_rate, sbr_flag) {
-        (true,  true)  => (3usize, 6usize),
-        (true,  false) => (6usize, 11usize),
-        (false, true)  => (2usize, 5usize),
+        (true, true) => (3usize, 6usize),
+        (true, false) => (6usize, 11usize),
+        (false, true) => (2usize, 5usize),
         (false, false) => (4usize, 8usize),
     };
 
@@ -179,7 +187,13 @@ fn extract_audio_units_dablin(sf: &[u8], sf_len: usize) -> Vec<AudioUnit> {
     // simple plausibility: offsets must be increasing
     for i in 0..num_aus {
         if au_start[i] >= au_start[i + 1] {
-            tracing::debug!("AU plausibility failed: au_start[{}]={} >= [{}]={}", i, au_start[i], i+1, au_start[i+1]);
+            tracing::debug!(
+                "AU plausibility failed: au_start[{}]={} >= [{}]={}",
+                i,
+                au_start[i],
+                i + 1,
+                au_start[i + 1]
+            );
             return Vec::new();
         }
     }

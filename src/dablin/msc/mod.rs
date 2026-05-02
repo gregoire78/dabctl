@@ -126,14 +126,19 @@ impl SubchannelBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrayvec::ArrayVec;
     use crate::dablin::eti::{EtiFrame, StcEntry};
+    use arrayvec::ArrayVec;
 
     // Helper: builds a synthetic EtiFrame backed by a static buffer.
     // The `data` slice must outlive the returned frame (caller owns the backing store).
     fn make_frame_with_stream<'a>(scid: u8, data: &'a [u8]) -> EtiFrame<'a> {
         let mut stc = ArrayVec::new();
-        stc.push(StcEntry { scid, sad: 0, tpl: 0x22, stl: 33 });
+        stc.push(StcEntry {
+            scid,
+            sad: 0,
+            tpl: 0x22,
+            stl: 33,
+        });
         let mut streams = ArrayVec::new();
         streams.push(data);
         EtiFrame {

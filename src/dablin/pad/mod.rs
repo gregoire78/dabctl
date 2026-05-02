@@ -124,11 +124,7 @@ impl DlDecoder {
             return None;
         }
 
-        let charset = self
-            .segs
-            .get(&0)
-            .map(|s| s.prefix1 >> 4)
-            .unwrap_or(0);
+        let charset = self.segs.get(&0).map(|s| s.prefix1 >> 4).unwrap_or(0);
 
         Some(convert_text_charset(&complete_chars, charset))
     }
@@ -244,11 +240,7 @@ impl MotDecoder {
 
     /// Parses the MSC Data Group structure (ETSI EN 301 234 / EN 300 401 §5.3.3.1),
     /// extracts the payload, and reassembles segments like dablin's MOTManager.
-    fn handle_mot_data_group(
-        &mut self,
-        dg: &[u8],
-        slide_counter: &mut u64,
-    ) -> Option<PadSlide> {
+    fn handle_mot_data_group(&mut self, dg: &[u8], slide_counter: &mut u64) -> Option<PadSlide> {
         let mut offset = 0usize;
 
         // General Data Group Header (2 bytes + optional 2-byte extension)
@@ -379,8 +371,8 @@ impl MotDecoder {
         // If no image magic found, emit raw bytes
         if !image_data.is_empty() {
             *slide_counter += 1;
-            let name = saved_content_name
-                .unwrap_or_else(|| format!("slide-{:06}.jpg", *slide_counter));
+            let name =
+                saved_content_name.unwrap_or_else(|| format!("slide-{:06}.jpg", *slide_counter));
             return Some(PadSlide {
                 content_name: name,
                 content_type: "image/jpeg".to_string(),
@@ -415,8 +407,8 @@ impl PadDecoder {
 
     pub fn process_au(&mut self, au: &[u8], mot_app_type: Option<u8>) -> PadEvents {
         let mut events = PadEvents::default();
-        let (xpad, fpad, exact_xpad_len) = extract_pad_from_au(au)
-            .unwrap_or_else(|| (Vec::new(), [0x00, 0x00], true));
+        let (xpad, fpad, exact_xpad_len) =
+            extract_pad_from_au(au).unwrap_or_else(|| (Vec::new(), [0x00, 0x00], true));
 
         // Undo reversed byte order (matches dablin PADDecoder::Process)
         let mut xpad_rev = xpad;
@@ -425,7 +417,6 @@ impl PadDecoder {
         let fpad_type = fpad[0] >> 6;
         let xpad_ind = (fpad[0] & 0x30) >> 4;
         let ci_flag = (fpad[1] & 0x02) != 0;
-
 
         let prev_xpad_ci = self.last_xpad_ci;
         self.last_xpad_ci = None;
@@ -518,7 +509,8 @@ impl PadDecoder {
                     // DGLI Data Group = 2 bytes length + 2 bytes CRC
                     if self.dgli_buf.len() >= 4 && crc16_ccitt_ok(&self.dgli_buf[..4]) {
                         // DGLI: (byte0 & 0x3F) << 8 | byte1  (ETSI EN 300 401 §7.4.2.1)
-                        self.dgli_len = ((self.dgli_buf[0] & 0x3F) as usize) << 8 | (self.dgli_buf[1] as usize);
+                        self.dgli_len =
+                            ((self.dgli_buf[0] & 0x3F) as usize) << 8 | (self.dgli_buf[1] as usize);
                         self.dgli_buf.clear();
                     }
 
@@ -552,7 +544,10 @@ impl PadDecoder {
         }
 
         if let Some(t) = continued_ci_type {
-            self.last_xpad_ci = Some(XpadCi { len: offset, r#type: t });
+            self.last_xpad_ci = Some(XpadCi {
+                len: offset,
+                r#type: t,
+            });
         }
         events
     }

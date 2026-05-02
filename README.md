@@ -94,6 +94,7 @@ dabctl dablin -i <eti-file|-> -s <sid> [options]
 | `--aac-gap` | | Behavior on missing/invalid AAC frames: `freeze` or `silence` | `freeze` |
 | `--slide-dir` | | Save MOT slideshow images to this directory | — |
 | `--slide-base64` | | Include slide payload as base64 in FD3 JSONL events | off |
+| `--all-services-out` | | Export all DAB+ services to per-service folders (`audio.wav`, `slides/`, `metadata.jsonl`) | — |
 | `--silent` | | No log output on stderr | off |
 
 ### AAC gap policy
@@ -154,6 +155,17 @@ exec 3>pad_metadata.json
   --slide-dir ./slides \
   --slide-base64 \
 | aplay -f S16_LE -r 48000 -c 2
+
+# Export all DAB+ services from the ETI into one directory tree
+./target/release/dabctl dablin \
+  -i multiplex.eti \
+  --all-services-out ./all-services \
+  --slide-base64
+# Produces:
+# ./all-services/global-index.jsonl
+# ./all-services/0xf2f8-NRJ/audio.wav
+# ./all-services/0xf2f8-NRJ/metadata.jsonl
+# ./all-services/0xf2f8-NRJ/slides/
 
 # Capture helper script (builds, tests, decodes, saves WAV)
 bash live-capture-iq2pcm.sh multiplex.eti 0xF2F8

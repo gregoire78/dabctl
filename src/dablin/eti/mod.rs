@@ -146,14 +146,21 @@ pub fn parse_frame(raw: &[u8]) -> Result<EtiFrame<'_>, EtiError> {
     let stc_bytes = nst as usize * 4;
     let mut stc = ArrayVec::<StcEntry, 64>::new();
     for i in 0..nst as usize {
-        if stc.is_full() { break; }  // safety: DAB spec max = 64 SCIDs
+        if stc.is_full() {
+            break;
+        } // safety: DAB spec max = 64 SCIDs
         let base = stc_start + i * 4;
         let b = &raw[base..base + 4];
         let scid = b[0] >> 2;
         let sad = (((b[0] & 0x03) as u16) << 8) | b[1] as u16;
         let tpl = b[2] >> 2;
         let stl = (((b[2] & 0x03) as u16) << 8) | b[3] as u16;
-        stc.push(StcEntry { scid, sad, tpl, stl });
+        stc.push(StcEntry {
+            scid,
+            sad,
+            tpl,
+            stl,
+        });
     }
 
     // EOH: MNSC (2 bytes) + HCRC (2 bytes)
@@ -164,19 +171,25 @@ pub fn parse_frame(raw: &[u8]) -> Result<EtiFrame<'_>, EtiError> {
     // MST starts after EOH
     let mst_start = eoh_start + 4;
     // FIC data — zero-copy slice into raw
-    let fic_fibs = if ficf { FIBS_PER_FRAME[mid as usize - 1] } else { 0 };
+    let fic_fibs = if ficf {
+        FIBS_PER_FRAME[mid as usize - 1]
+    } else {
+        0
+    };
     let fic_size = fic_fibs * 32;
     let fic: &[u8] = if ficf && mst_start + fic_size <= raw.len() {
         &raw[mst_start..mst_start + fic_size]
     } else {
-        &[]  // &'static [u8] coerces to &'a [u8] via covariance
+        &[] // &'static [u8] coerces to &'a [u8] via covariance
     };
 
     // Sub-channel stream data — zero-copy slices into raw (no per-stream allocation)
     let mut streams = ArrayVec::<&[u8], 64>::new();
     let mut stream_offset = mst_start + fic_size;
     for entry in &stc {
-        if streams.is_full() { break; }
+        if streams.is_full() {
+            break;
+        }
         let stream_size = entry.stl as usize * 8;
         let end = stream_offset + stream_size;
         let stream: &[u8] = if end <= raw.len() {
@@ -240,11 +253,11 @@ mod tests {
         frame[11] = (stl & 0xff) as u8;
         // EOH
         let eoh_start = 8 + nst as usize * 4;
-        frame[eoh_start] = 0xff;     // MNSC hi
+        frame[eoh_start] = 0xff; // MNSC hi
         frame[eoh_start + 1] = 0xff; // MNSC lo
         frame[eoh_start + 2] = 0x00; // HCRC hi (not checked)
         frame[eoh_start + 3] = 0x00; // HCRC lo
-        // Fill FIC with known pattern
+                                     // Fill FIC with known pattern
         let mst_start = eoh_start + 4;
         for i in 0..fic_size {
             frame[mst_start + i] = (i & 0xff) as u8;
@@ -285,7 +298,7 @@ mod tests {
         let frame = make_test_frame(0, [0x07, 0x3a, 0xb6]);
         let parsed = parse_frame(&frame).unwrap();
         assert_eq!(parsed.fic.len(), 96); // 3 FIBs × 32 bytes (Mode I)
-        // FIC is filled with sequential bytes 0..95
+                                          // FIC is filled with sequential bytes 0..95
         for (i, &b) in parsed.fic.iter().enumerate() {
             assert_eq!(b, (i & 0xff) as u8);
         }
@@ -321,8 +334,8 @@ mod tests {
         // STC[0]: SCID=1, SAD=0, TPL=0x22, STL=33
         let raw = [
             0xff_u8, 0x07, 0x3a, 0xb6, // ERR + FSYNC
-            0xa0, 0x8c, 0x8b, 0x3d,     // FC
-            0x04, 0x00, 0x88, 0x21,     // STC[0]
+            0xa0, 0x8c, 0x8b, 0x3d, // FC
+            0x04, 0x00, 0x88, 0x21, // STC[0]
         ];
         // Parse just the FC part manually
         let fct = raw[4];
