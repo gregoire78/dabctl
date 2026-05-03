@@ -23,7 +23,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-use crate::cli::{AacDecoder as AacDecoderChoice, AacGap, DablinArgs};
+use crate::cli::{
+    AacDecoder as AacDecoderChoice, AacGap, AllServicesOutArgs, DablinCommand, ListServicesArgs,
+    OneServiceOutArgs,
+};
 use crate::dablin::audio::AacDecoder;
 use crate::dablin::dabplus::process_superframe_inplace;
 use crate::dablin::eti::{parse_frame, FsyncState, ETI_FRAME_SIZE};
@@ -54,7 +57,15 @@ struct ServiceDumpContext {
 }
 
 /// Entry point for `dabctl dablin …`
-pub fn run(args: DablinArgs) -> Result<()> {
+pub fn run(command: DablinCommand) -> Result<()> {
+    match command {
+        DablinCommand::OneServiceOut(args) => run_one_service(args),
+        DablinCommand::AllServicesOut(args) => run_all_services_cmd(args),
+        DablinCommand::ListServices(args) => run_list_services(args),
+    }
+}
+
+fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
     if !args.silent {
         use std::io::IsTerminal;
         let ansi = std::io::stderr().is_terminal();
@@ -86,10 +97,6 @@ pub fn run(args: DablinArgs) -> Result<()> {
     };
     let mut reader = BufReader::with_capacity(ETI_FRAME_SIZE * 4, reader);
 
-    if let Some(out_dir) = args.all_services_out.as_deref() {
-        return run_all_services(&args, &mut reader, &running, Path::new(out_dir));
-    }
-
     let mut meta: Option<MetadataEmitter> = MetadataEmitter::open().ok();
 
     let slide_dir = args.slide_dir.as_deref().map(std::path::Path::new);
@@ -106,7 +113,6 @@ pub fn run(args: DablinArgs) -> Result<()> {
     let mut emitted_service_sid: Option<u32> = None;
     let mut emitted_service_label: Option<String> = None;
 
-    let mut list_services_frames: u32 = 0;
     let mut aac: Option<AacDecoder> = None;
     let mut subch_buf: Option<SubchannelBuffer> = None;
     let mut pad_decoder = PadDecoder::new();
@@ -177,19 +183,6 @@ pub fn run(args: DablinArgs) -> Result<()> {
                     }
                 }
             }
-        }
-
-        if args.list_services {
-            if !fic.services.is_empty() {
-                let all_known =
-                    fic.ensemble.label.is_some() && fic.services.iter().all(|s| s.label.is_some());
-                if all_known || list_services_frames >= 500 {
-                    print_services(&fic);
-                    return Ok(());
-                }
-                list_services_frames += 1;
-            }
-            continue;
         }
 
         if selected_scid.is_none() && !fic.services.is_empty() {
@@ -395,8 +388,133 @@ pub fn run(args: DablinArgs) -> Result<()> {
     Ok(())
 }
 
+fn run_all_services_cmd(args: AllServicesOutArgs) -> Result<()> {
+    if !args.silent {
+        use std::io::IsTerminal;
+        let ansi = std::io::stderr().is_terminal();
+        tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_ansi(ansi)
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::from_default_env()
+                    .add_directive(tracing::Level::INFO.into()),
+            )
+            .init();
+    }
+
+    let running = Arc::new(AtomicBool::new(true));
+    {
+        let r = Arc::clone(&running);
+        ctrlc::set_handler(move || {
+            r.store(false, Ordering::Relaxed);
+        })
+        .expect("Error setting Ctrl+C handler");
+    }
+
+    let reader: Box<dyn Read> = if args.input == "-" {
+        Box::new(io::stdin())
+    } else {
+        let f = std::fs::File::open(&args.input)
+            .with_context(|| format!("cannot open ETI file: {}", args.input))?;
+        Box::new(f)
+    };
+    let mut reader = BufReader::with_capacity(ETI_FRAME_SIZE * 4, reader);
+
+    run_all_services(&args, &mut reader, &running, Path::new(&args.out_dir))
+}
+
+fn run_list_services(args: ListServicesArgs) -> Result<()> {
+    if !args.silent {
+        use std::io::IsTerminal;
+        let ansi = std::io::stderr().is_terminal();
+        tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_ansi(ansi)
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::from_default_env()
+                    .add_directive(tracing::Level::INFO.into()),
+            )
+            .init();
+    }
+
+    let running = Arc::new(AtomicBool::new(true));
+    {
+        let r = Arc::clone(&running);
+        ctrlc::set_handler(move || {
+            r.store(false, Ordering::Relaxed);
+        })
+        .expect("Error setting Ctrl+C handler");
+    }
+
+    let reader: Box<dyn Read> = if args.input == "-" {
+        Box::new(io::stdin())
+    } else {
+        let f = std::fs::File::open(&args.input)
+            .with_context(|| format!("cannot open ETI file: {}", args.input))?;
+        Box::new(f)
+    };
+    let mut reader = BufReader::with_capacity(ETI_FRAME_SIZE * 4, reader);
+
+    let mut fic = FicDecoder::new();
+    let mut fsync_state = FsyncState::new();
+    let mut frame_buf = vec![0u8; ETI_FRAME_SIZE];
+    let mut frame_count = 0u64;
+    let mut list_services_frames: u32 = 0;
+
+    loop {
+        if !running.load(Ordering::Relaxed) {
+            info!("Interrupted, exiting");
+            break;
+        }
+
+        match reader.read_exact(&mut frame_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                info!("ETI stream ended after {} frames", frame_count);
+                break;
+            }
+            Err(e) => return Err(e).context("ETI read error"),
+        }
+
+        let frame = match parse_frame(&frame_buf) {
+            Ok(f) => f,
+            Err(e) => {
+                warn!("ETI parse error frame {}: {}", frame_count, e);
+                fsync_state.reset();
+                frame_count += 1;
+                continue;
+            }
+        };
+
+        let fsync = [frame_buf[1], frame_buf[2], frame_buf[3]];
+        if !fsync_state.check(fsync) {
+            warn!("FSYNC mismatch at frame {}, re-syncing", frame_count);
+            fsync_state.reset();
+            fsync_state.check(fsync);
+        }
+
+        frame_count += 1;
+
+        if frame.ficf && !frame.fic.is_empty() {
+            fic.process_fic(frame.fic);
+        }
+
+        if !fic.services.is_empty() {
+            let all_known =
+                fic.ensemble.label.is_some() && fic.services.iter().all(|s| s.label.is_some());
+            if all_known || list_services_frames >= 500 {
+                print_services(&fic);
+                return Ok(());
+            }
+            list_services_frames += 1;
+        }
+    }
+
+    Ok(())
+}
+
 fn run_all_services(
-    args: &DablinArgs,
+    args: &AllServicesOutArgs,
     reader: &mut BufReader<Box<dyn Read>>,
     running: &Arc<AtomicBool>,
     out_root: &Path,
@@ -803,7 +921,7 @@ fn service_dir_name(sid: u32, label: Option<&str>) -> String {
     format!("{}-{}", sid_hex, safe_label)
 }
 
-fn select_service<'a>(fic: &'a FicDecoder, args: &DablinArgs) -> Option<&'a ServiceInfo> {
+fn select_service<'a>(fic: &'a FicDecoder, args: &OneServiceOutArgs) -> Option<&'a ServiceInfo> {
     if let Some(ref sid_str) = args.sid {
         return fic.find_by_sid(sid_str);
     }
@@ -833,7 +951,7 @@ fn init_aac_decoder(backend: &AacDecoderChoice, gap: &AacGap) -> Option<AacDecod
     }
 }
 
-/// Print the list of discovered services to stderr (for --list-services).
+/// Print the list of discovered services to stderr (for `dablin list-services`).
 fn print_services(fic: &FicDecoder) {
     eprintln!(
         "Ensemble: EId={:#06x} label={}",

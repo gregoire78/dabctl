@@ -52,7 +52,7 @@ sudo sh -c '
   exec 3>pad_metadata.jsonl
   RUST_LOG=info exec "$@"
 ' _ \
-  ../target/release/dabctl dablin \
+  ../target/release/dabctl dablin one-service-out \
     -i "$ETI_FILE" \
     -s "$SID" \
     --slide-dir ./slides \

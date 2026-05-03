@@ -44,9 +44,9 @@ echo "[dablin] Sortie=./${OUT_DIR}"
 echo "[dablin] Log=${LOG_FILE}"
 echo "[dablin] Ctrl-C pour arreter"
 
-RUST_LOG=info ../target/release/dabctl dablin \
+RUST_LOG=info ../target/release/dabctl dablin all-services-out \
   -i "$ETI_FILE" \
-  --all-services-out "./${OUT_DIR}" \
+  --out "./${OUT_DIR}" \
   --slide-base64 \
   --aac-decoder fdk \
   --aac-gap silence \
