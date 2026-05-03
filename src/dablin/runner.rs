@@ -13,15 +13,15 @@
 
 use anyhow::{Context, Result};
 use base64::Engine;
+use rayon::prelude::*;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
-use rayon::prelude::*;
 
 use crate::cli::{AacDecoder as AacDecoderChoice, AacGap, DablinArgs};
 use crate::dablin::audio::AacDecoder;
@@ -31,84 +31,9 @@ use crate::dablin::fic::{FicDecoder, ServiceInfo};
 use crate::dablin::metadata::MetadataEmitter;
 use crate::dablin::msc::{extract_subchannel, SubchannelBuffer};
 use crate::dablin::pad::PadDecoder;
-
-struct WavWriter {
-    file: std::fs::File,
-    data_len: u32,
-}
-
-impl WavWriter {
-    fn create(path: &Path) -> Result<Self> {
-        let mut file = std::fs::File::create(path)
-            .with_context(|| format!("cannot create WAV file: {}", path.display()))?;
-        write_wav_header(&mut file, 0)?;
-        Ok(Self { file, data_len: 0 })
-    }
-
-    fn write_pcm(&mut self, pcm: &[i16]) -> Result<()> {
-        let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
-        self.file.write_all(&bytes)?;
-        let written = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
-        self.data_len = self.data_len.saturating_add(written);
-        Ok(())
-    }
-
-    fn finalize(&mut self) -> Result<()> {
-        self.file.seek(SeekFrom::Start(0))?;
-        write_wav_header(&mut self.file, self.data_len)?;
-        self.file.flush()?;
-        Ok(())
-    }
-}
-
-fn write_wav_header(file: &mut std::fs::File, data_len: u32) -> Result<()> {
-    let riff_size = 36u32.saturating_add(data_len);
-    let byte_rate = 48_000u32 * 2u32 * 2u32;
-    let block_align = 2u16 * 2u16;
-
-    file.write_all(b"RIFF")?;
-    file.write_all(&riff_size.to_le_bytes())?;
-    file.write_all(b"WAVE")?;
-    file.write_all(b"fmt ")?;
-    file.write_all(&16u32.to_le_bytes())?;
-    file.write_all(&1u16.to_le_bytes())?;
-    file.write_all(&2u16.to_le_bytes())?;
-    file.write_all(&48_000u32.to_le_bytes())?;
-    file.write_all(&byte_rate.to_le_bytes())?;
-    file.write_all(&block_align.to_le_bytes())?;
-    file.write_all(&16u16.to_le_bytes())?;
-    file.write_all(b"data")?;
-    file.write_all(&data_len.to_le_bytes())?;
-    Ok(())
-}
-
-fn write_jsonl(writer: &mut BufWriter<std::fs::File>, value: serde_json::Value) {
-    match serde_json::to_string(&value) {
-        Ok(line) => {
-            if let Err(e) = writeln!(writer, "{}", line) {
-                warn!("metadata file write error: {}", e);
-            }
-        }
-        Err(e) => warn!("metadata JSON serialize error: {}", e),
-    }
-}
-
-fn sanitize_for_path(label: &str) -> String {
-    let mut out = String::with_capacity(label.len());
-    for c in label.chars() {
-        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-            out.push(c);
-        } else if c.is_whitespace() {
-            out.push('_');
-        }
-    }
-    let trimmed = out.trim_matches('_');
-    if trimmed.is_empty() {
-        "no-label".to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
+use crate::dablin::utils::jsonl::write_jsonl;
+use crate::dablin::utils::path::sanitize_for_path;
+use crate::dablin::utils::wav_writer::WavWriter;
 
 struct ServiceDumpContext {
     sid: u32,
@@ -568,8 +493,7 @@ fn run_all_services(
             };
 
             let sid_hex = format!("{:#06x}", svc.sid);
-            let label = svc.label.as_deref().unwrap_or("no-label");
-            let service_dir_name = format!("{}-{}", sid_hex, sanitize_for_path(label));
+            let service_dir_name = service_dir_name(svc.sid, svc.label.as_deref());
             let service_dir = out_root.join(service_dir_name);
             let out_dir_rel = service_dir
                 .strip_prefix(out_root)
@@ -677,6 +601,37 @@ fn run_all_services(
                 if let Some(current_service_label) = svc.label.clone() {
                     if ctx.emitted_service_label.as_deref() != Some(current_service_label.as_str())
                     {
+                        let current_service_dir = out_root.join(&ctx.out_dir_rel);
+                        let new_service_dir = out_root.join(service_dir_name(
+                            ctx.sid,
+                            Some(current_service_label.as_str()),
+                        ));
+
+                        if new_service_dir != current_service_dir {
+                            if let Err(e) = std::fs::rename(&current_service_dir, &new_service_dir)
+                            {
+                                warn!(
+                                    "Cannot rename service directory SID={:#06x} from {:?} to {:?}: {}",
+                                    ctx.sid,
+                                    current_service_dir,
+                                    new_service_dir,
+                                    e
+                                );
+                            } else {
+                                ctx.out_dir_rel = new_service_dir
+                                    .strip_prefix(out_root)
+                                    .map(|p| p.to_string_lossy().to_string())
+                                    .unwrap_or_else(|_| {
+                                        new_service_dir.to_string_lossy().to_string()
+                                    });
+                                ctx.slide_dir = new_service_dir.join("slides");
+                                info!(
+                                    "Service label resolved, renamed SID={:#06x} directory to {}",
+                                    ctx.sid, ctx.out_dir_rel
+                                );
+                            }
+                        }
+
                         write_jsonl(
                             &mut ctx.meta,
                             json!({"service": {"sid": format!("{:#06x}", ctx.sid), "label": current_service_label}}),
@@ -801,6 +756,12 @@ fn run_all_services(
     Ok(())
 }
 
+fn service_dir_name(sid: u32, label: Option<&str>) -> String {
+    let sid_hex = format!("{:#06x}", sid);
+    let safe_label = sanitize_for_path(label.unwrap_or("no-label"));
+    format!("{}-{}", sid_hex, safe_label)
+}
+
 fn select_service<'a>(fic: &'a FicDecoder, args: &DablinArgs) -> Option<&'a ServiceInfo> {
     if let Some(ref sid_str) = args.sid {
         return fic.find_by_sid(sid_str);
@@ -851,5 +812,34 @@ fn print_services(fic: &FicDecoder) {
             subch_ids,
             dabplus_marks,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::service_dir_name;
+
+    #[test]
+    fn service_dir_name_with_label() {
+        let name = service_dir_name(0xf2f8, Some("NRJ"));
+        assert_eq!(name, "0xf2f8-NRJ");
+    }
+
+    #[test]
+    fn service_dir_name_without_label() {
+        let name = service_dir_name(0xf2f8, None);
+        assert_eq!(name, "0xf2f8-no-label");
+    }
+
+    #[test]
+    fn service_dir_name_sanitizes_spaces() {
+        let name = service_dir_name(0xf211, Some("RTL DAB"));
+        assert_eq!(name, "0xf211-RTL_DAB");
+    }
+
+    #[test]
+    fn service_dir_name_sanitizes_special_chars() {
+        let name = service_dir_name(0xf221, Some("RADIO/CLASSIQUE"));
+        assert_eq!(name, "0xf221-RADIOCLASSIQUE");
     }
 }

@@ -109,7 +109,7 @@ dabctl dablin -i <eti-file|-> -s <sid> [options]
 ## Metadata output (FD 3)
 
 JSONL events are emitted one per line on **file descriptor 3**.  
-Open it with a shell redirect: `3>metadata.json`
+Open it with a shell redirect: `3>metadata.jsonl`
 
 ```jsonl
 {"ensemble":{"eid":"0xf043","label":"Ile-de-France"}}
@@ -225,6 +225,9 @@ src/
     pad/mod.rs             F-PAD / X-PAD, DLS, MOT slideshow
     utils/
       ebu_latin.rs         EBU Latin-1 → UTF-8 (ETSI EN 300 401 §8.1.1.1)
+      jsonl.rs             JSONL writer helper for metadata files
+      path.rs              Path-safe label sanitization helper
+      wav_writer.rs        WAV file writer for all-services export
 ```
 
 ---
