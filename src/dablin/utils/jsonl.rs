@@ -1,12 +1,12 @@
 use serde_json::Value;
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use tracing::warn;
 
-pub(crate) fn write_jsonl(writer: &mut BufWriter<std::fs::File>, value: Value) {
+pub(crate) fn write_jsonl<W: Write>(writer: &mut W, value: Value) {
     match serde_json::to_string(&value) {
         Ok(line) => {
             if let Err(e) = writeln!(writer, "{}", line) {
-                warn!("metadata file write error: {}", e);
+                warn!("metadata write error: {}", e);
             }
         }
         Err(e) => warn!("metadata JSON serialize error: {}", e),

@@ -17,6 +17,7 @@ use rayon::prelude::*;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -56,17 +57,9 @@ struct ServiceDumpContext {
     dedup_pad: bool,
 }
 
-/// Entry point for `dabctl dablin …`
-pub fn run(command: DablinCommand) -> Result<()> {
-    match command {
-        DablinCommand::OneServiceOut(args) => run_one_service(args),
-        DablinCommand::AllServicesOut(args) => run_all_services_cmd(args),
-        DablinCommand::ListServices(args) => run_list_services(args),
-    }
-}
-
-fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
-    if !args.silent {
+/// Initialize the tracing logger on stderr unless `silent` is set.
+fn init_logger(silent: bool) {
+    if !silent {
         use std::io::IsTerminal;
         let ansi = std::io::stderr().is_terminal();
         tracing_subscriber::fmt()
@@ -78,24 +71,50 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
             )
             .init();
     }
+}
 
+/// Register a Ctrl+C handler and return the shared running flag.
+fn setup_ctrlc() -> Arc<AtomicBool> {
     let running = Arc::new(AtomicBool::new(true));
-    {
-        let r = Arc::clone(&running);
-        ctrlc::set_handler(move || {
-            r.store(false, Ordering::Relaxed);
-        })
-        .expect("Error setting Ctrl+C handler");
-    }
+    let r = Arc::clone(&running);
+    ctrlc::set_handler(move || {
+        r.store(false, Ordering::Relaxed);
+    })
+    .expect("Error setting Ctrl+C handler");
+    running
+}
 
-    let reader: Box<dyn Read> = if args.input == "-" {
+/// Open an ETI input: `-` for stdin, otherwise a file path.
+fn open_eti_reader(input: &str) -> Result<BufReader<Box<dyn Read>>> {
+    let reader: Box<dyn Read> = if input == "-" {
         Box::new(io::stdin())
     } else {
-        let f = std::fs::File::open(&args.input)
-            .with_context(|| format!("cannot open ETI file: {}", args.input))?;
+        let f = std::fs::File::open(input)
+            .with_context(|| format!("cannot open ETI file: {}", input))?;
         Box::new(f)
     };
-    let mut reader = BufReader::with_capacity(ETI_FRAME_SIZE * 4, reader);
+    Ok(BufReader::with_capacity(ETI_FRAME_SIZE * 4, reader))
+}
+
+/// Hash raw bytes with `DefaultHasher` for slide deduplication.
+fn hash_bytes(data: &[u8]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    data.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Entry point for `dabctl dablin …`
+pub fn run(command: DablinCommand) -> Result<()> {    match command {
+        DablinCommand::OneServiceOut(args) => run_one_service(args),
+        DablinCommand::AllServicesOut(args) => run_all_services_cmd(args),
+        DablinCommand::ListServices(args) => run_list_services(args),
+    }
+}
+
+fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
+    init_logger(args.silent);
+    let running = setup_ctrlc();
+    let mut reader = open_eti_reader(&args.input)?;
 
     let mut meta: Option<MetadataEmitter> = MetadataEmitter::open().ok();
 
@@ -329,11 +348,7 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
                     }
 
                     if let Some(slide) = pad_events.slide {
-                        use std::collections::hash_map::DefaultHasher;
-                        use std::hash::{Hash, Hasher};
-                        let mut hasher = DefaultHasher::new();
-                        slide.data.hash(&mut hasher);
-                        let slide_hash = hasher.finish();
+                        let slide_hash = hash_bytes(&slide.data);
                         let is_dup_slide = args.dedup_pad && last_slide_hash == Some(slide_hash);
 
                         if !is_dup_slide {
@@ -389,71 +404,17 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
 }
 
 fn run_all_services_cmd(args: AllServicesOutArgs) -> Result<()> {
-    if !args.silent {
-        use std::io::IsTerminal;
-        let ansi = std::io::stderr().is_terminal();
-        tracing_subscriber::fmt()
-            .with_writer(std::io::stderr)
-            .with_ansi(ansi)
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::from_default_env()
-                    .add_directive(tracing::Level::INFO.into()),
-            )
-            .init();
-    }
-
-    let running = Arc::new(AtomicBool::new(true));
-    {
-        let r = Arc::clone(&running);
-        ctrlc::set_handler(move || {
-            r.store(false, Ordering::Relaxed);
-        })
-        .expect("Error setting Ctrl+C handler");
-    }
-
-    let reader: Box<dyn Read> = if args.input == "-" {
-        Box::new(io::stdin())
-    } else {
-        let f = std::fs::File::open(&args.input)
-            .with_context(|| format!("cannot open ETI file: {}", args.input))?;
-        Box::new(f)
-    };
-    let mut reader = BufReader::with_capacity(ETI_FRAME_SIZE * 4, reader);
+    init_logger(args.silent);
+    let running = setup_ctrlc();
+    let mut reader = open_eti_reader(&args.input)?;
 
     run_all_services(&args, &mut reader, &running, Path::new(&args.out_dir))
 }
 
 fn run_list_services(args: ListServicesArgs) -> Result<()> {
-    if !args.silent {
-        use std::io::IsTerminal;
-        let ansi = std::io::stderr().is_terminal();
-        tracing_subscriber::fmt()
-            .with_writer(std::io::stderr)
-            .with_ansi(ansi)
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::from_default_env()
-                    .add_directive(tracing::Level::INFO.into()),
-            )
-            .init();
-    }
-
-    let running = Arc::new(AtomicBool::new(true));
-    {
-        let r = Arc::clone(&running);
-        ctrlc::set_handler(move || {
-            r.store(false, Ordering::Relaxed);
-        })
-        .expect("Error setting Ctrl+C handler");
-    }
-
-    let reader: Box<dyn Read> = if args.input == "-" {
-        Box::new(io::stdin())
-    } else {
-        let f = std::fs::File::open(&args.input)
-            .with_context(|| format!("cannot open ETI file: {}", args.input))?;
-        Box::new(f)
-    };
-    let mut reader = BufReader::with_capacity(ETI_FRAME_SIZE * 4, reader);
+    init_logger(args.silent);
+    let running = setup_ctrlc();
+    let mut reader = open_eti_reader(&args.input)?;
 
     let mut fic = FicDecoder::new();
     let mut fsync_state = FsyncState::new();
@@ -522,45 +483,12 @@ fn run_all_services(
     std::fs::create_dir_all(out_root)
         .with_context(|| format!("cannot create output directory: {}", out_root.display()))?;
 
-    let global_index_file = std::fs::File::create(out_root.join("global-index.jsonl"))
-        .with_context(|| {
-            format!(
-                "cannot create global index file: {}",
-                out_root.join("global-index.jsonl").display()
-            )
-        })?;
-    let mut global_index = BufWriter::new(global_index_file);
-    write_jsonl(
-        &mut global_index,
-        json!({
-            "run": {
-                "input": args.input.as_str(),
-                "aacDecoder": match &args.aac_decoder {
-                    AacDecoderChoice::Faad2 => "faad2",
-                    #[cfg(feature = "fdk-aac")]
-                    AacDecoderChoice::Fdk => "fdk",
-                },
-                "aacGap": match &args.aac_gap {
-                    AacGap::Freeze => "freeze",
-                    AacGap::Silence => "silence",
-                },
-                "slideBase64": args.slide_base64,
-            }
-        }),
-    );
-
     let mut fic = FicDecoder::new();
     let mut fsync_state = FsyncState::new();
     let mut last_mnsc: u16 = 0xFFFF;
     let mut frame_buf = vec![0u8; ETI_FRAME_SIZE];
     let mut frame_count = 0u64;
     let mut contexts: BTreeMap<u32, ServiceDumpContext> = BTreeMap::new();
-    let mut global_emitted_ensemble_label: Option<String> = None;
-
-    write_jsonl(
-        &mut global_index,
-        json!({"ensemble": {"eid": format!("{:#06x}", fic.ensemble.eid)}}),
-    );
 
     loop {
         if !running.load(Ordering::Relaxed) {
@@ -603,17 +531,6 @@ fn run_all_services(
                 debug!("MNSC changed ({:#06x}), re-parsing FIC", frame.mnsc);
             }
             fic.process_fic(frame.fic);
-
-            if let Some(current_ensemble_label) = fic.ensemble.label.clone() {
-                if global_emitted_ensemble_label.as_deref() != Some(current_ensemble_label.as_str())
-                {
-                    write_jsonl(
-                        &mut global_index,
-                        json!({"ensemble": {"eid": format!("{:#06x}", fic.ensemble.eid), "label": current_ensemble_label}}),
-                    );
-                    global_emitted_ensemble_label = Some(current_ensemble_label);
-                }
-            }
         }
 
         for svc in &fic.services {
@@ -656,51 +573,12 @@ fn run_all_services(
                     &mut meta,
                     json!({"ensemble": {"eid": format!("{:#06x}", fic.ensemble.eid), "label": l}}),
                 );
-            } else {
-                write_jsonl(
-                    &mut meta,
-                    json!({"ensemble": {"eid": format!("{:#06x}", fic.ensemble.eid)}}),
-                );
             }
             if let Some(l) = svc.label.as_deref() {
                 write_jsonl(&mut meta, json!({"service": {"sid": sid_hex, "label": l}}));
-            } else {
-                write_jsonl(&mut meta, json!({"service": {"sid": sid_hex}}));
             }
             let kbps = (u32::from(stc.stl) * 64) / 24;
             write_jsonl(&mut meta, json!({"bitrate": kbps}));
-            if let Some(l) = svc.label.as_deref() {
-                write_jsonl(
-                    &mut global_index,
-                    json!({
-                        "service": {
-                            "sid": sid_hex,
-                            "scid": scid,
-                            "label": l,
-                            "bitrate": kbps,
-                            "outDir": out_dir_rel.clone(),
-                            "wav": "audio.wav",
-                            "metadata": "metadata.jsonl",
-                            "slidesDir": "slides",
-                        }
-                    }),
-                );
-            } else {
-                write_jsonl(
-                    &mut global_index,
-                    json!({
-                        "service": {
-                            "sid": sid_hex,
-                            "scid": scid,
-                            "bitrate": kbps,
-                            "outDir": out_dir_rel.clone(),
-                            "wav": "audio.wav",
-                            "metadata": "metadata.jsonl",
-                            "slidesDir": "slides",
-                        }
-                    }),
-                );
-            }
 
             let ctx = ServiceDumpContext {
                 sid: svc.sid,
@@ -729,7 +607,7 @@ fn run_all_services(
             contexts.insert(svc.sid, ctx);
         }
 
-        // Phase 1 (serial): label sync — must stay serial to write global_index.
+        // Phase 1 (serial): label sync.
         for ctx in contexts.values_mut() {
             if let Some(current_ensemble_label) = fic.ensemble.label.clone() {
                 if ctx.emitted_ensemble_label.as_deref() != Some(current_ensemble_label.as_str()) {
@@ -781,16 +659,6 @@ fn run_all_services(
                             json!({"service": {"sid": format!("{:#06x}", ctx.sid), "label": current_service_label}}),
                         );
                         ctx.emitted_service_label = Some(current_service_label);
-                        write_jsonl(
-                            &mut global_index,
-                            json!({
-                                "serviceUpdate": {
-                                    "sid": format!("{:#06x}", ctx.sid),
-                                    "label": ctx.emitted_service_label.as_deref(),
-                                    "outDir": ctx.out_dir_rel,
-                                }
-                            }),
-                        );
                     }
                 }
             }
@@ -858,12 +726,7 @@ fn run_all_services(
                     }
 
                     if let Some(slide) = pad_events.slide {
-                        // Hash the slide data to detect changes
-                        use std::collections::hash_map::DefaultHasher;
-                        use std::hash::{Hash, Hasher};
-                        let mut hasher = DefaultHasher::new();
-                        slide.data.hash(&mut hasher);
-                        let slide_hash = hasher.finish();
+                        let slide_hash = hash_bytes(&slide.data);
 
                         let is_dup_slide = ctx.dedup_pad && ctx.last_slide_hash == Some(slide_hash);
                         if !is_dup_slide {
@@ -906,11 +769,6 @@ fn run_all_services(
         ctx.wav.finalize()?;
         ctx.meta.flush()?;
     }
-    write_jsonl(
-        &mut global_index,
-        json!({"summary": {"services": contexts.len(), "frames": frame_count}}),
-    );
-    global_index.flush()?;
 
     Ok(())
 }

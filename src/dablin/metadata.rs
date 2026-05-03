@@ -6,8 +6,9 @@
 //!   - NEVER writes to stdout or stderr
 
 use serde_json::json;
-use std::io::Write;
 use std::os::unix::io::FromRawFd;
+
+use crate::dablin::utils::jsonl::write_jsonl;
 
 /// Metadata emitter backed by FD 3.
 #[allow(dead_code)]
@@ -30,14 +31,7 @@ impl MetadataEmitter {
 
     /// Serialize a JSON value and emit it as one line.
     fn emit(&mut self, value: serde_json::Value) {
-        match serde_json::to_string(&value) {
-            Ok(line) => {
-                if let Err(e) = writeln!(self.writer, "{}", line) {
-                    tracing::warn!("FD3 write error: {}", e);
-                }
-            }
-            Err(e) => tracing::warn!("FD3 serialize error: {}", e),
-        }
+        write_jsonl(&mut self.writer, value);
     }
 
     /// Emit ensemble information.
