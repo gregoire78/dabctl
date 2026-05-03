@@ -95,6 +95,7 @@ dabctl dablin -i <eti-file|-> -s <sid> [options]
 | `--slide-dir` | | Save MOT slideshow images to this directory | — |
 | `--slide-base64` | | Include slide payload as base64 in FD3 JSONL events | off |
 | `--all-services-out` | | Export all DAB+ services to per-service folders (`audio.wav`, `slides/`, `metadata.jsonl`) | — |
+| `--dedup-pad` | | Suppress consecutive identical PAD events (DL and slides) in JSONL output | off |
 | `--silent` | | No log output on stderr | off |
 
 ### AAC gap policy

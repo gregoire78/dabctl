@@ -50,6 +50,7 @@ RUST_LOG=info ../target/release/dabctl dablin \
   --slide-base64 \
   --aac-decoder fdk \
   --aac-gap silence \
+  --dedup-pad \
   2>"$LOG_FILE"
 
 echo

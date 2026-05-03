@@ -48,6 +48,9 @@ struct ServiceDumpContext {
     sf_work_buf: Vec<u8>,
     emitted_ensemble_label: Option<String>,
     emitted_service_label: Option<String>,
+    last_dl: Option<String>,
+    last_slide_hash: Option<u64>,
+    dedup_pad: bool,
 }
 
 /// Entry point for `dabctl dablin …`
@@ -108,6 +111,8 @@ pub fn run(args: DablinArgs) -> Result<()> {
     let mut subch_buf: Option<SubchannelBuffer> = None;
     let mut pad_decoder = PadDecoder::new();
     let mut fsync_state = FsyncState::new();
+    let mut last_dl: Option<String> = None;
+    let mut last_slide_hash: Option<u64> = None;
     // FIC freeze: re-parse only on MNSC changes once labels are known.
     let mut fic_stable = false;
     let mut last_mnsc: u16 = 0xFFFF;
@@ -321,26 +326,44 @@ pub fn run(args: DablinArgs) -> Result<()> {
                         .or_else(|| fic.mot_app_type(scid));
                     let pad_events = pad_decoder.process_au(&au.data, mot_app_type);
                     if let Some(dl) = pad_events.dynamic_label {
-                        if let Some(m) = meta.as_mut() {
-                            m.emit_dynamic_label(&dl);
+                        let is_dup = args.dedup_pad && last_dl.as_deref() == Some(dl.as_str());
+                        if !is_dup {
+                            if let Some(m) = meta.as_mut() {
+                                m.emit_dynamic_label(&dl);
+                            }
+                            last_dl = Some(dl);
                         }
                     }
 
                     if let Some(slide) = pad_events.slide {
-                        if let Some(dir) = slide_dir {
-                            let path = dir.join(&slide.content_name);
-                            if let Err(e) = std::fs::write(&path, &slide.data) {
-                                warn!("Cannot write slide file {:?}: {}", path, e);
-                            }
-                        }
+                        use std::collections::hash_map::DefaultHasher;
+                        use std::hash::{Hash, Hasher};
+                        let mut hasher = DefaultHasher::new();
+                        slide.data.hash(&mut hasher);
+                        let slide_hash = hasher.finish();
+                        let is_dup_slide = args.dedup_pad && last_slide_hash == Some(slide_hash);
 
-                        if let Some(m) = meta.as_mut() {
-                            let data_base64 = if args.slide_base64 {
-                                base64::engine::general_purpose::STANDARD.encode(&slide.data)
-                            } else {
-                                String::new()
-                            };
-                            m.emit_slide(&slide.content_name, &slide.content_type, &data_base64);
+                        if !is_dup_slide {
+                            if let Some(dir) = slide_dir {
+                                let path = dir.join(&slide.content_name);
+                                if let Err(e) = std::fs::write(&path, &slide.data) {
+                                    warn!("Cannot write slide file {:?}: {}", path, e);
+                                }
+                            }
+
+                            if let Some(m) = meta.as_mut() {
+                                let data_base64 = if args.slide_base64 {
+                                    base64::engine::general_purpose::STANDARD.encode(&slide.data)
+                                } else {
+                                    String::new()
+                                };
+                                m.emit_slide(
+                                    &slide.content_name,
+                                    &slide.content_type,
+                                    &data_base64,
+                                );
+                            }
+                            last_slide_hash = Some(slide_hash);
                         }
                     }
                 }
@@ -574,6 +597,9 @@ fn run_all_services(
                 sf_work_buf: Vec::new(),
                 emitted_ensemble_label: ensemble_label,
                 emitted_service_label: svc.label.clone(),
+                last_dl: None,
+                last_slide_hash: None,
+                dedup_pad: args.dedup_pad,
             };
 
             info!(
@@ -706,30 +732,45 @@ fn run_all_services(
                     let pad_events = ctx.pad_decoder.process_au(&au.data, mot_app_type);
 
                     if let Some(dl) = pad_events.dynamic_label {
-                        write_jsonl(&mut ctx.meta, json!({"dl": dl}));
+                        let is_dup = ctx.dedup_pad && ctx.last_dl.as_deref() == Some(dl.as_str());
+                        if !is_dup {
+                            write_jsonl(&mut ctx.meta, json!({"dl": dl}));
+                            ctx.last_dl = Some(dl);
+                        }
                     }
 
                     if let Some(slide) = pad_events.slide {
-                        let path = ctx.slide_dir.join(&slide.content_name);
-                        if let Err(e) = std::fs::write(&path, &slide.data) {
-                            warn!("Cannot write slide file {:?}: {}", path, e);
-                        }
+                        // Hash the slide data to detect changes
+                        use std::collections::hash_map::DefaultHasher;
+                        use std::hash::{Hash, Hasher};
+                        let mut hasher = DefaultHasher::new();
+                        slide.data.hash(&mut hasher);
+                        let slide_hash = hasher.finish();
 
-                        let data_base64 = if slide_base64 {
-                            base64::engine::general_purpose::STANDARD.encode(&slide.data)
-                        } else {
-                            String::new()
-                        };
-                        write_jsonl(
-                            &mut ctx.meta,
-                            json!({
-                                "slide": {
-                                    "contentName": slide.content_name,
-                                    "contentType": slide.content_type,
-                                    "data": data_base64,
-                                }
-                            }),
-                        );
+                        let is_dup_slide = ctx.dedup_pad && ctx.last_slide_hash == Some(slide_hash);
+                        if !is_dup_slide {
+                            let path = ctx.slide_dir.join(&slide.content_name);
+                            if let Err(e) = std::fs::write(&path, &slide.data) {
+                                warn!("Cannot write slide file {:?}: {}", path, e);
+                            }
+
+                            let data_base64 = if slide_base64 {
+                                base64::engine::general_purpose::STANDARD.encode(&slide.data)
+                            } else {
+                                String::new()
+                            };
+                            write_jsonl(
+                                &mut ctx.meta,
+                                json!({
+                                    "slide": {
+                                        "contentName": slide.content_name,
+                                        "contentType": slide.content_type,
+                                        "data": data_base64,
+                                    }
+                                }),
+                            );
+                            ctx.last_slide_hash = Some(slide_hash);
+                        }
                     }
 
                     if let Some(aac_dec) = ctx.aac.as_mut() {

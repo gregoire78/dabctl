@@ -59,6 +59,10 @@ pub struct DablinArgs {
         conflicts_with_all = ["sid", "label", "list_services", "slide_dir"]
     )]
     pub all_services_out: Option<String>,
+
+    /// Deduplicate consecutive identical PAD events (DL and slides)
+    #[arg(long = "dedup-pad")]
+    pub dedup_pad: bool,
 }
 
 /// AAC decoder backend selection
