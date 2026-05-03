@@ -68,5 +68,5 @@ sudo sh -c '
 
 echo
 echo "--- Résultats ---"
-ls -lh output.wav pad_metadata.json "$LOG_FILE"
+ls -lh output.wav pad_metadata.jsonl "$LOG_FILE"
 ls -lh slides/ 2>/dev/null || true

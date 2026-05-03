@@ -103,8 +103,69 @@ fn hash_bytes(data: &[u8]) -> u64 {
     hasher.finish()
 }
 
+/// Outcome of one ETI frame read+parse+fsync step.
+enum EtiStep<'a> {
+    /// Successfully parsed frame.
+    Frame(Box<crate::dablin::eti::EtiFrame<'a>>),
+    /// Parse error or bad frame — caller should `continue`.
+    BadFrame,
+    /// End of stream — caller should `break`.
+    Eof,
+}
+
+/// Read one ETI frame, parse it, and update FSYNC state.
+///
+/// Returns `EtiStep::Frame(frame)` on success.
+fn read_eti_step<'buf>(
+    reader: &mut impl Read,
+    frame_buf: &'buf mut [u8],
+    fsync_state: &mut FsyncState,
+    frame_count: &mut u64,
+) -> Result<EtiStep<'buf>> {
+    match reader.read_exact(frame_buf) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(EtiStep::Eof),
+        Err(e) => return Err(e).context("ETI read error"),
+    }
+    let frame = match parse_frame(frame_buf) {
+        Ok(f) => f,
+        Err(e) => {
+            warn!("ETI parse error frame {}: {}", *frame_count, e);
+            fsync_state.reset();
+            *frame_count += 1;
+            return Ok(EtiStep::BadFrame);
+        }
+    };
+    let fsync = [frame_buf[1], frame_buf[2], frame_buf[3]];
+    if !fsync_state.check(fsync) {
+        warn!("FSYNC mismatch at frame {}, re-syncing", *frame_count);
+        fsync_state.reset();
+        fsync_state.check(fsync);
+    }
+    *frame_count += 1;
+    Ok(EtiStep::Frame(Box::new(frame)))
+}
+
+/// Optionally encode slide data as base64. Returns empty string when `do_base64` is false.
+fn encode_slide_base64(data: &[u8], do_base64: bool) -> String {
+    if do_base64 {
+        base64::engine::general_purpose::STANDARD.encode(data)
+    } else {
+        String::new()
+    }
+}
+
+/// Save a slide file to disk, logging a warning on failure.
+fn save_slide_file(dir: &Path, name: &str, data: &[u8]) {
+    let path = dir.join(name);
+    if let Err(e) = std::fs::write(&path, data) {
+        warn!("Cannot write slide file {:?}: {}", path, e);
+    }
+}
+
 /// Entry point for `dabctl dablin …`
-pub fn run(command: DablinCommand) -> Result<()> {    match command {
+pub fn run(command: DablinCommand) -> Result<()> {
+    match command {
         DablinCommand::OneServiceOut(args) => run_one_service(args),
         DablinCommand::AllServicesOut(args) => run_all_services_cmd(args),
         DablinCommand::ListServices(args) => run_list_services(args),
@@ -153,33 +214,11 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
             break;
         }
 
-        match reader.read_exact(&mut frame_buf) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                info!("ETI stream ended after {} frames", frame_count);
-                break;
-            }
-            Err(e) => return Err(e).context("ETI read error"),
-        }
-
-        let frame = match parse_frame(&frame_buf) {
-            Ok(f) => f,
-            Err(e) => {
-                warn!("ETI parse error frame {}: {}", frame_count, e);
-                fsync_state.reset();
-                frame_count += 1;
-                continue;
-            }
+        let frame = match read_eti_step(&mut reader, &mut frame_buf, &mut fsync_state, &mut frame_count)? {
+            EtiStep::Eof => { info!("ETI stream ended after {} frames", frame_count); break; }
+            EtiStep::BadFrame => continue,
+            EtiStep::Frame(f) => *f,
         };
-
-        let fsync = [frame_buf[1], frame_buf[2], frame_buf[3]];
-        if !fsync_state.check(fsync) {
-            warn!("FSYNC mismatch at frame {}, re-syncing", frame_count);
-            fsync_state.reset();
-            fsync_state.check(fsync);
-        }
-
-        frame_count += 1;
 
         if frame.ficf && !frame.fic.is_empty() {
             let mnsc_changed = frame.mnsc != last_mnsc;
@@ -353,23 +392,11 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
 
                         if !is_dup_slide {
                             if let Some(dir) = slide_dir {
-                                let path = dir.join(&slide.content_name);
-                                if let Err(e) = std::fs::write(&path, &slide.data) {
-                                    warn!("Cannot write slide file {:?}: {}", path, e);
-                                }
+                                save_slide_file(dir, &slide.content_name, &slide.data);
                             }
-
                             if let Some(m) = meta.as_mut() {
-                                let data_base64 = if args.slide_base64 {
-                                    base64::engine::general_purpose::STANDARD.encode(&slide.data)
-                                } else {
-                                    String::new()
-                                };
-                                m.emit_slide(
-                                    &slide.content_name,
-                                    &slide.content_type,
-                                    &data_base64,
-                                );
+                                let data_base64 = encode_slide_base64(&slide.data, args.slide_base64);
+                                m.emit_slide(&slide.content_name, &slide.content_type, &data_base64);
                             }
                             last_slide_hash = Some(slide_hash);
                         }
@@ -428,33 +455,11 @@ fn run_list_services(args: ListServicesArgs) -> Result<()> {
             break;
         }
 
-        match reader.read_exact(&mut frame_buf) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                info!("ETI stream ended after {} frames", frame_count);
-                break;
-            }
-            Err(e) => return Err(e).context("ETI read error"),
-        }
-
-        let frame = match parse_frame(&frame_buf) {
-            Ok(f) => f,
-            Err(e) => {
-                warn!("ETI parse error frame {}: {}", frame_count, e);
-                fsync_state.reset();
-                frame_count += 1;
-                continue;
-            }
+        let frame = match read_eti_step(&mut reader, &mut frame_buf, &mut fsync_state, &mut frame_count)? {
+            EtiStep::Eof => { info!("ETI stream ended after {} frames", frame_count); break; }
+            EtiStep::BadFrame => continue,
+            EtiStep::Frame(f) => *f,
         };
-
-        let fsync = [frame_buf[1], frame_buf[2], frame_buf[3]];
-        if !fsync_state.check(fsync) {
-            warn!("FSYNC mismatch at frame {}, re-syncing", frame_count);
-            fsync_state.reset();
-            fsync_state.check(fsync);
-        }
-
-        frame_count += 1;
 
         if frame.ficf && !frame.fic.is_empty() {
             fic.process_fic(frame.fic);
@@ -496,33 +501,11 @@ fn run_all_services(
             break;
         }
 
-        match reader.read_exact(&mut frame_buf) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                info!("ETI stream ended after {} frames", frame_count);
-                break;
-            }
-            Err(e) => return Err(e).context("ETI read error"),
-        }
-
-        let frame = match parse_frame(&frame_buf) {
-            Ok(f) => f,
-            Err(e) => {
-                warn!("ETI parse error frame {}: {}", frame_count, e);
-                fsync_state.reset();
-                frame_count += 1;
-                continue;
-            }
+        let frame = match read_eti_step(reader, &mut frame_buf, &mut fsync_state, &mut frame_count)? {
+            EtiStep::Eof => { info!("ETI stream ended after {} frames", frame_count); break; }
+            EtiStep::BadFrame => continue,
+            EtiStep::Frame(f) => *f,
         };
-
-        let fsync = [frame_buf[1], frame_buf[2], frame_buf[3]];
-        if !fsync_state.check(fsync) {
-            warn!("FSYNC mismatch at frame {}, re-syncing", frame_count);
-            fsync_state.reset();
-            fsync_state.check(fsync);
-        }
-
-        frame_count += 1;
 
         if frame.ficf && !frame.fic.is_empty() {
             let mnsc_changed = frame.mnsc != last_mnsc;
@@ -730,16 +713,8 @@ fn run_all_services(
 
                         let is_dup_slide = ctx.dedup_pad && ctx.last_slide_hash == Some(slide_hash);
                         if !is_dup_slide {
-                            let path = ctx.slide_dir.join(&slide.content_name);
-                            if let Err(e) = std::fs::write(&path, &slide.data) {
-                                warn!("Cannot write slide file {:?}: {}", path, e);
-                            }
-
-                            let data_base64 = if slide_base64 {
-                                base64::engine::general_purpose::STANDARD.encode(&slide.data)
-                            } else {
-                                String::new()
-                            };
+                            save_slide_file(&ctx.slide_dir, &slide.content_name, &slide.data);
+                            let data_base64 = encode_slide_base64(&slide.data, slide_base64);
                             write_jsonl(
                                 &mut ctx.meta,
                                 json!({
@@ -834,7 +809,7 @@ fn print_services(fic: &FicDecoder) {
 
 #[cfg(test)]
 mod tests {
-    use super::service_dir_name;
+    use super::{encode_slide_base64, hash_bytes, save_slide_file, service_dir_name};
 
     #[test]
     fn service_dir_name_with_label() {
@@ -858,5 +833,42 @@ mod tests {
     fn service_dir_name_sanitizes_special_chars() {
         let name = service_dir_name(0xf221, Some("RADIO/CLASSIQUE"));
         assert_eq!(name, "0xf221-RADIOCLASSIQUE");
+    }
+
+    #[test]
+    fn hash_bytes_same_input_gives_same_hash() {
+        let a = hash_bytes(b"hello");
+        let b = hash_bytes(b"hello");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn hash_bytes_different_input_gives_different_hash() {
+        let a = hash_bytes(b"slide1");
+        let b = hash_bytes(b"slide2");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn encode_slide_base64_disabled_returns_empty() {
+        let result = encode_slide_base64(b"some data", false);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn encode_slide_base64_enabled_returns_base64() {
+        let result = encode_slide_base64(b"hello", true);
+        assert_eq!(result, "aGVsbG8=");
+    }
+
+    #[test]
+    fn save_slide_file_writes_data() {
+        let dir = std::env::temp_dir();
+        let name = format!("dabctl-test-slide-{}.bin", std::process::id());
+        save_slide_file(&dir, &name, b"slide payload");
+        let path = dir.join(&name);
+        let data = std::fs::read(&path).expect("slide file should exist");
+        assert_eq!(data, b"slide payload");
+        let _ = std::fs::remove_file(path);
     }
 }

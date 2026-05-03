@@ -25,24 +25,20 @@ pub fn extract_subchannel<'a>(frame: &EtiFrame<'a>, target_scid: u8) -> Option<&
 ///
 /// The backing `Vec` is pre-allocated to 6×cif_bytes at construction;
 /// no further heap allocations occur during normal streaming.
-#[allow(dead_code)]
 pub struct SubchannelBuffer {
-    scid: u8,
     cif_bytes: usize,
     /// Accumulated raw bytes from ETI frames (bounded to ≤6×cif_bytes)
     buffer: Vec<u8>,
 }
 
-#[allow(dead_code)]
 impl SubchannelBuffer {
     /// Create a new buffer for a sub-channel.
     ///
     /// `stl_cus` is the sub-channel stream length in Capacity Units (STL field).
     /// One CU = 8 bytes in the ETI stream.
-    pub fn new(scid: u8, stl_cus: u16) -> Self {
+    pub fn new(_scid: u8, stl_cus: u16) -> Self {
         let cif_bytes = stl_cus as usize * 8;
         Self {
-            scid,
             cif_bytes,
             buffer: Vec::with_capacity(cif_bytes * 6),
         }
@@ -51,11 +47,6 @@ impl SubchannelBuffer {
     /// Feed one CIF of sub-channel data.
     pub fn push_cif(&mut self, data: &[u8]) {
         self.buffer.extend_from_slice(data);
-    }
-
-    /// Returns the sub-channel ID this buffer serves.
-    pub fn scid(&self) -> u8 {
-        self.scid
     }
 
     /// Returns how many bytes per CIF this sub-channel has.
@@ -79,20 +70,6 @@ impl SubchannelBuffer {
         Some(&self.buffer[..sf_size])
     }
 
-    /// Attempt to drain one super frame from the buffer.
-    ///
-    /// Returns `Some(Vec<u8>)` if at least one super frame worth of bytes
-    /// is available, otherwise `None`.
-    pub fn try_pop_superframe(&mut self) -> Option<Vec<u8>> {
-        let sf_size = self.superframe_size();
-        if self.buffer.len() < sf_size {
-            return None;
-        }
-        let result = self.buffer[..sf_size].to_vec();
-        self.buffer.drain(..sf_size);
-        Some(result)
-    }
-
     /// Consume (discard) one complete super frame from the buffer.
     pub fn consume_superframe(&mut self) {
         let sf_size = self.superframe_size();
@@ -112,12 +89,26 @@ impl SubchannelBuffer {
     pub fn len(&self) -> usize {
         self.buffer.len()
     }
+}
+
+/// Methods used only in unit tests.
+#[cfg(test)]
+impl SubchannelBuffer {
+    /// Drain one complete super frame from the buffer, returning it.
+    pub fn try_pop_superframe(&mut self) -> Option<Vec<u8>> {
+        let sf_size = self.superframe_size();
+        if self.buffer.len() < sf_size {
+            return None;
+        }
+        let result = self.buffer[..sf_size].to_vec();
+        self.buffer.drain(..sf_size);
+        Some(result)
+    }
 
     pub fn is_empty(&self) -> bool {
         self.buffer.is_empty()
     }
 
-    /// Discard all buffered data (re-sync after errors).
     pub fn flush(&mut self) {
         self.buffer.clear();
     }

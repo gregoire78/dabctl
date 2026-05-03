@@ -189,8 +189,6 @@ impl Drop for Faad2Decoder {
     }
 }
 
-// Each Faad2Decoder holds its own independent faad2 context handle.
-// The handle is never shared between threads; only the owning thread touches it.
-// SAFETY: libfaad2 context is not thread-safe when shared, but here each
-// ServiceDumpContext owns exactly one instance used from a single Rayon worker.
+// SAFETY: libfaad2 decoder handles are not thread-safe when shared, but each
+// Faad2Decoder instance is owned by a single thread and never aliased.
 unsafe impl Send for Faad2Decoder {}

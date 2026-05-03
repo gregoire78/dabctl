@@ -30,12 +30,13 @@ fn crc16_ccitt(data: &[u8]) -> u16 {
 }
 
 /// Decoded ensemble information (from FIG 0/0)
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct EnsembleInfo {
     pub eid: u16,
     pub label: Option<String>,
+    #[allow(dead_code)]
     pub lto: i8,
+    #[allow(dead_code)]
     pub ecc: u8,
 }
 
@@ -71,11 +72,12 @@ pub enum ComponentType {
 }
 
 /// A single service component (from FIG 0/2)
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ServiceComponent {
     pub subch_id: u8,
+    #[allow(dead_code)]
     pub is_primary: bool,
+    #[allow(dead_code)]
     pub ctype: ComponentType,
 }
 

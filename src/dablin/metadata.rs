@@ -11,17 +11,15 @@ use std::os::unix::io::FromRawFd;
 use crate::dablin::utils::jsonl::write_jsonl;
 
 /// Metadata emitter backed by FD 3.
-#[allow(dead_code)]
 pub struct MetadataEmitter {
     writer: std::fs::File,
 }
 
-#[allow(dead_code)]
 impl MetadataEmitter {
-    /// Open FD 3 for writing. Panics (propagated as Err) if FD 3 is not open.
+    /// Open FD 3 for writing. Returns `Err` if FD 3 is not available.
     ///
     /// # Safety
-    /// The caller must ensure FD 3 is valid and writable before calling this.
+    /// FD 3 must be opened by the shell before dabctl starts (e.g. `3>meta.json`).
     pub fn open() -> anyhow::Result<Self> {
         // SAFETY: FD 3 is expected to be opened by the shell before dabctl starts.
         // We don't own the fd's lifetime – we just wrap it.

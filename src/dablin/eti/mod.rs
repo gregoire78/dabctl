@@ -34,22 +34,27 @@ pub struct StcEntry {
 }
 
 /// Parsed ETI-NI frame (zero-copy: `fic` and `streams` are slices into the raw ETI buffer)
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct EtiFrame<'a> {
     /// Error byte (0 = no errors)
+    #[allow(dead_code)]
     pub err: u8,
     /// Frame count timer (0-249, increments each CIF)
+    #[allow(dead_code)]
     pub fct: u8,
     /// FIC present flag
     pub ficf: bool,
     /// Number of sub-channel streams
+    #[allow(dead_code)]
     pub nst: u8,
     /// Frame phase (0-6 for Mode I)
+    #[allow(dead_code)]
     pub fp: u8,
     /// DAB Mode ID (1 = Mode I, 2 = Mode II, 3 = Mode III, 4 = Mode IV)
+    #[allow(dead_code)]
     pub mid: u8,
     /// Frame length (MST in 32-bit words)
+    #[allow(dead_code)]
     pub fl: u16,
     /// Sub-channel characterization table (stack-allocated, max 64 entries per spec)
     pub stc: ArrayVec<StcEntry, 64>,
@@ -62,11 +67,11 @@ pub struct EtiFrame<'a> {
 }
 
 /// Error type for ETI parsing
-#[allow(dead_code)]
 #[derive(Debug, thiserror::Error)]
 pub enum EtiError {
     #[error("frame too short: expected {expected}, got {got}")]
     FrameTooShort { expected: usize, got: usize },
+    #[allow(dead_code)]
     #[error("invalid FSYNC bytes: {0:02x} {1:02x} {2:02x}")]
     InvalidFsync(u8, u8, u8),
     #[error("unsupported mode: {0}")]

@@ -96,10 +96,10 @@ impl AacDecoder {
 
         match result {
             Some(pcm) => {
-                // Update channel/frame info from first successful decode
+                // Update channel count from the first successful decode.
                 let n_channels = self.channels;
                 if !pcm.is_empty() {
-                    self.channels = n_channels; // keep
+                    self.channels = n_channels;
                     self.samples_per_frame = pcm.len() / n_channels.max(1);
                 }
                 Some(pcm)

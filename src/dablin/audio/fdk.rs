@@ -141,6 +141,6 @@ impl Drop for FdkDecoder {
     }
 }
 
-// Each FdkDecoder holds its own independent fdk-aac context handle.
-// SAFETY: same rationale as Faad2Decoder — one instance per Rayon worker thread.
+// SAFETY: fdk-aac decoder handles are not thread-safe when shared, but each
+// FdkDecoder instance is owned by a single thread and never aliased.
 unsafe impl Send for FdkDecoder {}
