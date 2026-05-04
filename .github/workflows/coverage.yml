@@ -32,7 +32,7 @@ jobs:
         run: cargo install cargo-tarpaulin
 
       - name: Run coverage
-        run: cargo tarpaulin --lib --out Xml --output-dir coverage/
+        run: cargo tarpaulin --bins --out Xml --output-dir coverage/
 
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
