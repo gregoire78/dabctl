@@ -152,7 +152,8 @@ impl Faad2Decoder {
     }
 
     /// Decode one AU, returning raw s16le PCM samples.
-    /// Returns `None` on decode error.
+    /// Follows dablin behavior: logs error warnings but returns PCM if samples > 0.
+    /// Only returns None if both bytesconsumed and samples are zero.
     pub fn decode(&mut self, data: &[u8]) -> Option<Vec<i16>> {
         if !self.initialized {
             return None;
@@ -160,20 +161,28 @@ impl Faad2Decoder {
         let mut info = NeAACDecFrameInfo::default();
         let pcm_ptr =
             unsafe { NeAACDecDecode(self.handle, &mut info, data.as_ptr(), data.len() as c_ulong) };
-        if info.error != 0 || pcm_ptr.is_null() {
-            if info.error != 0 {
-                tracing::warn!(
-                    "faad2: decode error {} (AU {} bytes)",
-                    info.error,
-                    data.len()
-                );
-            }
+        
+        // Log error warning but don't abort
+        if info.error != 0 {
+            tracing::warn!(
+                "faad2: decode error {} (AU {} bytes, samples: {}, consumed: {})",
+                info.error,
+                data.len(),
+                info.samples,
+                info.bytesconsumed
+            );
+        }
+        
+        // Abort only if both bytesconsumed and samples are zero (matches dablin behavior)
+        if info.bytesconsumed == 0 && info.samples == 0 {
             return None;
         }
+        
         let n_samples = info.samples as usize;
-        if n_samples == 0 {
+        if n_samples == 0 || pcm_ptr.is_null() {
             return None;
         }
+        
         // PCM is returned as i16 samples
         let pcm_i16: &[i16] =
             unsafe { std::slice::from_raw_parts(pcm_ptr as *const i16, n_samples) };

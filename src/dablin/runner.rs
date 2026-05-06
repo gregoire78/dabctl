@@ -155,6 +155,10 @@ fn encode_slide_base64(data: &[u8], do_base64: bool) -> String {
     }
 }
 
+fn should_emit_slide_metadata(slide_dir: Option<&Path>, slide_base64: bool) -> bool {
+    slide_dir.is_some() || slide_base64
+}
+
 /// Save a slide file to disk, logging a warning on failure.
 fn save_slide_file(dir: &Path, name: &str, data: &[u8]) {
     let path = dir.join(name);
@@ -356,6 +360,18 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
 
             if !result.firecode_ok {
                 debug!("DAB+ FireCode mismatch – advancing one CIF");
+                if let Some(aac_dec) = aac.as_ref() {
+                    if let Some(pcm) = aac_dec.silence_for_missing_cifs(1) {
+                        let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
+                        if let Err(e) = out.write_all(&bytes) {
+                            if e.kind() == io::ErrorKind::BrokenPipe {
+                                info!("stdout closed, exiting");
+                                return Ok(());
+                            }
+                            return Err(e).context("PCM write error");
+                        }
+                    }
+                }
                 buf.advance_one_cif();
                 continue;
             }
@@ -394,9 +410,16 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
                             if let Some(dir) = slide_dir {
                                 save_slide_file(dir, &slide.content_name, &slide.data);
                             }
-                            if let Some(m) = meta.as_mut() {
-                                let data_base64 = encode_slide_base64(&slide.data, args.slide_base64);
-                                m.emit_slide(&slide.content_name, &slide.content_type, &data_base64);
+                            if should_emit_slide_metadata(slide_dir, args.slide_base64) {
+                                if let Some(m) = meta.as_mut() {
+                                    let data_base64 =
+                                        encode_slide_base64(&slide.data, args.slide_base64);
+                                    m.emit_slide(
+                                        &slide.content_name,
+                                        &slide.content_type,
+                                        &data_base64,
+                                    );
+                                }
                             }
                             last_slide_hash = Some(slide_hash);
                         }
@@ -420,7 +443,8 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
                         }
                     }
                     None => {
-                        debug!("AAC gap: freeze");
+                        // This should not happen with silence policy - silence is generated inside decode()
+                        debug!("AAC gap: no PCM (unexpected with silence policy)");
                     }
                 }
             }
@@ -686,6 +710,11 @@ fn run_all_services(
 
                 let result = process_superframe_inplace(&mut ctx.sf_work_buf);
                 if !result.firecode_ok {
+                    if let Some(aac_dec) = ctx.aac.as_ref() {
+                        if let Some(pcm) = aac_dec.silence_for_missing_cifs(1) {
+                            ctx.wav.write_pcm(&pcm)?;
+                        }
+                    }
                     ctx.subch_buf.advance_one_cif();
                     continue;
                 }
@@ -809,7 +838,11 @@ fn print_services(fic: &FicDecoder) {
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_slide_base64, hash_bytes, save_slide_file, service_dir_name};
+    use super::{
+        encode_slide_base64, hash_bytes, save_slide_file, service_dir_name,
+        should_emit_slide_metadata,
+    };
+    use std::path::Path;
 
     #[test]
     fn service_dir_name_with_label() {
@@ -859,6 +892,21 @@ mod tests {
     fn encode_slide_base64_enabled_returns_base64() {
         let result = encode_slide_base64(b"hello", true);
         assert_eq!(result, "aGVsbG8=");
+    }
+
+    #[test]
+    fn should_not_emit_slide_metadata_without_dir_or_base64() {
+        assert!(!should_emit_slide_metadata(None, false));
+    }
+
+    #[test]
+    fn should_emit_slide_metadata_with_dir() {
+        assert!(should_emit_slide_metadata(Some(Path::new("slides")), false));
+    }
+
+    #[test]
+    fn should_emit_slide_metadata_with_base64() {
+        assert!(should_emit_slide_metadata(None, true));
     }
 
     #[test]

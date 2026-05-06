@@ -49,6 +49,13 @@ const TT_MP4_RAW: c_int = 0;
 /// Maximum output buffer size (2048 samples × 8 channels × 2 bytes)
 const MAX_BUF_SAMPLES: usize = 2048 * 8;
 
+/// Check if FDK output is valid.
+/// Per FDK-AAC spec: AAC_DEC_OK (0x0) or decode errors (0x4000-0x4FFF) both produce valid PCM.
+/// Decode errors indicate bitstream issues but output is concealed and valid for use.
+fn is_output_valid(err: c_int) -> bool {
+    err == 0 || (err >= 0x4000 && err <= 0x4FFF)
+}
+
 pub struct FdkDecoder {
     handle: HANDLE_AACDECODER,
     configured: bool,
@@ -88,7 +95,9 @@ impl FdkDecoder {
     }
 
     /// Decode one RAW AAC AU, returning s16le PCM samples.
-    /// Returns `None` on decode error.
+    /// Returns `None` only on critical errors, not on decode errors 0x4000-0x4FFF.
+    /// Per FDK-AAC spec: decode errors indicate bitstream issues but output is concealed and valid.
+    /// This matches gregoire78/dablin behavior using IS_OUTPUT_VALID macro.
     pub fn decode(&mut self, data: &[u8]) -> Option<Vec<i16>> {
         if !self.configured {
             return None;
@@ -109,8 +118,12 @@ impl FdkDecoder {
         let dec_err = unsafe {
             aacDecoder_DecodeFrame(self.handle, pcm_buf.as_mut_ptr(), pcm_buf.len() as c_int, 0)
         };
-        if dec_err != 0 {
-            tracing::warn!("fdk-aac: DecodeFrame error {:#x}", dec_err);
+        
+        // Check if output is valid using IS_OUTPUT_VALID logic (FDK spec)
+        if !is_output_valid(dec_err) {
+            if dec_err != 0 {
+                tracing::warn!("fdk-aac: DecodeFrame critical error {:#x}", dec_err);
+            }
             return None;
         }
 

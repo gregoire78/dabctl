@@ -15,6 +15,55 @@ use crate::dablin::dabplus::{AudioUnit, SuperframeFormat};
 /// Number of samples per AAC frame per channel (standard AAC-LC / HE-AAC).
 /// Used to compute the silence buffer size when gap policy = `silence`.
 pub const AAC_SAMPLES_PER_FRAME: usize = 1024;
+pub const PCM_SAMPLES_PER_CIF_48K: usize = 1152;
+
+fn expected_output_samples_per_au(fmt: &SuperframeFormat) -> usize {
+    match (fmt.dac_rate, fmt.sbr_flag) {
+        (true, true) => 1920,
+        (true, false) => 960,
+        (false, true) => 2880,
+        (false, false) => 1440,
+    }
+}
+
+fn resample_frame_to_len(pcm: &[i16], channels: usize, output_samples_per_channel: usize) -> Vec<i16> {
+    if channels == 0 {
+        return Vec::new();
+    }
+
+    let input_samples_per_channel = pcm.len() / channels;
+    if input_samples_per_channel == 0 {
+        return Vec::new();
+    }
+    if input_samples_per_channel == output_samples_per_channel {
+        return pcm.to_vec();
+    }
+    if input_samples_per_channel == 1 {
+        let mut out = Vec::with_capacity(output_samples_per_channel * channels);
+        for _ in 0..output_samples_per_channel {
+            out.extend_from_slice(&pcm[..channels]);
+        }
+        return out;
+    }
+
+    let mut out = Vec::with_capacity(output_samples_per_channel * channels);
+    for out_index in 0..output_samples_per_channel {
+        let position = (out_index as f32) * ((input_samples_per_channel - 1) as f32)
+            / ((output_samples_per_channel - 1) as f32);
+        let left = position.floor() as usize;
+        let right = position.ceil() as usize;
+        let frac = position - (left as f32);
+
+        for channel in 0..channels {
+            let left_sample = pcm[left * channels + channel] as f32;
+            let right_sample = pcm[right * channels + channel] as f32;
+            let sample = left_sample + (right_sample - left_sample) * frac;
+            out.push(sample.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16);
+        }
+    }
+
+    out
+}
 
 /// Audio decoder: wraps the backend and applies gap policy.
 pub struct AacDecoder {
@@ -22,8 +71,8 @@ pub struct AacDecoder {
     gap_policy: AacGap,
     /// Channel count established on first successful decode (default 2 = stereo)
     channels: usize,
-    /// Sample count per frame (per channel)
-    samples_per_frame: usize,
+    /// Output sample count per AU (per channel) after normalization to 48 kHz.
+    output_samples_per_au: usize,
     /// Whether the backend has been initialized with ASC
     initialized: bool,
 }
@@ -42,7 +91,7 @@ impl AacDecoder {
             inner: AacDecoderInner::Faad2(inner),
             gap_policy,
             channels: 2,
-            samples_per_frame: AAC_SAMPLES_PER_FRAME,
+            output_samples_per_au: AAC_SAMPLES_PER_FRAME,
             initialized: false,
         })
     }
@@ -55,7 +104,7 @@ impl AacDecoder {
             inner: AacDecoderInner::Fdk(inner),
             gap_policy,
             channels: 2,
-            samples_per_frame: AAC_SAMPLES_PER_FRAME,
+            output_samples_per_au: AAC_SAMPLES_PER_FRAME,
             initialized: false,
         })
     }
@@ -75,6 +124,7 @@ impl AacDecoder {
         if ok {
             self.initialized = true;
             self.channels = fmt.core_ch_config() as usize;
+            self.output_samples_per_au = expected_output_samples_per_au(fmt);
         }
         ok
     }
@@ -96,11 +146,14 @@ impl AacDecoder {
 
         match result {
             Some(pcm) => {
-                // Update channel count from the first successful decode.
                 let n_channels = self.channels;
                 if !pcm.is_empty() {
                     self.channels = n_channels;
-                    self.samples_per_frame = pcm.len() / n_channels.max(1);
+                    return Some(resample_frame_to_len(
+                        &pcm,
+                        n_channels.max(1),
+                        self.output_samples_per_au,
+                    ));
                 }
                 Some(pcm)
             }
@@ -109,13 +162,23 @@ impl AacDecoder {
                 match self.gap_policy {
                     AacGap::Freeze => None,
                     AacGap::Silence => {
-                        // Emit PCM silence: samples_per_frame × channels zeros
-                        let n = self.samples_per_frame * self.channels;
+                        // Emit 48 kHz PCM silence with the same AU duration as a valid frame.
+                        let n = self.output_samples_per_au * self.channels;
                         Some(vec![0i16; n])
                     }
                 }
             }
         }
+    }
+
+    /// Emit silence for missing CIFs (24 ms each) to keep 48 kHz PCM time-continuous.
+    /// Used when superframe sync is lost before AU decoding.
+    pub fn silence_for_missing_cifs(&self, cif_count: usize) -> Option<Vec<i16>> {
+        if cif_count == 0 || !self.initialized || self.gap_policy != AacGap::Silence {
+            return None;
+        }
+        let n = PCM_SAMPLES_PER_CIF_48K * cif_count * self.channels;
+        Some(vec![0i16; n])
     }
 }
 
@@ -164,5 +227,37 @@ mod tests {
     fn test_silence_values_are_zero() {
         let silence = vec![0i16; 64];
         assert!(silence.iter().all(|&s| s == 0));
+    }
+
+    #[test]
+    fn test_expected_output_samples_per_au_matches_dabplus_grid() {
+        let fmt = SuperframeFormat {
+            dac_rate: false,
+            sbr_flag: false,
+            aac_channel_mode: true,
+            ps_flag: false,
+            mpeg_surround_config: 0,
+        };
+        assert_eq!(expected_output_samples_per_au(&fmt), 1440);
+
+        let fmt = SuperframeFormat {
+            dac_rate: true,
+            sbr_flag: false,
+            aac_channel_mode: true,
+            ps_flag: false,
+            mpeg_surround_config: 0,
+        };
+        assert_eq!(expected_output_samples_per_au(&fmt), 960);
+    }
+
+    #[test]
+    fn test_resample_frame_to_len_expands_stereo_frame() {
+        let pcm = [0i16, 100, 1000, 1100, 2000, 2100, 3000, 3100];
+        let out = resample_frame_to_len(&pcm, 2, 6);
+        assert_eq!(out.len(), 12);
+        assert_eq!(out[0], 0);
+        assert_eq!(out[1], 100);
+        assert_eq!(out[10], 3000);
+        assert_eq!(out[11], 3100);
     }
 }
