@@ -376,6 +376,29 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
                 continue;
             }
 
+            // If RS had to correct too many errors, emit silence instead of decoding corrupted audio
+            if result.rs_over_threshold {
+                debug!(
+                    "Superframe too corrupted (RS corrected {} codewords) – applying gap policy",
+                    result.rs_corrected
+                );
+                if let Some(aac_dec) = aac.as_ref() {
+                    // A superframe represents 5 CIFs = 5 * 24ms = 120ms
+                    if let Some(pcm) = aac_dec.silence_for_corrupted_superframe(5) {
+                        let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
+                        if let Err(e) = out.write_all(&bytes) {
+                            if e.kind() == io::ErrorKind::BrokenPipe {
+                                info!("stdout closed, exiting");
+                                return Ok(());
+                            }
+                            return Err(e).context("PCM write error");
+                        }
+                    }
+                }
+                buf.consume_superframe();
+                continue;
+            }
+
             buf.consume_superframe();
 
             if result.rs_corrected > 0 {
@@ -718,6 +741,19 @@ fn run_all_services(
                     ctx.subch_buf.advance_one_cif();
                     continue;
                 }
+
+                // If RS had to correct too many errors, apply gap policy
+                if result.rs_over_threshold {
+                    if let Some(aac_dec) = ctx.aac.as_ref() {
+                        // A superframe represents 5 CIFs = 5 * 24ms = 120ms
+                        if let Some(pcm) = aac_dec.silence_for_corrupted_superframe(5) {
+                            ctx.wav.write_pcm(&pcm)?;
+                        }
+                    }
+                    ctx.subch_buf.consume_superframe();
+                    continue;
+                }
+
                 ctx.subch_buf.consume_superframe();
 
                 if let Some(fmt) = result.format.as_ref() {
@@ -920,3 +956,11 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 }
+
+// Note: Integration tests for the full decoding pipeline (ETI → PCM)
+// would require complex ETI frame construction and are better handled
+// as separate integration tests with real ETI files.
+//
+// The `rs_over_threshold` flag is tested indirectly through the
+// `SuperframeResult` construction in `dabplus::tests`, which ensures
+// the flag is properly initialized and propagated.

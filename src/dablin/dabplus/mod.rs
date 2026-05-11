@@ -73,6 +73,8 @@ pub struct SuperframeResult {
     pub firecode_ok: bool,
     /// Audio format (only valid when firecode_ok = true)
     pub format: Option<SuperframeFormat>,
+    /// Whether RS had to correct too many errors (superframe too corrupted)
+    pub rs_over_threshold: bool,
 }
 
 /// Process a DAB+ super frame buffer in-place (5 CIFs of sub-channel data).
@@ -92,6 +94,7 @@ pub fn process_superframe_inplace(sf: &mut [u8]) -> SuperframeResult {
             rs_corrected: 0,
             firecode_ok: false,
             format: None,
+            rs_over_threshold: false,
         };
     }
 
@@ -104,6 +107,16 @@ pub fn process_superframe_inplace(sf: &mut [u8]) -> SuperframeResult {
         }
     };
 
+    // Check if RS had to correct too many errors (threshold: 10+ codewords)
+    // This indicates severe corruption; decoding the AU would likely produce noise
+    let rs_over_threshold = rs_corrected > 10;
+    if rs_over_threshold && rs_corrected > 0 {
+        tracing::debug!(
+            "RS corrected {} codewords (excessive) – superframe too corrupted for clean decode",
+            rs_corrected
+        );
+    }
+
     // 2. FireCode check AFTER RS (matches dablin CheckSync())
     let firecode_ok = check_firecode(sf);
     if !firecode_ok {
@@ -114,6 +127,7 @@ pub fn process_superframe_inplace(sf: &mut [u8]) -> SuperframeResult {
             rs_corrected,
             firecode_ok: false,
             format: None,
+            rs_over_threshold: false,
         };
     }
 
@@ -132,6 +146,7 @@ pub fn process_superframe_inplace(sf: &mut [u8]) -> SuperframeResult {
         rs_corrected,
         firecode_ok: true,
         format: Some(format),
+        rs_over_threshold,
     }
 }
 
@@ -234,5 +249,26 @@ mod tests {
         sf[1] = 0x00;
         let result = process_superframe_inplace(&mut sf);
         assert!(result.firecode_ok);
+    }
+
+    #[test]
+    fn test_superframe_result_has_rs_over_threshold_flag() {
+        // Verify the SuperframeResult structure includes rs_over_threshold
+        let mut sf = vec![0u8; 120]; // Minimal valid size
+        sf[0] = 0x00;
+        sf[1] = 0x00;
+        let result = process_superframe_inplace(&mut sf);
+        // The flag should be initialized (false for zero-corruption frames)
+        assert!(!result.rs_over_threshold);
+        assert_eq!(result.rs_corrected, 0);
+    }
+
+    #[test]
+    fn test_superframe_bad_size_returns_false_over_threshold() {
+        // Invalid size should not set rs_over_threshold
+        let mut sf = vec![0u8; 121]; // Not divisible by 120
+        let result = process_superframe_inplace(&mut sf);
+        assert!(!result.rs_over_threshold);
+        assert!(!result.firecode_ok);
     }
 }
