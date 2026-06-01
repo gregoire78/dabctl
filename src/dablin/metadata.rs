@@ -60,6 +60,17 @@ impl MetadataEmitter {
         self.emit(json!({"bitrate": kbps}));
     }
 
+    /// Emit DAB date/time information derived from FIG 0/9 + FIG 0/10.
+    pub fn emit_time(&mut self, utc: &str, local: &str, lto: &str) {
+        self.emit(json!({
+            "time": {
+                "utc": utc,
+                "local": local,
+                "lto": lto,
+            }
+        }));
+    }
+
     /// Emit MOT slide metadata.
     pub fn emit_slide(&mut self, name: &str, content_type: &str, data_base64: &str) {
         self.emit(json!({
@@ -108,5 +119,21 @@ mod tests {
         let v = serde_json::json!({"dl": "\x01"});
         let s = serde_json::to_string(&v).unwrap();
         assert!(s.contains("\\u0001"));
+    }
+
+    #[test]
+    fn test_emit_time_shape() {
+        let v = serde_json::json!({
+            "time": {
+                "utc": "2023-02-25, Sat - 12:34:45.321",
+                "local": "2023-02-25, Sat - 13:34:45",
+                "lto": "+01:00"
+            }
+        });
+        let s = serde_json::to_string(&v).unwrap();
+        assert!(s.contains("\"time\""));
+        assert!(s.contains("\"utc\""));
+        assert!(s.contains("\"local\""));
+        assert!(s.contains("\"lto\""));
     }
 }

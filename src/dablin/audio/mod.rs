@@ -26,7 +26,11 @@ fn expected_output_samples_per_au(fmt: &SuperframeFormat) -> usize {
     }
 }
 
-fn resample_frame_to_len(pcm: &[i16], channels: usize, output_samples_per_channel: usize) -> Vec<i16> {
+fn resample_frame_to_len(
+    pcm: &[i16],
+    channels: usize,
+    output_samples_per_channel: usize,
+) -> Vec<i16> {
     if channels == 0 {
         return Vec::new();
     }
@@ -38,23 +42,25 @@ fn resample_frame_to_len(pcm: &[i16], channels: usize, output_samples_per_channe
     if input_samples_per_channel == output_samples_per_channel {
         return pcm.to_vec();
     }
-    
+
     // For very short frames (≤ 2 samples), use smooth linear extrapolation
     // instead of raw repetition to avoid harsh clicks/pops
     if input_samples_per_channel <= 2 {
         let mut out = Vec::with_capacity(output_samples_per_channel * channels);
         for out_index in 0..output_samples_per_channel {
-            let position = (out_index as f32) * ((input_samples_per_channel.saturating_sub(1).max(1)) as f32)
+            let position = (out_index as f32)
+                * ((input_samples_per_channel.saturating_sub(1).max(1)) as f32)
                 / ((output_samples_per_channel - 1).max(1) as f32);
             let idx = position.floor() as usize;
             let frac = position - (idx as f32);
-            
+
             for channel in 0..channels {
-                let current = pcm[idx.min(input_samples_per_channel - 1) * channels + channel] as f32;
+                let current =
+                    pcm[idx.min(input_samples_per_channel - 1) * channels + channel] as f32;
                 let next = if idx + 1 < input_samples_per_channel {
                     pcm[(idx + 1) * channels + channel] as f32
                 } else {
-                    current  // Extrapolate as constant if only 1 sample
+                    current // Extrapolate as constant if only 1 sample
                 };
                 let sample = current + (next - current) * frac;
                 out.push(sample.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16);
@@ -212,7 +218,7 @@ impl AacDecoder {
                 let n = PCM_SAMPLES_PER_CIF_48K * cif_count * self.channels;
                 Some(vec![0i16; n])
             }
-            AacGap::Freeze => None,  // Freeze: don't emit anything, let it freeze naturally
+            AacGap::Freeze => None, // Freeze: don't emit anything, let it freeze naturally
         }
     }
 }
@@ -320,7 +326,7 @@ mod tests {
         let pcm = [1000i16, 1100, 2000i16, 2100]; // 2 samples stereo (L, R per sample)
         let out = resample_frame_to_len(&pcm, 2, 4);
         assert_eq!(out.len(), 8); // 4 output samples * 2 channels
-        // First sample pair (sample 0)
+                                  // First sample pair (sample 0)
         assert_eq!(out[0], 1000);
         assert_eq!(out[1], 1100);
         // Last sample pair (sample 3, which corresponds to input sample 1)
@@ -353,7 +359,7 @@ mod tests {
         // Verify the behavior boundary for silence vs freeze
         let silence_policy = AacGap::Silence;
         let freeze_policy = AacGap::Freeze;
-        
+
         // These should be different policies
         assert_eq!(silence_policy, AacGap::Silence);
         assert_eq!(freeze_policy, AacGap::Freeze);
@@ -369,52 +375,67 @@ mod tests {
         assert_eq!(samples_per_superframe, 5760);
         // 5760 samples @ 48 kHz = 120 ms
         let duration_ms = (samples_per_superframe as f32 / 48000.0) * 1000.0;
-        assert!((duration_ms - 120.0).abs() < 0.01, "SF timing should be exactly 120ms");
+        assert!(
+            (duration_ms - 120.0).abs() < 0.01,
+            "SF timing should be exactly 120ms"
+        );
     }
 
     #[test]
     fn test_all_audio_formats_produce_same_superframe_duration() {
         // Verify that all DAB+ audio formats produce 5760 samples per superframe
         // This ensures timing is never disrupted regardless of audio config
-        
+
         // Format 1: dac_rate=true, sbr_flag=true → 3 AUs
-        assert_eq!(expected_output_samples_per_au(&SuperframeFormat {
-            dac_rate: true,
-            sbr_flag: true,
-            aac_channel_mode: false,
-            ps_flag: false,
-            mpeg_surround_config: 0,
-        }), 1920);
+        assert_eq!(
+            expected_output_samples_per_au(&SuperframeFormat {
+                dac_rate: true,
+                sbr_flag: true,
+                aac_channel_mode: false,
+                ps_flag: false,
+                mpeg_surround_config: 0,
+            }),
+            1920
+        );
         assert_eq!(3 * 1920, 5760);
-        
+
         // Format 2: dac_rate=true, sbr_flag=false → 6 AUs
-        assert_eq!(expected_output_samples_per_au(&SuperframeFormat {
-            dac_rate: true,
-            sbr_flag: false,
-            aac_channel_mode: false,
-            ps_flag: false,
-            mpeg_surround_config: 0,
-        }), 960);
+        assert_eq!(
+            expected_output_samples_per_au(&SuperframeFormat {
+                dac_rate: true,
+                sbr_flag: false,
+                aac_channel_mode: false,
+                ps_flag: false,
+                mpeg_surround_config: 0,
+            }),
+            960
+        );
         assert_eq!(6 * 960, 5760);
-        
+
         // Format 3: dac_rate=false, sbr_flag=true → 2 AUs
-        assert_eq!(expected_output_samples_per_au(&SuperframeFormat {
-            dac_rate: false,
-            sbr_flag: true,
-            aac_channel_mode: false,
-            ps_flag: false,
-            mpeg_surround_config: 0,
-        }), 2880);
+        assert_eq!(
+            expected_output_samples_per_au(&SuperframeFormat {
+                dac_rate: false,
+                sbr_flag: true,
+                aac_channel_mode: false,
+                ps_flag: false,
+                mpeg_surround_config: 0,
+            }),
+            2880
+        );
         assert_eq!(2 * 2880, 5760);
-        
+
         // Format 4: dac_rate=false, sbr_flag=false → 4 AUs
-        assert_eq!(expected_output_samples_per_au(&SuperframeFormat {
-            dac_rate: false,
-            sbr_flag: false,
-            aac_channel_mode: false,
-            ps_flag: false,
-            mpeg_surround_config: 0,
-        }), 1440);
+        assert_eq!(
+            expected_output_samples_per_au(&SuperframeFormat {
+                dac_rate: false,
+                sbr_flag: false,
+                aac_channel_mode: false,
+                ps_flag: false,
+                mpeg_surround_config: 0,
+            }),
+            1440
+        );
         assert_eq!(4 * 1440, 5760);
     }
 }

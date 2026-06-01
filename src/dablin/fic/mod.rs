@@ -3,6 +3,10 @@
 
 use encoding_rs::WINDOWS_1252;
 
+use crate::dablin::utils::datetime::{
+    apply_lto, format_dab_datetime, format_dab_datetime_custom, format_dab_datetime_iso8601,
+    format_lto, mjd_to_ymd, DabDateTime,
+};
 use crate::dablin::utils::ebu_latin::ebu_latin_bytes_to_utf8_string;
 
 /// CRC-16 (CCITT, polynomial 0x1021, initial value 0xFFFF) over FIB data.
@@ -34,8 +38,7 @@ fn crc16_ccitt(data: &[u8]) -> u16 {
 pub struct EnsembleInfo {
     pub eid: u16,
     pub label: Option<String>,
-    #[allow(dead_code)]
-    pub lto: i8,
+    pub lto: Option<i8>,
     #[allow(dead_code)]
     pub ecc: u8,
 }
@@ -96,6 +99,7 @@ pub struct FicDecoder {
     pub ensemble: EnsembleInfo,
     pub subchannels: Vec<SubchannelOrg>,
     pub services: Vec<ServiceInfo>,
+    pub utc_datetime: Option<DabDateTime>,
     /// SCIDs that carry DAB+ (determined by FIG 0/13 user application)
     pub dabplus_subch_ids: Vec<u8>,
     /// X-PAD app type used for MOT slideshow, per sub-channel.
@@ -103,6 +107,7 @@ pub struct FicDecoder {
     /// X-PAD app type used for MOT slideshow, per service SID.
     pub mot_app_types_by_sid: Vec<(u32, u8)>,
     seen_fig0_13_log: bool,
+    utc_datetime_long: bool,
 }
 
 impl FicDecoder {
@@ -169,6 +174,8 @@ impl FicDecoder {
             0 => self.parse_fig0_0(payload),
             1 => self.parse_fig0_1(payload),
             2 => self.parse_fig0_2(payload, pd),
+            9 => self.parse_fig0_9(payload),
+            10 => self.parse_fig0_10(payload),
             13 => {
                 if !self.seen_fig0_13_log {
                     self.seen_fig0_13_log = true;
@@ -187,6 +194,63 @@ impl FicDecoder {
         }
         self.ensemble.eid = ((data[0] as u16) << 8) | data[1] as u16;
         // Remaining: change flag (2 bits) + Al (1 bit) + CIF count Hi (5) + CIF count Lo (8)
+    }
+
+    /// FIG 0/9: Time and country identifier (ECC/LTO).
+    fn parse_fig0_9(&mut self, data: &[u8]) {
+        if data.len() < 3 {
+            return;
+        }
+
+        let lto_mag = (data[0] & 0x1f) as i8;
+        let lto_sign = if (data[0] & 0x20) != 0 { -1 } else { 1 };
+        self.ensemble.lto = Some(lto_sign * lto_mag);
+        self.ensemble.ecc = data[1];
+    }
+
+    /// FIG 0/10: UTC date and time.
+    fn parse_fig0_10(&mut self, data: &[u8]) {
+        if data.len() < 4 {
+            return;
+        }
+
+        // Ignore short form once long form has been seen (dablin behavior).
+        let utc_flag = (data[2] & 0x08) != 0;
+        if !utc_flag && self.utc_datetime_long {
+            return;
+        }
+
+        let mjd =
+            (((data[0] as i32) & 0x7f) << 10) | ((data[1] as i32) << 2) | ((data[2] as i32) >> 6);
+        let (year, month, day) = mjd_to_ymd(mjd);
+        let hour = ((data[2] & 0x07) << 2) | (data[3] >> 6);
+        let minute = data[3] & 0x3f;
+
+        let (second, ms) = if utc_flag {
+            if data.len() < 6 {
+                return;
+            }
+            self.utc_datetime_long = true;
+            let sec = data[4] >> 2;
+            let millis = (((data[4] & 0x03) as u16) << 8) | data[5] as u16;
+            (sec, Some(millis))
+        } else {
+            (0, None)
+        };
+
+        let new_dt = DabDateTime {
+            year,
+            month,
+            day,
+            hour,
+            minute,
+            second,
+            ms,
+        };
+
+        if self.utc_datetime.as_ref() != Some(&new_dt) {
+            self.utc_datetime = Some(new_dt);
+        }
     }
 
     /// FIG 0/1: Sub-channel organisation
@@ -508,6 +572,38 @@ impl FicDecoder {
             .find(|(s, _)| *s == sid)
             .map(|(_, t)| *t)
     }
+
+    /// Returns DAB time metadata strings (UTC, local with LTO, LTO text).
+    pub fn current_dab_time_metadata(
+        &self,
+        iso8601: bool,
+        time_only: bool,
+        custom_pattern: Option<&str>,
+    ) -> Option<(String, String, String)> {
+        let utc = self.utc_datetime.as_ref()?;
+        let lto = self.ensemble.lto?;
+        let local_dt = apply_lto(utc, lto);
+        let lto_str = format_lto(lto);
+
+        let (utc_str, local_str) = if let Some(pattern) = custom_pattern {
+            (
+                format_dab_datetime_custom(utc, Some("+00:00"), pattern),
+                format_dab_datetime_custom(&local_dt, Some(lto_str.as_str()), pattern),
+            )
+        } else if iso8601 {
+            (
+                format_dab_datetime_iso8601(utc, true, Some("Z"), time_only),
+                format_dab_datetime_iso8601(&local_dt, false, Some(lto_str.as_str()), time_only),
+            )
+        } else {
+            (
+                format_dab_datetime(utc, true, time_only),
+                format_dab_datetime(&local_dt, false, time_only),
+            )
+        };
+
+        Some((utc_str, local_str, lto_str))
+    }
 }
 
 /// Parse a SID from a string ("0xF2F8", "62200", etc.)
@@ -708,5 +804,102 @@ mod tests {
         let svc = decoder.services.iter().find(|s| s.sid == 0x0001_2345);
         assert!(svc.is_some());
         assert_eq!(svc.and_then(|s| s.label.clone()).as_deref(), Some("RADIO"));
+    }
+
+    #[test]
+    fn test_parse_fig0_9_and_fig0_10_time_metadata() {
+        // FIG 0/9: LTO = +1h (2 * 30min)
+        let fig_lto = [0x04u8, 0x09, 0x02, 0xe0, 0x01];
+        // FIG 0/10 short form: MJD=60000, 12:34 UTC
+        let fig_time = [0x05u8, 0x0a, 0x3a, 0x98, 0x03, 0x22];
+
+        let mut decoder = FicDecoder::new();
+        decoder.process_fic(&make_fib(&fig_lto));
+        decoder.process_fic(&make_fib(&fig_time));
+
+        let (utc, local, lto) = decoder
+            .current_dab_time_metadata(false, false, None)
+            .expect("time metadata");
+        assert_eq!(lto, "+01:00");
+        assert!(utc.ends_with(" - 12:34"));
+        assert!(local.ends_with(" - 13:34"));
+    }
+
+    #[test]
+    fn test_fig0_10_ignores_short_after_long() {
+        let mut decoder = FicDecoder::new();
+
+        // FIG 0/9: LTO = +0h, required so metadata formatting can be produced.
+        let fig_lto = [0x04u8, 0x09, 0x00, 0xe0, 0x01];
+        decoder.process_fic(&make_fib(&fig_lto));
+
+        // Long form first: MJD=60000, 12:34:45.321 UTC
+        let fig_long = [0x07u8, 0x0a, 0x3a, 0x98, 0x0b, 0x22, 0xb5, 0x41];
+        // Short form later (should be ignored once long form has been seen)
+        let fig_short = [0x05u8, 0x0a, 0x3a, 0x98, 0x03, 0x23];
+
+        decoder.process_fic(&make_fib(&fig_long));
+        decoder.process_fic(&make_fib(&fig_short));
+
+        let utc = decoder
+            .current_dab_time_metadata(false, false, None)
+            .map(|(u, _, _)| u)
+            .expect("utc string");
+        assert!(utc.ends_with(" - 12:34:45.321"));
+    }
+
+    #[test]
+    fn test_parse_fig0_9_and_fig0_10_time_metadata_iso8601() {
+        // FIG 0/9: LTO = +1h (2 * 30min)
+        let fig_lto = [0x04u8, 0x09, 0x02, 0xe0, 0x01];
+        // FIG 0/10 long form: MJD=60000, 12:34:45.321 UTC
+        let fig_time = [0x07u8, 0x0a, 0x3a, 0x98, 0x0b, 0x22, 0xb5, 0x41];
+
+        let mut decoder = FicDecoder::new();
+        decoder.process_fic(&make_fib(&fig_lto));
+        decoder.process_fic(&make_fib(&fig_time));
+
+        let (utc, local, lto) = decoder
+            .current_dab_time_metadata(true, false, None)
+            .expect("time metadata");
+        assert_eq!(lto, "+01:00");
+        assert_eq!(utc, "2023-02-25T12:34:45.321Z");
+        assert_eq!(local, "2023-02-25T13:34:45+01:00");
+    }
+
+    #[test]
+    fn test_parse_fig0_9_and_fig0_10_time_metadata_time_only() {
+        // FIG 0/9: LTO = +1h (2 * 30min)
+        let fig_lto = [0x04u8, 0x09, 0x02, 0xe0, 0x01];
+        // FIG 0/10 long form: MJD=60000, 12:34:45.321 UTC
+        let fig_time = [0x07u8, 0x0a, 0x3a, 0x98, 0x0b, 0x22, 0xb5, 0x41];
+
+        let mut decoder = FicDecoder::new();
+        decoder.process_fic(&make_fib(&fig_lto));
+        decoder.process_fic(&make_fib(&fig_time));
+
+        let (utc, local, lto) = decoder
+            .current_dab_time_metadata(false, true, None)
+            .expect("time metadata");
+        assert_eq!(lto, "+01:00");
+        assert_eq!(utc, "12:34:45.321");
+        assert_eq!(local, "13:34:45");
+    }
+
+    #[test]
+    fn test_parse_fig0_9_and_fig0_10_time_metadata_custom_template() {
+        let fig_lto = [0x04u8, 0x09, 0x02, 0xe0, 0x01];
+        let fig_time = [0x07u8, 0x0a, 0x3a, 0x98, 0x0b, 0x22, 0xb5, 0x41];
+
+        let mut decoder = FicDecoder::new();
+        decoder.process_fic(&make_fib(&fig_lto));
+        decoder.process_fic(&make_fib(&fig_time));
+
+        let (utc, local, lto) = decoder
+            .current_dab_time_metadata(false, false, Some("[YYYYescape] YYYY-MM-DDTHH:mm:ssZ[Z]"))
+            .expect("time metadata");
+        assert_eq!(lto, "+01:00");
+        assert_eq!(utc, "YYYYescape 2023-02-25T12:34:45+00:00Z");
+        assert_eq!(local, "YYYYescape 2023-02-25T13:34:45+01:00Z");
     }
 }

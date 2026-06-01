@@ -30,9 +30,8 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          sudo add-apt-repository universe -y
           sudo apt-get update
-          sudo apt-get install -y \
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             pkg-config libusb-1.0-0-dev librtlsdr-dev \
             libfaad-dev libmpg123-dev libfec-dev \
             clang libclang-dev \
@@ -40,7 +39,7 @@ jobs:
 
       - name: Install libfdk-aac-dev
         if: fromJSON(matrix.info).fdk
-        run: sudo apt-get install -y libfdk-aac-dev
+        run: sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libfdk-aac-dev
 
       - name: Set up Rust
         run: rustup update stable

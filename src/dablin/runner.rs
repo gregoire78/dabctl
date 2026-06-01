@@ -25,8 +25,8 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use crate::cli::{
-    AacDecoder as AacDecoderChoice, AacGap, AllServicesOutArgs, DablinCommand, ListServicesArgs,
-    OneServiceOutArgs,
+    AacDecoder as AacDecoderChoice, AacGap, AllServicesOutArgs, DablinCommand, DateTimeFormat,
+    ListServicesArgs, OneServiceOutArgs,
 };
 use crate::dablin::audio::AacDecoder;
 use crate::dablin::dabplus::process_superframe_inplace;
@@ -196,6 +196,19 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
     let mut emitted_ensemble_label: Option<String> = None;
     let mut emitted_service_sid: Option<u32> = None;
     let mut emitted_service_label: Option<String> = None;
+    let mut emitted_time: Option<(String, String, String)> = None;
+    let datetime_mode: Option<(bool, bool, Option<&str>)> =
+        args.datetime_format.as_ref().map(|fmt| {
+            let custom_datetime_format = match fmt {
+                DateTimeFormat::Custom(pattern) => Some(pattern.as_str()),
+                _ => None,
+            };
+            let use_iso8601_time =
+                matches!(fmt, DateTimeFormat::Iso8601 | DateTimeFormat::TimeIso8601);
+            let use_time_only =
+                matches!(fmt, DateTimeFormat::TimeHuman | DateTimeFormat::TimeIso8601);
+            (use_iso8601_time, use_time_only, custom_datetime_format)
+        });
 
     let mut aac: Option<AacDecoder> = None;
     let mut subch_buf: Option<SubchannelBuffer> = None;
@@ -218,8 +231,16 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
             break;
         }
 
-        let frame = match read_eti_step(&mut reader, &mut frame_buf, &mut fsync_state, &mut frame_count)? {
-            EtiStep::Eof => { info!("ETI stream ended after {} frames", frame_count); break; }
+        let frame = match read_eti_step(
+            &mut reader,
+            &mut frame_buf,
+            &mut fsync_state,
+            &mut frame_count,
+        )? {
+            EtiStep::Eof => {
+                info!("ETI stream ended after {} frames", frame_count);
+                break;
+            }
             EtiStep::BadFrame => continue,
             EtiStep::Frame(f) => *f,
         };
@@ -242,6 +263,23 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
                     if fic.ensemble.label.is_some() && svc_stable {
                         fic_stable = true;
                         debug!("FIC stable — entering MNSC-watch-only mode");
+                    }
+                }
+
+                if let Some((use_iso8601_time, use_time_only, custom_datetime_format)) =
+                    datetime_mode
+                {
+                    if let Some(current_time) = fic.current_dab_time_metadata(
+                        use_iso8601_time,
+                        use_time_only,
+                        custom_datetime_format,
+                    ) {
+                        if emitted_time.as_ref() != Some(&current_time) {
+                            if let Some(m) = meta.as_mut() {
+                                m.emit_time(&current_time.0, &current_time.1, &current_time.2);
+                            }
+                            emitted_time = Some(current_time);
+                        }
                     }
                 }
             }
@@ -502,8 +540,16 @@ fn run_list_services(args: ListServicesArgs) -> Result<()> {
             break;
         }
 
-        let frame = match read_eti_step(&mut reader, &mut frame_buf, &mut fsync_state, &mut frame_count)? {
-            EtiStep::Eof => { info!("ETI stream ended after {} frames", frame_count); break; }
+        let frame = match read_eti_step(
+            &mut reader,
+            &mut frame_buf,
+            &mut fsync_state,
+            &mut frame_count,
+        )? {
+            EtiStep::Eof => {
+                info!("ETI stream ended after {} frames", frame_count);
+                break;
+            }
             EtiStep::BadFrame => continue,
             EtiStep::Frame(f) => *f,
         };
@@ -541,6 +587,19 @@ fn run_all_services(
     let mut frame_buf = vec![0u8; ETI_FRAME_SIZE];
     let mut frame_count = 0u64;
     let mut contexts: BTreeMap<u32, ServiceDumpContext> = BTreeMap::new();
+    let mut emitted_time: Option<(String, String, String)> = None;
+    let datetime_mode: Option<(bool, bool, Option<&str>)> =
+        args.datetime_format.as_ref().map(|fmt| {
+            let custom_datetime_format = match fmt {
+                DateTimeFormat::Custom(pattern) => Some(pattern.as_str()),
+                _ => None,
+            };
+            let use_iso8601_time =
+                matches!(fmt, DateTimeFormat::Iso8601 | DateTimeFormat::TimeIso8601);
+            let use_time_only =
+                matches!(fmt, DateTimeFormat::TimeHuman | DateTimeFormat::TimeIso8601);
+            (use_iso8601_time, use_time_only, custom_datetime_format)
+        });
 
     loop {
         if !running.load(Ordering::Relaxed) {
@@ -548,8 +607,12 @@ fn run_all_services(
             break;
         }
 
-        let frame = match read_eti_step(reader, &mut frame_buf, &mut fsync_state, &mut frame_count)? {
-            EtiStep::Eof => { info!("ETI stream ended after {} frames", frame_count); break; }
+        let frame = match read_eti_step(reader, &mut frame_buf, &mut fsync_state, &mut frame_count)?
+        {
+            EtiStep::Eof => {
+                info!("ETI stream ended after {} frames", frame_count);
+                break;
+            }
             EtiStep::BadFrame => continue,
             EtiStep::Frame(f) => *f,
         };
@@ -606,6 +669,18 @@ fn run_all_services(
             }
             if let Some(l) = svc.label.as_deref() {
                 write_jsonl(&mut meta, json!({"service": {"sid": sid_hex, "label": l}}));
+            }
+            if let Some((use_iso8601_time, use_time_only, custom_datetime_format)) = datetime_mode {
+                if let Some((utc, local, lto)) = fic.current_dab_time_metadata(
+                    use_iso8601_time,
+                    use_time_only,
+                    custom_datetime_format,
+                ) {
+                    write_jsonl(
+                        &mut meta,
+                        json!({"time": {"utc": utc, "local": local, "lto": lto}}),
+                    );
+                }
             }
             let kbps = (u32::from(stc.stl) * 64) / 24;
             write_jsonl(&mut meta, json!({"bitrate": kbps}));
@@ -690,6 +765,30 @@ fn run_all_services(
                         );
                         ctx.emitted_service_label = Some(current_service_label);
                     }
+                }
+            }
+        }
+
+        if let Some((use_iso8601_time, use_time_only, custom_datetime_format)) = datetime_mode {
+            if let Some(current_time) = fic.current_dab_time_metadata(
+                use_iso8601_time,
+                use_time_only,
+                custom_datetime_format,
+            ) {
+                if emitted_time.as_ref() != Some(&current_time) {
+                    for ctx in contexts.values_mut() {
+                        write_jsonl(
+                            &mut ctx.meta,
+                            json!({
+                                "time": {
+                                    "utc": &current_time.0,
+                                    "local": &current_time.1,
+                                    "lto": &current_time.2,
+                                }
+                            }),
+                        );
+                    }
+                    emitted_time = Some(current_time);
                 }
             }
         }

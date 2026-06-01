@@ -118,7 +118,7 @@ impl FdkDecoder {
         let dec_err = unsafe {
             aacDecoder_DecodeFrame(self.handle, pcm_buf.as_mut_ptr(), pcm_buf.len() as c_int, 0)
         };
-        
+
         // Check if output is valid using IS_OUTPUT_VALID logic (FDK spec)
         if !is_output_valid(dec_err) {
             if dec_err != 0 {

@@ -102,6 +102,7 @@ dabctl dablin <subcommand> [options]
 | `--slide-dir` | | Save MOT slideshow images to this directory | — |
 | `--slide-base64` | | Include slide payload as base64 in FD3 JSONL events | off |
 | `--dedup-pad` | | Suppress consecutive identical PAD events (DL and slides) in JSONL output | off |
+| `--datetime-format` | | Date/time format for `time` metadata events: preset (`human`, `iso8601`, `time-human`, `time-iso8601`) or custom token template | off (no `time` event) |
 | `--silent` | | No log output on stderr | off |
 
 ### `all-services-out` options
@@ -114,6 +115,7 @@ dabctl dablin <subcommand> [options]
 | `--aac-gap` | | Behavior on missing/invalid AAC frames: `freeze` or `silence` | `freeze` |
 | `--slide-base64` | | Include slide payload as base64 in metadata files | off |
 | `--dedup-pad` | | Suppress consecutive identical PAD events (DL and slides) in metadata files | off |
+| `--datetime-format` | | Date/time format for `time` metadata events: preset (`human`, `iso8601`, `time-human`, `time-iso8601`) or custom token template | off (no `time` event) |
 | `--silent` | | No log output on stderr | off |
 
 ### `list-services` options
@@ -140,10 +142,68 @@ Open it with a shell redirect: `3>metadata.jsonl`
 ```jsonl
 {"ensemble":{"eid":"0xf043","label":"Ile-de-France"}}
 {"service":{"sid":"0xf2f8","label":"NRJ"}}
+{"time":{"utc":"2023-02-25, Sat - 12:34:45.321","local":"2023-02-25, Sat - 13:34:45","lto":"+01:00"}}
 {"bitrate":88}
 {"dl":"NRJ - Ed Sheeran - Shape Of You"}
 {"slide":{"contentName":"cover.jpg","contentType":"image/jpeg","data":"<base64>"}}
 ```
+
+`time` events are emitted only when `--datetime-format` is provided.
+
+- `--datetime-format` omitted: no `time` event is emitted.
+- `--datetime-format` provided without value: defaults to `iso8601`.
+
+When enabled, `time` event format is configurable with `--datetime-format`:
+
+- `human` (default): human-readable display format
+  - `utc`: `YYYY-MM-DD, Ddd - HH:MM[:SS[.mmm]]`
+  - `local`: `YYYY-MM-DD, Ddd - HH:MM[:SS]`
+  - `lto`: `+/-HH:MM`
+- `iso8601`: machine-friendly format
+  - `utc`: `YYYY-MM-DDTHH:MM[:SS[.mmm]]Z`
+  - `local`: `YYYY-MM-DDTHH:MM[:SS][+/-HH:MM]`
+  - `lto`: `+/-HH:MM`
+- `time-human`: human-readable time-only format
+  - `utc`: `HH:MM[:SS[.mmm]]`
+  - `local`: `HH:MM[:SS]`
+- `time-iso8601`: ISO 8601 time-only format
+  - `utc`: `HH:MM[:SS[.mmm]]Z`
+  - `local`: `HH:MM[:SS][+/-HH:MM]`
+
+You can also pass a custom template directly to `--datetime-format`.
+
+List of available tokens:
+
+| Token | Output example | Description |
+|---|---|---|
+| `YY` | `18` | Two-digit year |
+| `YYYY` | `2018` | Four-digit year |
+| `M` | `1-12` | Month, starting at 1 |
+| `MM` | `01-12` | Month, 2 digits |
+| `MMM` | `Jan-Dec` | Abbreviated month name |
+| `MMMM` | `January-December` | Full month name |
+| `D` | `1-31` | Day of month |
+| `DD` | `01-31` | Day of month, 2 digits |
+| `d` | `0-6` | Day of week, Sunday = 0 |
+| `dd` | `Su-Sa` | Min day name |
+| `ddd` | `Sun-Sat` | Short day name |
+| `dddd` | `Sunday-Saturday` | Full day name |
+| `H` | `0-23` | Hour (24h) |
+| `HH` | `00-23` | Hour (24h), 2 digits |
+| `h` | `1-12` | Hour (12h) |
+| `hh` | `01-12` | Hour (12h), 2 digits |
+| `m` | `0-59` | Minute |
+| `mm` | `00-59` | Minute, 2 digits |
+| `s` | `0-59` | Second |
+| `ss` | `00-59` | Second, 2 digits |
+| `SSS` | `000-999` | Millisecond, 3 digits |
+| `Z` | `+05:00` | UTC offset, ±HH:mm |
+| `ZZ` | `+0500` | UTC offset, ±HHmm |
+
+Escaping literals:
+
+- Wrap literal text in square brackets, for example:
+  - `[YYYYescape] YYYY-MM-DDTHH:mm:ssZ[Z]`
 
 > Events are only emitted once labels are fully resolved from FIG 1. No partial/label-less events are written.
 
@@ -178,6 +238,7 @@ exec 3>pad_metadata.json
   -i multiplex.eti -s 0xF2F8 \
   --aac-decoder fdk \
   --aac-gap silence \
+  --datetime-format time-iso8601 \
   --slide-dir ./slides \
   --slide-base64 \
 | aplay -f S16_LE -r 48000 -c 2
@@ -238,7 +299,7 @@ src/
     runner.rs              Main decoding loop
     metadata.rs            JSONL emitter (FD 3)
     eti/mod.rs             ETI-NI frame parser + FSYNC
-    fic/mod.rs             FIC/FIG decoder (FIG 0/0, 0/1, 0/2, 0/13, 1/0, 1/1, 1/5)
+    fic/mod.rs             FIC/FIG decoder (FIG 0/0, 0/1, 0/2, 0/9, 0/10, 0/13, 1/0, 1/1, 1/5)
     msc/mod.rs             MSC sub-channel extraction
     dabplus/
       mod.rs               DAB+ superframe assembly
