@@ -15,6 +15,17 @@ pub struct MetadataEmitter {
     writer: std::fs::File,
 }
 
+/// Audio metadata payload for DAB+ decoded stream.
+pub struct AudioMeta<'a> {
+    pub codec: &'a str,
+    pub channels: u8,
+    pub mode: &'a str,
+    pub sample_rate: u32,
+    pub bitrate: Option<u32>,
+    pub sbr: bool,
+    pub ps: bool,
+}
+
 impl MetadataEmitter {
     /// Open FD 3 for writing. Returns `Err` if FD 3 is not available.
     ///
@@ -55,9 +66,34 @@ impl MetadataEmitter {
         self.emit(json!({"dl": text}));
     }
 
-    /// Emit audio bitrate information.
-    pub fn emit_bitrate(&mut self, kbps: u32) {
-        self.emit(json!({"bitrate": kbps}));
+    /// Emit sub-channel information discovered from FIG.
+    pub fn emit_subchannel(&mut self, scid: u8, protection: Option<&str>, dabplus: bool) {
+        let mut subchannel = json!({
+            "id": scid,
+            "dabplus": dabplus,
+        });
+        if let Some(p) = protection {
+            subchannel["protection"] = json!(p);
+        }
+        self.emit(json!({"subchannel": subchannel}));
+    }
+
+    /// Emit decoded DAB+ audio format information.
+    pub fn emit_audio(&mut self, audio_meta: AudioMeta<'_>) {
+        let mut audio = json!({
+            "codec": audio_meta.codec,
+            "channels": audio_meta.channels,
+            "mode": audio_meta.mode,
+            "sampleRate": audio_meta.sample_rate,
+            "sbr": audio_meta.sbr,
+            "ps": audio_meta.ps,
+        });
+        if let Some(kbps) = audio_meta.bitrate {
+            audio["bitrate"] = json!(kbps);
+        }
+        self.emit(json!({
+            "audio": audio
+        }));
     }
 
     /// Emit DAB date/time information derived from FIG 0/9 + FIG 0/10.

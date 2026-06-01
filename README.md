@@ -143,10 +143,20 @@ Open it with a shell redirect: `3>metadata.jsonl`
 {"ensemble":{"eid":"0xf043","label":"Ile-de-France"}}
 {"service":{"sid":"0xf2f8","label":"NRJ"}}
 {"time":{"utc":"2023-02-25, Sat - 12:34:45.321","local":"2023-02-25, Sat - 13:34:45","lto":"+01:00"}}
-{"bitrate":88}
+{"subchannel":{"id":3,"dabplus":true,"protection":"EEP-3A"}}
+{"audio":{"codec":"HE-AAC","channels":2,"mode":"stereo","sampleRate":48000,"bitrate":88,"sbr":true,"ps":false}}
 {"dl":"NRJ - Ed Sheeran - Shape Of You"}
 {"slide":{"contentName":"cover.jpg","contentType":"image/jpeg","data":"<base64>"}}
 ```
+
+Audio/profile notes:
+
+- `subchannel.protection` comes from FIG 0/1 (for example `EEP-3A`) and `subchannel` may be emitted again if protection changes later in the stream.
+- `audio.codec` is derived from DAB+ superframe signaling:
+  - `AAC-LC` when `sbr=false`
+  - `HE-AAC` when `sbr=true` and `ps=false`
+  - `HE-AAC v2` when `sbr=true` and `ps=true`
+- `audio.mode` / `audio.channels` indicate mono/stereo as decoded (e.g. stereo with `ps=false`).
 
 `time` events are emitted only when `--datetime-format` is provided.
 

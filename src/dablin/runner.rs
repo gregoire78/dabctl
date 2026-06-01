@@ -29,10 +29,10 @@ use crate::cli::{
     ListServicesArgs, OneServiceOutArgs,
 };
 use crate::dablin::audio::AacDecoder;
-use crate::dablin::dabplus::process_superframe_inplace;
+use crate::dablin::dabplus::{process_superframe_inplace, SuperframeFormat};
 use crate::dablin::eti::{parse_frame, FsyncState, ETI_FRAME_SIZE};
-use crate::dablin::fic::{FicDecoder, ServiceInfo};
-use crate::dablin::metadata::MetadataEmitter;
+use crate::dablin::fic::{FicDecoder, ProtectionProfile, ServiceInfo};
+use crate::dablin::metadata::{AudioMeta, MetadataEmitter};
 use crate::dablin::msc::{extract_subchannel, SubchannelBuffer};
 use crate::dablin::pad::PadDecoder;
 use crate::dablin::utils::jsonl::write_jsonl;
@@ -55,6 +55,69 @@ struct ServiceDumpContext {
     last_dl: Option<String>,
     last_slide_hash: Option<u64>,
     dedup_pad: bool,
+    emitted_audio_format: Option<SuperframeFormat>,
+    emitted_subchannel_protection: Option<String>,
+    bitrate_kbps: u32,
+}
+
+const OUTPUT_SAMPLE_RATE_HZ: u32 = 48_000;
+
+fn protection_label(p: &ProtectionProfile) -> String {
+    match p {
+        ProtectionProfile::EepA(level) => format!("EEP-{}A", level),
+        ProtectionProfile::EepB(level) => format!("EEP-{}B", level),
+        ProtectionProfile::Uep(index) => format!("UEP-{}", index),
+    }
+}
+
+fn audio_codec_label(fmt: &SuperframeFormat) -> &'static str {
+    match (fmt.sbr_flag, fmt.ps_flag) {
+        (false, _) => "AAC-LC",
+        (true, false) => "HE-AAC",
+        (true, true) => "HE-AAC v2",
+    }
+}
+
+fn audio_mode_label(fmt: &SuperframeFormat) -> &'static str {
+    if fmt.core_ch_config() == 2 {
+        "stereo"
+    } else {
+        "mono"
+    }
+}
+
+fn current_subchannel_protection(fic: &FicDecoder, scid: u8) -> Option<String> {
+    fic.subchannel_org(scid)
+        .map(|s| protection_label(&s.protection))
+}
+
+fn emit_subchannel_fd3(meta: &mut MetadataEmitter, fic: &FicDecoder, scid: u8) -> Option<String> {
+    let protection = current_subchannel_protection(fic, scid);
+    if let Some(ref p) = protection {
+        meta.emit_subchannel(scid, Some(p.as_str()), fic.is_dabplus(scid));
+    }
+    protection
+}
+
+fn write_subchannel_jsonl(
+    meta: &mut BufWriter<std::fs::File>,
+    fic: &FicDecoder,
+    scid: u8,
+    protection: Option<&str>,
+) {
+    let Some(protection) = protection else {
+        return;
+    };
+    write_jsonl(
+        meta,
+        json!({
+            "subchannel": {
+                "id": scid,
+                "dabplus": fic.is_dabplus(scid),
+                "protection": protection,
+            }
+        }),
+    );
 }
 
 /// Initialize the tracing logger on stderr unless `silent` is set.
@@ -197,6 +260,9 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
     let mut emitted_service_sid: Option<u32> = None;
     let mut emitted_service_label: Option<String> = None;
     let mut emitted_time: Option<(String, String, String)> = None;
+    let mut emitted_audio_format: Option<SuperframeFormat> = None;
+    let mut emitted_subchannel_protection: Option<String> = None;
+    let mut selected_bitrate_kbps: Option<u32> = None;
     let datetime_mode: Option<(bool, bool, Option<&str>)> =
         args.datetime_format.as_ref().map(|fmt| {
             let custom_datetime_format = match fmt {
@@ -310,9 +376,10 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
                         );
                         subch_buf = Some(buf);
 
+                        let kbps = (u32::from(stc.stl) * 64) / 24;
+                        selected_bitrate_kbps = Some(kbps);
                         if let Some(m) = meta.as_mut() {
-                            let kbps = (u32::from(stc.stl) * 64) / 24;
-                            m.emit_bitrate(kbps);
+                            emitted_subchannel_protection = emit_subchannel_fd3(m, &fic, scid);
                         }
                     } else {
                         warn!("Sub-channel SCID={} not found in STC", scid);
@@ -358,6 +425,15 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
                 }
                 emitted_ensemble_eid = Some(fic.ensemble.eid);
                 emitted_ensemble_label = current_ensemble_label;
+            }
+        }
+
+        if let Some(scid) = selected_scid {
+            if let Some(m) = meta.as_mut() {
+                let protection = current_subchannel_protection(&fic, scid);
+                if protection.is_some() && emitted_subchannel_protection != protection {
+                    emitted_subchannel_protection = emit_subchannel_fd3(m, &fic, scid);
+                }
             }
         }
 
@@ -445,6 +521,20 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
 
             if let (Some(fmt), Some(aac_dec)) = (result.format.as_ref(), aac.as_mut()) {
                 aac_dec.init_format(fmt);
+                if emitted_audio_format.as_ref() != Some(fmt) {
+                    if let Some(m) = meta.as_mut() {
+                        m.emit_audio(AudioMeta {
+                            codec: audio_codec_label(fmt),
+                            channels: fmt.core_ch_config(),
+                            mode: audio_mode_label(fmt),
+                            sample_rate: OUTPUT_SAMPLE_RATE_HZ,
+                            bitrate: selected_bitrate_kbps,
+                            sbr: fmt.sbr_flag,
+                            ps: fmt.ps_flag,
+                        });
+                    }
+                    emitted_audio_format = Some(fmt.clone());
+                }
             }
 
             for au in result.units {
@@ -683,7 +773,8 @@ fn run_all_services(
                 }
             }
             let kbps = (u32::from(stc.stl) * 64) / 24;
-            write_jsonl(&mut meta, json!({"bitrate": kbps}));
+            let protection = current_subchannel_protection(&fic, scid);
+            write_subchannel_jsonl(&mut meta, &fic, scid, protection.as_deref());
 
             let ctx = ServiceDumpContext {
                 sid: svc.sid,
@@ -701,6 +792,9 @@ fn run_all_services(
                 last_dl: None,
                 last_slide_hash: None,
                 dedup_pad: args.dedup_pad,
+                emitted_audio_format: None,
+                emitted_subchannel_protection: protection,
+                bitrate_kbps: kbps,
             };
 
             info!(
@@ -766,6 +860,17 @@ fn run_all_services(
                         ctx.emitted_service_label = Some(current_service_label);
                     }
                 }
+            }
+
+            let current_protection = current_subchannel_protection(&fic, ctx.scid);
+            if ctx.emitted_subchannel_protection != current_protection {
+                write_subchannel_jsonl(
+                    &mut ctx.meta,
+                    &fic,
+                    ctx.scid,
+                    current_protection.as_deref(),
+                );
+                ctx.emitted_subchannel_protection = current_protection;
             }
         }
 
@@ -858,6 +963,23 @@ fn run_all_services(
                 if let Some(fmt) = result.format.as_ref() {
                     if let Some(aac_dec) = ctx.aac.as_mut() {
                         aac_dec.init_format(fmt);
+                    }
+                    if ctx.emitted_audio_format.as_ref() != Some(fmt) {
+                        write_jsonl(
+                            &mut ctx.meta,
+                            json!({
+                                "audio": {
+                                    "codec": audio_codec_label(fmt),
+                                    "channels": fmt.core_ch_config(),
+                                    "mode": audio_mode_label(fmt),
+                                    "sampleRate": OUTPUT_SAMPLE_RATE_HZ,
+                                    "bitrate": ctx.bitrate_kbps,
+                                    "sbr": fmt.sbr_flag,
+                                    "ps": fmt.ps_flag,
+                                }
+                            }),
+                        );
+                        ctx.emitted_audio_format = Some(fmt.clone());
                     }
                 }
 
@@ -956,17 +1078,27 @@ fn print_services(fic: &FicDecoder) {
         fic.ensemble.label.as_deref().unwrap_or("(no label)")
     );
     for svc in &fic.services {
-        let subch_ids: Vec<u8> = svc.components.iter().map(|c| c.subch_id).collect();
-        let dabplus_marks: Vec<&str> = subch_ids
+        let subch_details: Vec<String> = svc
+            .components
             .iter()
-            .map(|&id| if fic.is_dabplus(id) { "DAB+" } else { "DAB" })
+            .map(|c| {
+                let family = if fic.is_dabplus(c.subch_id) {
+                    "DAB+"
+                } else {
+                    "DAB"
+                };
+                let protection = fic
+                    .subchannel_org(c.subch_id)
+                    .map(|s| protection_label(&s.protection))
+                    .unwrap_or_else(|| "unknown-protection".to_string());
+                format!("SCID={} {} {}", c.subch_id, family, protection)
+            })
             .collect();
         eprintln!(
-            "  SID={:#06x}  label={:?}  sub-ch={:?}  type={:?}",
+            "  SID={:#06x}  label={:?}  components={:?}",
             svc.sid,
             svc.label.as_deref().unwrap_or("(no label)"),
-            subch_ids,
-            dabplus_marks,
+            subch_details,
         );
     }
 }
@@ -974,7 +1106,8 @@ fn print_services(fic: &FicDecoder) {
 #[cfg(test)]
 mod tests {
     use super::{
-        encode_slide_base64, hash_bytes, save_slide_file, service_dir_name,
+        audio_codec_label, audio_mode_label, current_subchannel_protection, encode_slide_base64,
+        hash_bytes, protection_label, save_slide_file, service_dir_name,
         should_emit_slide_metadata,
     };
     use std::path::Path;
@@ -1001,6 +1134,40 @@ mod tests {
     fn service_dir_name_sanitizes_special_chars() {
         let name = service_dir_name(0xf221, Some("RADIO/CLASSIQUE"));
         assert_eq!(name, "0xf221-RADIOCLASSIQUE");
+    }
+
+    #[test]
+    fn protection_label_formats_eep_a() {
+        let label = protection_label(&crate::dablin::fic::ProtectionProfile::EepA(3));
+        assert_eq!(label, "EEP-3A");
+    }
+
+    #[test]
+    fn current_subchannel_protection_none_when_unknown() {
+        let fic = crate::dablin::fic::FicDecoder::new();
+        assert_eq!(current_subchannel_protection(&fic, 3), None);
+    }
+
+    #[test]
+    fn audio_codec_label_detects_he_aac_and_v2() {
+        let v1 = crate::dablin::dabplus::SuperframeFormat {
+            dac_rate: true,
+            sbr_flag: true,
+            aac_channel_mode: true,
+            ps_flag: false,
+            mpeg_surround_config: 0,
+        };
+        let v2 = crate::dablin::dabplus::SuperframeFormat {
+            dac_rate: true,
+            sbr_flag: true,
+            aac_channel_mode: false,
+            ps_flag: true,
+            mpeg_surround_config: 0,
+        };
+        assert_eq!(audio_codec_label(&v1), "HE-AAC");
+        assert_eq!(audio_codec_label(&v2), "HE-AAC v2");
+        assert_eq!(audio_mode_label(&v1), "stereo");
+        assert_eq!(audio_mode_label(&v2), "stereo");
     }
 
     #[test]

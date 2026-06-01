@@ -51,6 +51,7 @@ RUST_LOG=info ../target/release/dabctl dablin all-services-out \
   --aac-decoder fdk \
   --aac-gap silence \
   --dedup-pad \
+  --datetime-format \
   2>"$LOG_FILE"
 
 echo

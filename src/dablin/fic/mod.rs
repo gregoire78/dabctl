@@ -557,6 +557,11 @@ impl FicDecoder {
         self.dabplus_subch_ids.contains(&subch_id)
     }
 
+    /// Returns sub-channel organization for a given SCID.
+    pub fn subchannel_org(&self, subch_id: u8) -> Option<&SubchannelOrg> {
+        self.subchannels.iter().find(|s| s.subch_id == subch_id)
+    }
+
     /// Returns X-PAD MOT app type for slideshow on this sub-channel.
     pub fn mot_app_type(&self, subch_id: u8) -> Option<u8> {
         self.mot_app_types
