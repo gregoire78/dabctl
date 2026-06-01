@@ -103,6 +103,7 @@ dabctl dablin <subcommand> [options]
 | `--slide-base64` | | Include slide payload as base64 in FD3 JSONL events | off |
 | `--dedup-pad` | | Suppress consecutive identical PAD events (DL and slides) in JSONL output | off |
 | `--datetime-format` | | Date/time format for `time` metadata events: preset (`human`, `iso8601`, `time-human`, `time-iso8601`) or custom token template | off (no `time` event) |
+| `--startup-silence-watchdog` | | Stop decoding if startup PCM stays all-zero for more than `SECONDS` (disables itself after first non-zero sample) | off |
 | `--silent` | | No log output on stderr | off |
 
 ### `all-services-out` options
@@ -238,6 +239,7 @@ exec 3>pad_metadata.json
   -i multiplex.eti -s 0xF2F8 \
   --aac-decoder fdk \
   --aac-gap silence \
+  --startup-silence-watchdog 30 \
   --datetime-format time-iso8601 \
   --slide-dir ./slides \
   --slide-base64 \

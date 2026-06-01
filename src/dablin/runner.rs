@@ -39,6 +39,9 @@ use crate::dablin::utils::jsonl::write_jsonl;
 use crate::dablin::utils::path::sanitize_for_path;
 use crate::dablin::utils::wav_writer::WavWriter;
 
+const PCM_SAMPLE_RATE_HZ: u64 = 48_000;
+const PCM_OUTPUT_CHANNELS: usize = 2;
+
 struct ServiceDumpContext {
     sid: u32,
     scid: u8,
@@ -55,6 +58,54 @@ struct ServiceDumpContext {
     last_dl: Option<String>,
     last_slide_hash: Option<u64>,
     dedup_pad: bool,
+}
+
+struct StartupSilenceWatchdog {
+    threshold_seconds: u32,
+    threshold_samples_per_channel: u64,
+    silent_samples_per_channel: u64,
+    seen_non_silent: bool,
+}
+
+impl StartupSilenceWatchdog {
+    fn new(threshold_seconds: u32) -> Self {
+        Self {
+            threshold_seconds,
+            threshold_samples_per_channel: u64::from(threshold_seconds) * PCM_SAMPLE_RATE_HZ,
+            silent_samples_per_channel: 0,
+            seen_non_silent: false,
+        }
+    }
+
+    fn observe(&mut self, pcm: &[i16]) -> Result<()> {
+        if self.seen_non_silent || pcm.is_empty() {
+            return Ok(());
+        }
+
+        if pcm.iter().any(|&sample| sample != 0) {
+            self.seen_non_silent = true;
+            return Ok(());
+        }
+
+        let silent_samples = (pcm.len() / PCM_OUTPUT_CHANNELS) as u64;
+        self.silent_samples_per_channel = self
+            .silent_samples_per_channel
+            .saturating_add(silent_samples);
+
+        if self.silent_samples_per_channel >= self.threshold_samples_per_channel {
+            return Err(anyhow::anyhow!(
+                "startup silence watchdog fired after {}s of all-zero PCM; stopping",
+                self.threshold_seconds
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+enum PcmWriteOutcome {
+    Continue,
+    StdoutClosed,
 }
 
 /// Initialize the tracing logger on stderr unless `silent` is set.
@@ -159,6 +210,27 @@ fn should_emit_slide_metadata(slide_dir: Option<&Path>, slide_base64: bool) -> b
     slide_dir.is_some() || slide_base64
 }
 
+fn write_stdout_pcm(
+    out: &mut dyn Write,
+    pcm: &[i16],
+    startup_silence_watchdog: &mut Option<StartupSilenceWatchdog>,
+) -> Result<PcmWriteOutcome> {
+    if let Some(watchdog) = startup_silence_watchdog.as_mut() {
+        watchdog.observe(pcm)?;
+    }
+
+    let bytes: Vec<u8> = pcm.iter().flat_map(|sample| sample.to_le_bytes()).collect();
+    if let Err(e) = out.write_all(&bytes) {
+        if e.kind() == io::ErrorKind::BrokenPipe {
+            info!("stdout closed, exiting");
+            return Ok(PcmWriteOutcome::StdoutClosed);
+        }
+        return Err(e).context("PCM write error");
+    }
+
+    Ok(PcmWriteOutcome::Continue)
+}
+
 /// Save a slide file to disk, logging a warning on failure.
 fn save_slide_file(dir: &Path, name: &str, data: &[u8]) {
     let path = dir.join(name);
@@ -224,6 +296,9 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
     let mut out = stdout.lock();
     let mut frame_buf = vec![0u8; ETI_FRAME_SIZE];
     let mut frame_count = 0u64;
+    let mut startup_silence_watchdog = args
+        .startup_silence_watchdog
+        .map(StartupSilenceWatchdog::new);
 
     loop {
         if !running.load(Ordering::Relaxed) {
@@ -400,13 +475,9 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
                 debug!("DAB+ FireCode mismatch – advancing one CIF");
                 if let Some(aac_dec) = aac.as_ref() {
                     if let Some(pcm) = aac_dec.silence_for_missing_cifs(1) {
-                        let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
-                        if let Err(e) = out.write_all(&bytes) {
-                            if e.kind() == io::ErrorKind::BrokenPipe {
-                                info!("stdout closed, exiting");
-                                return Ok(());
-                            }
-                            return Err(e).context("PCM write error");
+                        match write_stdout_pcm(&mut out, &pcm, &mut startup_silence_watchdog)? {
+                            PcmWriteOutcome::Continue => {}
+                            PcmWriteOutcome::StdoutClosed => return Ok(()),
                         }
                     }
                 }
@@ -423,13 +494,9 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
                 if let Some(aac_dec) = aac.as_ref() {
                     // A superframe represents 5 CIFs = 5 * 24ms = 120ms
                     if let Some(pcm) = aac_dec.silence_for_corrupted_superframe(5) {
-                        let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
-                        if let Err(e) = out.write_all(&bytes) {
-                            if e.kind() == io::ErrorKind::BrokenPipe {
-                                info!("stdout closed, exiting");
-                                return Ok(());
-                            }
-                            return Err(e).context("PCM write error");
+                        match write_stdout_pcm(&mut out, &pcm, &mut startup_silence_watchdog)? {
+                            PcmWriteOutcome::Continue => {}
+                            PcmWriteOutcome::StdoutClosed => return Ok(()),
                         }
                     }
                 }
@@ -494,13 +561,9 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
 
                 match aac_dec.decode(&au) {
                     Some(pcm) => {
-                        let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
-                        if let Err(e) = out.write_all(&bytes) {
-                            if e.kind() == io::ErrorKind::BrokenPipe {
-                                info!("stdout closed, exiting");
-                                return Ok(());
-                            }
-                            return Err(e).context("PCM write error");
+                        match write_stdout_pcm(&mut out, &pcm, &mut startup_silence_watchdog)? {
+                            PcmWriteOutcome::Continue => {}
+                            PcmWriteOutcome::StdoutClosed => return Ok(()),
                         }
                     }
                     None => {
@@ -975,7 +1038,7 @@ fn print_services(fic: &FicDecoder) {
 mod tests {
     use super::{
         encode_slide_base64, hash_bytes, save_slide_file, service_dir_name,
-        should_emit_slide_metadata,
+        should_emit_slide_metadata, StartupSilenceWatchdog,
     };
     use std::path::Path;
 
@@ -1053,6 +1116,34 @@ mod tests {
         let data = std::fs::read(&path).expect("slide file should exist");
         assert_eq!(data, b"slide payload");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn startup_silence_watchdog_triggers_after_threshold() {
+        let mut watchdog = StartupSilenceWatchdog::new(1);
+        let silent_chunk = vec![0i16; 48_000 * 2];
+        let result = watchdog.observe(&silent_chunk);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn startup_silence_watchdog_stops_after_non_silent_audio() {
+        let mut watchdog = StartupSilenceWatchdog::new(10);
+        let silent_chunk = vec![0i16; 48_000 * 2];
+        watchdog
+            .observe(&silent_chunk)
+            .expect("silent startup accepted");
+
+        let mut audio_chunk = vec![0i16; 96_000 * 2];
+        audio_chunk[10] = 123;
+        watchdog
+            .observe(&audio_chunk)
+            .expect("non-silent startup should disable watchdog");
+
+        let long_silent = vec![0i16; 960_000 * 2];
+        watchdog
+            .observe(&long_silent)
+            .expect("watchdog remains disabled once non-silent audio arrived");
     }
 }
 

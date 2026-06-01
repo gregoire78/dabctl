@@ -74,6 +74,16 @@ pub struct OneServiceOutArgs {
     /// Pass `--datetime-format` without a value to use `iso8601`.
     #[arg(long = "datetime-format", num_args = 0..=1, default_missing_value = "iso8601")]
     pub datetime_format: Option<DateTimeFormat>,
+
+    /// Stop decoding if startup audio stays silent for too long.
+    ///
+    /// The watchdog is disabled by default.
+    #[arg(
+        long = "startup-silence-watchdog",
+        value_name = "SECONDS",
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub startup_silence_watchdog: Option<u32>,
 }
 
 /// Arguments for `dabctl dablin all-services-out`
@@ -205,6 +215,7 @@ mod tests {
                 assert!(!args.silent);
                 assert_eq!(args.aac_gap, AacGap::Freeze);
                 assert_eq!(args.datetime_format, None);
+                assert_eq!(args.startup_silence_watchdog, None);
             }
             _ => panic!("unexpected command"),
         }
@@ -464,6 +475,47 @@ mod tests {
             }
             _ => panic!("unexpected command"),
         }
+    }
+
+    #[test]
+    fn test_parse_dablin_startup_silence_watchdog() {
+        let cli = Cli::try_parse_from([
+            "dabctl",
+            "dablin",
+            "one-service-out",
+            "-i",
+            "test.eti",
+            "-s",
+            "0xF2F8",
+            "--startup-silence-watchdog",
+            "15",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Dablin {
+                command: DablinCommand::OneServiceOut(args),
+            } => {
+                assert_eq!(args.startup_silence_watchdog, Some(15));
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_dablin_rejects_zero_startup_silence_watchdog() {
+        let cli = Cli::try_parse_from([
+            "dabctl",
+            "dablin",
+            "one-service-out",
+            "-i",
+            "test.eti",
+            "-s",
+            "0xF2F8",
+            "--startup-silence-watchdog",
+            "0",
+        ]);
+        assert!(cli.is_err());
     }
 
     #[test]
