@@ -155,7 +155,7 @@ pub enum DateTimeFormat {
     TimeHuman,
     /// ISO 8601 time-only output (without date)
     TimeIso8601,
-    /// Custom format template (token-based)
+    /// Custom format template (chrono strftime syntax)
     Custom(String),
 }
 
@@ -447,7 +447,7 @@ mod tests {
             "-s",
             "0xF2F8",
             "--datetime-format",
-            "[YYYYescape] YYYY-MM-DDTHH:mm:ssZ[Z]",
+            "YYYYescape %Y-%m-%dT%H:%M:%S%:zZ",
         ])
         .unwrap();
 
@@ -458,7 +458,7 @@ mod tests {
                 assert_eq!(
                     args.datetime_format,
                     Some(DateTimeFormat::Custom(
-                        "[YYYYescape] YYYY-MM-DDTHH:mm:ssZ[Z]".to_string()
+                        "YYYYescape %Y-%m-%dT%H:%M:%S%:zZ".to_string()
                     ))
                 );
             }

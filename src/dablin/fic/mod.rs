@@ -590,21 +590,15 @@ impl FicDecoder {
         let local_dt = apply_lto(utc, lto);
         let lto_str = format_lto(lto);
 
-        let (utc_str, local_str) = if let Some(pattern) = custom_pattern {
-            (
-                format_dab_datetime_custom(utc, Some("+00:00"), pattern),
-                format_dab_datetime_custom(&local_dt, Some(lto_str.as_str()), pattern),
-            )
+        // UTC is always emitted in ISO 8601 for stable machine parsing.
+        let utc_str = format_dab_datetime_iso8601(utc, true, Some("Z"), time_only);
+
+        let local_str = if let Some(pattern) = custom_pattern {
+            format_dab_datetime_custom(&local_dt, Some(lto_str.as_str()), pattern)
         } else if iso8601 {
-            (
-                format_dab_datetime_iso8601(utc, true, Some("Z"), time_only),
-                format_dab_datetime_iso8601(&local_dt, false, Some(lto_str.as_str()), time_only),
-            )
+            format_dab_datetime_iso8601(&local_dt, false, Some(lto_str.as_str()), time_only)
         } else {
-            (
-                format_dab_datetime(utc, true, time_only),
-                format_dab_datetime(&local_dt, false, time_only),
-            )
+            format_dab_datetime(&local_dt, false, time_only)
         };
 
         Some((utc_str, local_str, lto_str))
@@ -826,7 +820,7 @@ mod tests {
             .current_dab_time_metadata(false, false, None)
             .expect("time metadata");
         assert_eq!(lto, "+01:00");
-        assert!(utc.ends_with(" - 12:34"));
+        assert_eq!(utc, "2023-02-25T12:34Z");
         assert!(local.ends_with(" - 13:34"));
     }
 
@@ -850,7 +844,7 @@ mod tests {
             .current_dab_time_metadata(false, false, None)
             .map(|(u, _, _)| u)
             .expect("utc string");
-        assert!(utc.ends_with(" - 12:34:45.321"));
+        assert_eq!(utc, "2023-02-25T12:34:45.321Z");
     }
 
     #[test]
@@ -887,7 +881,7 @@ mod tests {
             .current_dab_time_metadata(false, true, None)
             .expect("time metadata");
         assert_eq!(lto, "+01:00");
-        assert_eq!(utc, "12:34:45.321");
+        assert_eq!(utc, "12:34:45.321Z");
         assert_eq!(local, "13:34:45");
     }
 
@@ -901,10 +895,10 @@ mod tests {
         decoder.process_fic(&make_fib(&fig_time));
 
         let (utc, local, lto) = decoder
-            .current_dab_time_metadata(false, false, Some("[YYYYescape] YYYY-MM-DDTHH:mm:ssZ[Z]"))
+            .current_dab_time_metadata(false, false, Some("YYYYescape %Y-%m-%dT%H:%M:%S%:zZ"))
             .expect("time metadata");
         assert_eq!(lto, "+01:00");
-        assert_eq!(utc, "YYYYescape 2023-02-25T12:34:45+00:00Z");
+        assert_eq!(utc, "2023-02-25T12:34:45.321Z");
         assert_eq!(local, "YYYYescape 2023-02-25T13:34:45+01:00Z");
     }
 }

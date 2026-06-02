@@ -1,3 +1,52 @@
+use chrono::{FixedOffset, Locale, NaiveDate, TimeZone};
+use std::env;
+use std::str::FromStr;
+
+fn current_date_locale() -> Locale {
+    if let Ok(raw) = env::var("LC_TIME") {
+        if let Some(locale) = parse_locale_tag(&raw) {
+            return locale;
+        }
+    }
+
+    if let Ok(raw) = env::var("LANG") {
+        if let Some(locale) = parse_locale_tag(&raw) {
+            return locale;
+        }
+    }
+
+    if let Ok(raw) = env::var("LANGUAGE") {
+        for candidate in raw.split(':') {
+            if let Some(locale) = parse_locale_tag(candidate) {
+                return locale;
+            }
+        }
+    }
+
+    Locale::POSIX
+}
+
+fn parse_locale_tag(raw: &str) -> Option<Locale> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let base = trimmed.split('.').next().unwrap_or(trimmed);
+    let normalized = base.replace('-', "_");
+
+    Locale::from_str(&normalized).ok().or_else(|| {
+        let lang = normalized.split('@').next().unwrap_or(&normalized);
+        let short = lang.split('_').next().unwrap_or(lang);
+        if short.len() == 2 {
+            let upper = short.to_ascii_uppercase();
+            Locale::from_str(&format!("{}_{}", short, upper)).ok()
+        } else {
+            None
+        }
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DabDateTime {
     pub year: i32,
@@ -55,22 +104,34 @@ pub fn apply_lto(utc: &DabDateTime, lto: i8) -> DabDateTime {
 }
 
 pub fn format_dab_datetime(dt: &DabDateTime, output_ms: bool, time_only: bool) -> String {
-    if time_only {
-        return match dt.ms {
-            Some(ms) => {
-                if output_ms {
-                    format!("{:02}:{:02}:{:02}.{:03}", dt.hour, dt.minute, dt.second, ms)
-                } else {
-                    format!("{:02}:{:02}:{:02}", dt.hour, dt.minute, dt.second)
-                }
+    format_dab_datetime_with_locale(dt, output_ms, time_only, current_date_locale())
+}
+
+fn format_time_component(dt: &DabDateTime, output_ms: bool) -> String {
+    match dt.ms {
+        Some(ms) => {
+            if output_ms {
+                format!("{:02}:{:02}:{:02}.{:03}", dt.hour, dt.minute, dt.second, ms)
+            } else {
+                format!("{:02}:{:02}:{:02}", dt.hour, dt.minute, dt.second)
             }
-            None => format!("{:02}:{:02}", dt.hour, dt.minute),
-        };
+        }
+        None => format!("{:02}:{:02}", dt.hour, dt.minute),
+    }
+}
+
+fn format_dab_datetime_with_locale(
+    dt: &DabDateTime,
+    output_ms: bool,
+    time_only: bool,
+    locale: Locale,
+) -> String {
+    if time_only {
+        return format_time_component(dt, output_ms);
     }
 
-    let year = dt.year + 1900;
-    let weekday = weekday_name(year, u32::from(dt.month), u32::from(dt.day));
-    let base = format!("{:04}-{:02}-{:02}, {} - ", year, dt.month, dt.day, weekday);
+    let pattern = "%Y-%m-%d, %a - ";
+    let base = format_dab_datetime_custom_with_locale(dt, None, pattern, locale);
 
     match dt.ms {
         Some(ms) => {
@@ -94,16 +155,7 @@ pub fn format_dab_datetime_iso8601(
     time_only: bool,
 ) -> String {
     let mut base = if time_only {
-        match dt.ms {
-            Some(ms) => {
-                if output_ms {
-                    format!("{:02}:{:02}:{:02}.{:03}", dt.hour, dt.minute, dt.second, ms)
-                } else {
-                    format!("{:02}:{:02}:{:02}", dt.hour, dt.minute, dt.second)
-                }
-            }
-            None => format!("{:02}:{:02}", dt.hour, dt.minute),
-        }
+        format_time_component(dt, output_ms)
     } else {
         let year = dt.year + 1900;
         match dt.ms {
@@ -135,138 +187,74 @@ pub fn format_dab_datetime_iso8601(
 }
 
 pub fn format_dab_datetime_custom(dt: &DabDateTime, offset: Option<&str>, pattern: &str) -> String {
-    let mut out = String::with_capacity(pattern.len() + 16);
-    let mut i = 0usize;
-
-    while i < pattern.len() {
-        let rest = &pattern[i..];
-
-        if let Some(after_open) = rest.strip_prefix('[') {
-            if let Some(close_idx) = after_open.find(']') {
-                out.push_str(&after_open[..close_idx]);
-                i += close_idx + 2;
-                continue;
-            }
-        }
-
-        if let Some((token, token_len)) = match_custom_token(rest) {
-            out.push_str(&render_custom_token(token, dt, offset));
-            i += token_len;
-            continue;
-        }
-
-        if let Some(ch) = rest.chars().next() {
-            out.push(ch);
-            i += ch.len_utf8();
-        } else {
-            break;
-        }
-    }
-
-    out
+    format_dab_datetime_custom_with_locale(dt, offset, pattern, current_date_locale())
 }
 
-fn match_custom_token(input: &str) -> Option<(&'static str, usize)> {
-    const TOKENS: [&str; 23] = [
-        "YYYY", "MMMM", "dddd", "SSS", "MMM", "ddd", "hh", "HH", "mm", "ss", "DD", "YY", "MM",
-        "dd", "ZZ", "Z", "M", "D", "d", "H", "h", "m", "s",
-    ];
+fn format_dab_datetime_custom_with_locale(
+    dt: &DabDateTime,
+    offset: Option<&str>,
+    pattern: &str,
+    locale: Locale,
+) -> String {
+    let Some(rendered) = render_with_chrono(dt, offset, pattern, locale) else {
+        return pattern.to_string();
+    };
 
-    TOKENS
-        .iter()
-        .find(|token| input.starts_with(**token))
-        .map(|token| (*token, token.len()))
+    rendered
 }
 
-fn render_custom_token(token: &str, dt: &DabDateTime, offset: Option<&str>) -> String {
-    const MONTHS_SHORT: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-    const MONTHS_FULL: [&str; 12] = [
-        "January",
-        "February",
-        "March",
-        "April",
-        "May",
-        "June",
-        "July",
-        "August",
-        "September",
-        "October",
-        "November",
-        "December",
-    ];
-    const WEEKDAY_MIN: [&str; 7] = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
-    const WEEKDAY_SHORT: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-    const WEEKDAY_FULL: [&str; 7] = [
-        "Sunday",
-        "Monday",
-        "Tuesday",
-        "Wednesday",
-        "Thursday",
-        "Friday",
-        "Saturday",
-    ];
-
+fn render_with_chrono(
+    dt: &DabDateTime,
+    offset: Option<&str>,
+    pattern: &str,
+    locale: Locale,
+) -> Option<String> {
     let year = dt.year + 1900;
-    let month_idx = usize::from(dt.month.saturating_sub(1).min(11));
-    let weekday_idx = weekday_index(year, u32::from(dt.month), u32::from(dt.day));
-    let h12 = ((dt.hour + 11) % 12) + 1;
+    let date = NaiveDate::from_ymd_opt(year, u32::from(dt.month), u32::from(dt.day))?;
+    let datetime = date.and_hms_milli_opt(
+        u32::from(dt.hour),
+        u32::from(dt.minute),
+        u32::from(dt.second),
+        u32::from(dt.ms.unwrap_or(0)),
+    )?;
 
-    match token {
-        "YY" => format!("{:02}", year.rem_euclid(100)),
-        "YYYY" => format!("{:04}", year),
-        "M" => dt.month.to_string(),
-        "MM" => format!("{:02}", dt.month),
-        "MMM" => MONTHS_SHORT[month_idx].to_string(),
-        "MMMM" => MONTHS_FULL[month_idx].to_string(),
-        "D" => dt.day.to_string(),
-        "DD" => format!("{:02}", dt.day),
-        "d" => weekday_idx.to_string(),
-        "dd" => WEEKDAY_MIN[weekday_idx].to_string(),
-        "ddd" => WEEKDAY_SHORT[weekday_idx].to_string(),
-        "dddd" => WEEKDAY_FULL[weekday_idx].to_string(),
-        "H" => dt.hour.to_string(),
-        "HH" => format!("{:02}", dt.hour),
-        "h" => h12.to_string(),
-        "hh" => format!("{:02}", h12),
-        "m" => dt.minute.to_string(),
-        "mm" => format!("{:02}", dt.minute),
-        "s" => dt.second.to_string(),
-        "ss" => format!("{:02}", dt.second),
-        "SSS" => format!("{:03}", dt.ms.unwrap_or(0)),
-        "Z" => normalize_offset(offset, false),
-        "ZZ" => normalize_offset(offset, true),
-        _ => token.to_string(),
-    }
+    let offset_colon = normalize_offset(offset);
+
+    let sec = parse_offset_seconds(&offset_colon)?;
+    let fixed = FixedOffset::east_opt(sec)?;
+    let dt_fixed = fixed.from_local_datetime(&datetime).single()?;
+
+    Some(dt_fixed.format_localized(pattern, locale).to_string())
 }
 
-fn normalize_offset(offset: Option<&str>, compact: bool) -> String {
+fn normalize_offset(offset: Option<&str>) -> String {
     let off = offset.unwrap_or("+00:00");
-    let expanded = if off.eq_ignore_ascii_case("z") {
+    if off.eq_ignore_ascii_case("z") {
         "+00:00".to_string()
     } else if off.len() == 5 && (off.starts_with('+') || off.starts_with('-')) {
         format!("{}{}:{}", &off[0..1], &off[1..3], &off[3..5])
     } else {
         off.to_string()
-    };
-
-    if compact {
-        expanded.replace(':', "")
-    } else {
-        expanded
     }
 }
 
-fn weekday_index(year: i32, month: u32, day: u32) -> usize {
-    let days = days_from_civil(year, month, day);
-    (days + 4).rem_euclid(7) as usize
-}
+fn parse_offset_seconds(offset: &str) -> Option<i32> {
+    if offset.len() != 6 {
+        return None;
+    }
 
-fn weekday_name(year: i32, month: u32, day: u32) -> &'static str {
-    const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-    let idx = weekday_index(year, month, day);
-    WEEKDAYS[idx]
+    let sign = match &offset[0..1] {
+        "+" => 1,
+        "-" => -1,
+        _ => return None,
+    };
+    if &offset[3..4] != ":" {
+        return None;
+    }
+
+    let hours: i32 = offset[1..3].parse().ok()?;
+    let minutes: i32 = offset[4..6].parse().ok()?;
+    Some(sign * (hours * 3600 + minutes * 60))
 }
 
 fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
@@ -346,11 +334,11 @@ mod tests {
         };
 
         assert_eq!(
-            format_dab_datetime(&dt, true, false),
+            format_dab_datetime_with_locale(&dt, true, false, Locale::en_US),
             "2023-02-25, Sat - 12:34:45.321"
         );
         assert_eq!(
-            format_dab_datetime(&dt, false, false),
+            format_dab_datetime_with_locale(&dt, false, false, Locale::en_US),
             "2023-02-25, Sat - 12:34:45"
         );
         assert_eq!(
@@ -375,8 +363,14 @@ mod tests {
             ms: Some(321),
         };
 
-        assert_eq!(format_dab_datetime(&dt, true, true), "12:34:45.321");
-        assert_eq!(format_dab_datetime(&dt, false, true), "12:34:45");
+        assert_eq!(
+            format_dab_datetime_with_locale(&dt, true, true, Locale::en_US),
+            "12:34:45.321"
+        );
+        assert_eq!(
+            format_dab_datetime_with_locale(&dt, false, true, Locale::en_US),
+            "12:34:45"
+        );
         assert_eq!(
             format_dab_datetime_iso8601(&dt, true, Some("Z"), true),
             "12:34:45.321Z"
@@ -388,7 +382,7 @@ mod tests {
     }
 
     #[test]
-    fn test_format_dab_datetime_custom_tokens() {
+    fn test_format_dab_datetime_custom_chrono() {
         let dt = DabDateTime {
             year: 123,
             month: 2,
@@ -403,9 +397,9 @@ mod tests {
             format_dab_datetime_custom(
                 &dt,
                 Some("+01:00"),
-                "YY YYYY M MM MMM MMMM D DD d dd ddd dddd H HH h hh m mm s ss SSS Z ZZ"
+                "%y %Y %-m %m %b %B %-d %d %w %a %A %-H %H %-I %I %-M %M %-S %S %3f %:z %z"
             ),
-            "23 2023 2 02 Feb February 25 25 6 Sa Sat Saturday 12 12 12 12 34 34 45 45 321 +01:00 +0100"
+            "23 2023 2 02 Feb February 25 25 6 Sat Saturday 12 12 12 12 34 34 45 45 321 +01:00 +0100"
         );
     }
 
@@ -422,8 +416,50 @@ mod tests {
         };
 
         assert_eq!(
-            format_dab_datetime_custom(&dt, Some("+00:00"), "[YYYYescape] YYYY-MM-DDTHH:mm:ssZ[Z]"),
+            format_dab_datetime_custom(&dt, Some("+00:00"), "YYYYescape %Y-%m-%dT%H:%M:%S%:zZ"),
             "YYYYescape 2023-02-25T12:34:45+00:00Z"
         );
+    }
+
+    #[test]
+    fn test_render_with_chrono_french_locale_textual_names() {
+        let dt = DabDateTime {
+            year: 123,
+            month: 2,
+            day: 25,
+            hour: 12,
+            minute: 34,
+            second: 45,
+            ms: Some(321),
+        };
+
+        let rendered = render_with_chrono(&dt, Some("+01:00"), "%a %A %b %B", Locale::fr_FR)
+            .expect("localized rendering");
+        assert_eq!(rendered, "sam. samedi f\u{e9}vr. f\u{e9}vrier");
+    }
+
+    #[test]
+    fn test_format_dab_datetime_human_french_locale() {
+        let dt = DabDateTime {
+            year: 123,
+            month: 2,
+            day: 25,
+            hour: 12,
+            minute: 34,
+            second: 45,
+            ms: Some(321),
+        };
+
+        assert_eq!(
+            format_dab_datetime_with_locale(&dt, true, false, Locale::fr_FR),
+            "2023-02-25, sam. - 12:34:45.321"
+        );
+    }
+
+    #[test]
+    fn test_parse_locale_tag_variants() {
+        assert_eq!(parse_locale_tag("fr_FR.UTF-8"), Some(Locale::fr_FR));
+        assert_eq!(parse_locale_tag("fr-FR"), Some(Locale::fr_FR));
+        assert_eq!(parse_locale_tag("de"), Some(Locale::de_DE));
     }
 }

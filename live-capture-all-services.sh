@@ -5,11 +5,15 @@
 #   ./live-capture-all-services.sh [ETI_FILE]
 #
 #   ETI_FILE : fichier ETI (defaut : multiplex.eti)
+#
+# Variables optionnelles :
+#   DATETIME_LOCALE : locale pour l'affichage des dates (defaut : fr_FR.UTF-8)
 
 set -e
 
 ETI_FILE="${1:-multiplex.eti}"
 OUT_DIR="all-services"
+DATETIME_LOCALE="${DATETIME_LOCALE:-fr_FR.UTF-8}"
 
 RUN_TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 LOG_FILE="dablin-all-services-${RUN_TIMESTAMP}.log"
@@ -42,16 +46,17 @@ rm -rf "$OUT_DIR"
 echo "[dablin] ETI=${ETI_FILE}"
 echo "[dablin] Sortie=./${OUT_DIR}"
 echo "[dablin] Log=${LOG_FILE}"
+echo "[dablin] Locale=${DATETIME_LOCALE}"
 echo "[dablin] Ctrl-C pour arreter"
 
-RUST_LOG=info ../target/release/dabctl dablin all-services-out \
+LC_TIME="${DATETIME_LOCALE}" RUST_LOG=info ../target/release/dabctl dablin all-services-out \
   -i "$ETI_FILE" \
   --out "./${OUT_DIR}" \
   --slide-base64 \
   --aac-decoder fdk \
   --aac-gap silence \
   --dedup-pad \
-  --datetime-format \
+  --datetime-format human \
   2>"$LOG_FILE"
 
 echo

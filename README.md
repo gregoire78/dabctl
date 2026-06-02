@@ -102,7 +102,7 @@ dabctl dablin <subcommand> [options]
 | `--slide-dir` | | Save MOT slideshow images to this directory | — |
 | `--slide-base64` | | Include slide payload as base64 in FD3 JSONL events | off |
 | `--dedup-pad` | | Suppress consecutive identical PAD events (DL and slides) in JSONL output | off |
-| `--datetime-format` | | Date/time format for `time` metadata events: preset (`human`, `iso8601`, `time-human`, `time-iso8601`) or custom token template | off (no `time` event) |
+| `--datetime-format` | | Date/time format for `time` metadata events: preset (`human`, `iso8601`, `time-human`, `time-iso8601`) or custom chrono template | off (no `time` event) |
 | `--silent` | | No log output on stderr | off |
 
 ### `all-services-out` options
@@ -115,7 +115,7 @@ dabctl dablin <subcommand> [options]
 | `--aac-gap` | | Behavior on missing/invalid AAC frames: `freeze` or `silence` | `freeze` |
 | `--slide-base64` | | Include slide payload as base64 in metadata files | off |
 | `--dedup-pad` | | Suppress consecutive identical PAD events (DL and slides) in metadata files | off |
-| `--datetime-format` | | Date/time format for `time` metadata events: preset (`human`, `iso8601`, `time-human`, `time-iso8601`) or custom token template | off (no `time` event) |
+| `--datetime-format` | | Date/time format for `time` metadata events: preset (`human`, `iso8601`, `time-human`, `time-iso8601`) or custom chrono template | off (no `time` event) |
 | `--silent` | | No log output on stderr | off |
 
 ### `list-services` options
@@ -165,16 +165,19 @@ Audio/profile notes:
 
 When enabled, `time` event format is configurable with `--datetime-format`:
 
-- `human` (default): human-readable display format
-  - `utc`: `YYYY-MM-DD, Ddd - HH:MM[:SS[.mmm]]`
+- `utc` is always emitted in ISO 8601 (`...Z`) for stable machine parsing.
+- `local` follows the selected preset or custom template.
+
+- `human`: human-readable display format (weekday language follows system locale)
+  - `utc`: `YYYY-MM-DDTHH:MM[:SS[.mmm]]Z`
   - `local`: `YYYY-MM-DD, Ddd - HH:MM[:SS]`
   - `lto`: `+/-HH:MM`
-- `iso8601`: machine-friendly format
+- `iso8601` (default when `--datetime-format` has no value): machine-friendly format
   - `utc`: `YYYY-MM-DDTHH:MM[:SS[.mmm]]Z`
   - `local`: `YYYY-MM-DDTHH:MM[:SS][+/-HH:MM]`
   - `lto`: `+/-HH:MM`
 - `time-human`: human-readable time-only format
-  - `utc`: `HH:MM[:SS[.mmm]]`
+  - `utc`: `HH:MM[:SS[.mmm]]Z`
   - `local`: `HH:MM[:SS]`
 - `time-iso8601`: ISO 8601 time-only format
   - `utc`: `HH:MM[:SS[.mmm]]Z`
@@ -182,38 +185,43 @@ When enabled, `time` event format is configurable with `--datetime-format`:
 
 You can also pass a custom template directly to `--datetime-format`.
 
-List of available tokens:
+Custom templates now use chrono/strftime directives.
 
-| Token | Output example | Description |
+Language for textual directives follows system locale (`LC_TIME`, then `LANG`, then `LANGUAGE`).
+Locale tags are resolved with chrono locales (for example `fr_FR.UTF-8`, `de_DE.UTF-8`, `es_ES.UTF-8`). Unknown tags fall back to `POSIX`.
+Abbreviated names (for example `%a`, `%b`) can include locale-specific punctuation.
+
+- Example: `%Y-%m-%dT%H:%M:%S%:z`
+- Example with literal text: `dab-time %Y-%m-%d %H:%M:%S %:z`
+
+Note: custom templates apply to `local` only; `utc` remains ISO 8601.
+
+Useful directives:
+
+| Directive | Output example | Description |
 |---|---|---|
-| `YY` | `18` | Two-digit year |
-| `YYYY` | `2018` | Four-digit year |
-| `M` | `1-12` | Month, starting at 1 |
-| `MM` | `01-12` | Month, 2 digits |
-| `MMM` | `Jan-Dec` | Abbreviated month name |
-| `MMMM` | `January-December` | Full month name |
-| `D` | `1-31` | Day of month |
-| `DD` | `01-31` | Day of month, 2 digits |
-| `d` | `0-6` | Day of week, Sunday = 0 |
-| `dd` | `Su-Sa` | Min day name |
-| `ddd` | `Sun-Sat` | Short day name |
-| `dddd` | `Sunday-Saturday` | Full day name |
-| `H` | `0-23` | Hour (24h) |
-| `HH` | `00-23` | Hour (24h), 2 digits |
-| `h` | `1-12` | Hour (12h) |
-| `hh` | `01-12` | Hour (12h), 2 digits |
-| `m` | `0-59` | Minute |
-| `mm` | `00-59` | Minute, 2 digits |
-| `s` | `0-59` | Second |
-| `ss` | `00-59` | Second, 2 digits |
-| `SSS` | `000-999` | Millisecond, 3 digits |
-| `Z` | `+05:00` | UTC offset, ±HH:mm |
-| `ZZ` | `+0500` | UTC offset, ±HHmm |
-
-Escaping literals:
-
-- Wrap literal text in square brackets, for example:
-  - `[YYYYescape] YYYY-MM-DDTHH:mm:ssZ[Z]`
+| `%Y` | `2018` | Four-digit year |
+| `%y` | `18` | Two-digit year |
+| `%m` | `01-12` | Month, 2 digits |
+| `%-m` | `1-12` | Month, no leading zero |
+| `%d` | `01-31` | Day of month, 2 digits |
+| `%-d` | `1-31` | Day of month, no leading zero |
+| `%H` | `00-23` | Hour (24h), 2 digits |
+| `%-H` | `0-23` | Hour (24h), no leading zero |
+| `%I` | `01-12` | Hour (12h), 2 digits |
+| `%-I` | `1-12` | Hour (12h), no leading zero |
+| `%M` | `00-59` | Minute, 2 digits |
+| `%-M` | `0-59` | Minute, no leading zero |
+| `%S` | `00-59` | Second, 2 digits |
+| `%-S` | `0-59` | Second, no leading zero |
+| `%3f` | `000-999` | Milliseconds |
+| `%a` | `Sun-Sat` or `Dim-Sam` | Short weekday name (localized) |
+| `%A` | `Sunday-Saturday` or `Dimanche-Samedi` | Full weekday name (localized) |
+| `%b` | `Jan-Dec` or `Jan-Dec` | Abbreviated month name (localized) |
+| `%B` | `January-December` or `Janvier-Decembre` | Full month name (localized) |
+| `%w` | `0-6` | Day of week, Sunday = 0 |
+| `%:z` | `+05:00` | UTC offset, ±HH:mm |
+| `%z` | `+0500` | UTC offset, ±HHmm |
 
 > Events are only emitted once labels are fully resolved from FIG 1. No partial/label-less events are written.
 
