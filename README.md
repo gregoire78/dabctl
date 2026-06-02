@@ -27,7 +27,7 @@ sudo apt update && sudo apt install -y libfdk-aac-dev
 cargo build --release
 
 # 3. Decode an ETI file — service NRJ (SID 0xF2F8)
-./target/release/dabctl dablin one-service-out -i multiplex.eti -s 0xF2F8 \
+./target/release/dabctl eti-reader one-service-out -i multiplex.eti -s 0xF2F8 \
   | ffplay -f s16le -ar 48000 -ac 2 -nodisp -i -
 ```
 
@@ -79,7 +79,7 @@ A ready-to-use devcontainer is provided for VS Code and GitHub Codespaces (`.dev
 ## CLI reference
 
 ```
-dabctl dablin <subcommand> [options]
+dabctl eti-reader <subcommand> [options]
 ```
 
 ### Subcommands
@@ -224,7 +224,7 @@ Escaping literals:
 ```bash
 # Decode an ETI file → WAV
 exec 3>pad_metadata.json
-./target/release/dabctl dablin one-service-out \
+./target/release/dabctl eti-reader one-service-out \
   -i multiplex.eti -s 0xF2F8 \
   --slide-dir ./slides \
   --slide-base64 \
@@ -232,19 +232,19 @@ exec 3>pad_metadata.json
 
 # Decode from stdin
 cat multiplex.eti \
-| ./target/release/dabctl dablin one-service-out -i - -s 0xF2F8 \
+| ./target/release/dabctl eti-reader one-service-out -i - -s 0xF2F8 \
 | ffplay -f s16le -ar 48000 -ac 2 -nodisp -i -
 
 # List services in an ensemble
-./target/release/dabctl dablin list-services -i multiplex.eti
+./target/release/dabctl eti-reader list-services -i multiplex.eti
 
 # Select service by label
-./target/release/dabctl dablin one-service-out -i multiplex.eti -l "NRJ" \
+./target/release/dabctl eti-reader one-service-out -i multiplex.eti -l "NRJ" \
 | ffplay -f s16le -ar 48000 -ac 2 -nodisp -i -
 
 # FDK-AAC backend + silence gap fill + slideshow
 exec 3>pad_metadata.json
-./target/release/dabctl dablin one-service-out \
+./target/release/dabctl eti-reader one-service-out \
   -i multiplex.eti -s 0xF2F8 \
   --aac-decoder fdk \
   --aac-gap silence \
@@ -254,7 +254,7 @@ exec 3>pad_metadata.json
 | aplay -f S16_LE -r 48000 -c 2
 
 # Export all DAB+ services from the ETI into one directory tree
-./target/release/dabctl dablin all-services-out \
+./target/release/dabctl eti-reader all-services-out \
   -i multiplex.eti \
   --out ./all-services \
   --slide-base64

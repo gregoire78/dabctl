@@ -12,15 +12,15 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Commands {
     /// Decode an ETI stream (DAB/DAB+)
-    Dablin {
+    EtiReader {
         #[command(subcommand)]
-        command: DablinCommand,
+        command: EtiReaderCommand,
     },
 }
 
-/// Subcommands for `dabctl dablin`
+/// Subcommands for `dabctl eti-reader`
 #[derive(Subcommand, Debug)]
-pub enum DablinCommand {
+pub enum EtiReaderCommand {
     /// Decode one DAB/DAB+ service to stdout PCM
     OneServiceOut(OneServiceOutArgs),
     /// Export all DAB+ services into per-service directories
@@ -29,7 +29,7 @@ pub enum DablinCommand {
     ListServices(ListServicesArgs),
 }
 
-/// Arguments for `dabctl dablin one-service-out`
+/// Arguments for `dabctl eti-reader one-service-out`
 #[derive(Parser, Debug)]
 pub struct OneServiceOutArgs {
     /// ETI input file or stdin (use `-` for stdin)
@@ -76,7 +76,7 @@ pub struct OneServiceOutArgs {
     pub datetime_format: Option<DateTimeFormat>,
 }
 
-/// Arguments for `dabctl dablin all-services-out`
+/// Arguments for `dabctl eti-reader all-services-out`
 #[derive(Parser, Debug)]
 pub struct AllServicesOutArgs {
     /// ETI input file or stdin (use `-` for stdin)
@@ -115,7 +115,7 @@ pub struct AllServicesOutArgs {
     pub datetime_format: Option<DateTimeFormat>,
 }
 
-/// Arguments for `dabctl dablin list-services`
+/// Arguments for `dabctl eti-reader list-services`
 #[derive(Parser, Debug)]
 pub struct ListServicesArgs {
     /// ETI input file or stdin (use `-` for stdin)
@@ -185,10 +185,10 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn test_parse_dablin_basic() {
+    fn test_parse_eti_reader_basic() {
         let cli = Cli::try_parse_from([
             "dabctl",
-            "dablin",
+            "eti-reader",
             "one-service-out",
             "-i",
             "test.eti",
@@ -197,8 +197,8 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Commands::Dablin {
-                command: DablinCommand::OneServiceOut(args),
+            Commands::EtiReader {
+                command: EtiReaderCommand::OneServiceOut(args),
             } => {
                 assert_eq!(args.input, "test.eti");
                 assert_eq!(args.sid, Some("0xF2F8".to_string()));
@@ -211,10 +211,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_dablin_silence_gap() {
+    fn test_parse_eti_reader_silence_gap() {
         let cli = Cli::try_parse_from([
             "dabctl",
-            "dablin",
+            "eti-reader",
             "one-service-out",
             "-i",
             "-",
@@ -226,8 +226,8 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Commands::Dablin {
-                command: DablinCommand::OneServiceOut(args),
+            Commands::EtiReader {
+                command: EtiReaderCommand::OneServiceOut(args),
             } => {
                 assert_eq!(args.input, "-");
                 assert_eq!(args.aac_gap, AacGap::Silence);
@@ -239,12 +239,12 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_dablin_list_services() {
+    fn test_parse_eti_reader_list_services() {
         let cli =
-            Cli::try_parse_from(["dabctl", "dablin", "list-services", "-i", "test.eti"]).unwrap();
+            Cli::try_parse_from(["dabctl", "eti-reader", "list-services", "-i", "test.eti"]).unwrap();
         match cli.command {
-            Commands::Dablin {
-                command: DablinCommand::ListServices(args),
+            Commands::EtiReader {
+                command: EtiReaderCommand::ListServices(args),
             } => {
                 assert_eq!(args.input, "test.eti");
             }
@@ -253,10 +253,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_dablin_by_label() {
+    fn test_parse_eti_reader_by_label() {
         let cli = Cli::try_parse_from([
             "dabctl",
-            "dablin",
+            "eti-reader",
             "one-service-out",
             "-i",
             "test.eti",
@@ -265,8 +265,8 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Commands::Dablin {
-                command: DablinCommand::OneServiceOut(args),
+            Commands::EtiReader {
+                command: EtiReaderCommand::OneServiceOut(args),
             } => {
                 assert_eq!(args.label, Some("France Inter".to_string()));
             }
@@ -275,10 +275,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_dablin_all_services_out() {
+    fn test_parse_eti_reader_all_services_out() {
         let cli = Cli::try_parse_from([
             "dabctl",
-            "dablin",
+            "eti-reader",
             "all-services-out",
             "-i",
             "test.eti",
@@ -287,8 +287,8 @@ mod tests {
         ])
         .unwrap();
         match cli.command {
-            Commands::Dablin {
-                command: DablinCommand::AllServicesOut(args),
+            Commands::EtiReader {
+                command: EtiReaderCommand::AllServicesOut(args),
             } => {
                 assert_eq!(args.out_dir, "out".to_string());
                 assert_eq!(args.datetime_format, None);
@@ -298,10 +298,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_dablin_datetime_format_iso8601() {
+    fn test_parse_eti_reader_datetime_format_iso8601() {
         let cli = Cli::try_parse_from([
             "dabctl",
-            "dablin",
+            "eti-reader",
             "one-service-out",
             "-i",
             "test.eti",
@@ -313,8 +313,8 @@ mod tests {
         .unwrap();
 
         match cli.command {
-            Commands::Dablin {
-                command: DablinCommand::OneServiceOut(args),
+            Commands::EtiReader {
+                command: EtiReaderCommand::OneServiceOut(args),
             } => {
                 assert_eq!(args.datetime_format, Some(DateTimeFormat::Iso8601));
             }
@@ -323,10 +323,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_dablin_datetime_format_time_human() {
+    fn test_parse_eti_reader_datetime_format_time_human() {
         let cli = Cli::try_parse_from([
             "dabctl",
-            "dablin",
+            "eti-reader",
             "one-service-out",
             "-i",
             "test.eti",
@@ -338,8 +338,8 @@ mod tests {
         .unwrap();
 
         match cli.command {
-            Commands::Dablin {
-                command: DablinCommand::OneServiceOut(args),
+            Commands::EtiReader {
+                command: EtiReaderCommand::OneServiceOut(args),
             } => {
                 assert_eq!(args.datetime_format, Some(DateTimeFormat::TimeHuman));
             }
@@ -348,10 +348,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_dablin_datetime_format_time_iso8601() {
+    fn test_parse_eti_reader_datetime_format_time_iso8601() {
         let cli = Cli::try_parse_from([
             "dabctl",
-            "dablin",
+            "eti-reader",
             "one-service-out",
             "-i",
             "test.eti",
@@ -363,8 +363,8 @@ mod tests {
         .unwrap();
 
         match cli.command {
-            Commands::Dablin {
-                command: DablinCommand::OneServiceOut(args),
+            Commands::EtiReader {
+                command: EtiReaderCommand::OneServiceOut(args),
             } => {
                 assert_eq!(args.datetime_format, Some(DateTimeFormat::TimeIso8601));
             }
@@ -373,10 +373,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_dablin_datetime_format_no_value_defaults_iso8601() {
+    fn test_parse_eti_reader_datetime_format_no_value_defaults_iso8601() {
         let cli = Cli::try_parse_from([
             "dabctl",
-            "dablin",
+            "eti-reader",
             "one-service-out",
             "-i",
             "test.eti",
@@ -387,8 +387,8 @@ mod tests {
         .unwrap();
 
         match cli.command {
-            Commands::Dablin {
-                command: DablinCommand::OneServiceOut(args),
+            Commands::EtiReader {
+                command: EtiReaderCommand::OneServiceOut(args),
             } => {
                 assert_eq!(args.datetime_format, Some(DateTimeFormat::Iso8601));
             }
@@ -397,10 +397,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_dablin_datetime_format_empty_value_defaults_iso8601() {
+    fn test_parse_eti_reader_datetime_format_empty_value_defaults_iso8601() {
         let cli = Cli::try_parse_from([
             "dabctl",
-            "dablin",
+            "eti-reader",
             "one-service-out",
             "-i",
             "test.eti",
@@ -412,8 +412,8 @@ mod tests {
         .unwrap();
 
         match cli.command {
-            Commands::Dablin {
-                command: DablinCommand::OneServiceOut(args),
+            Commands::EtiReader {
+                command: EtiReaderCommand::OneServiceOut(args),
             } => {
                 assert_eq!(args.datetime_format, Some(DateTimeFormat::Iso8601));
             }
@@ -422,10 +422,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_dablin_rejects_time_only_flag() {
+    fn test_parse_eti_reader_rejects_time_only_flag() {
         let cli = Cli::try_parse_from([
             "dabctl",
-            "dablin",
+            "eti-reader",
             "one-service-out",
             "-i",
             "test.eti",
@@ -437,10 +437,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_dablin_datetime_format_custom_template() {
+    fn test_parse_eti_reader_datetime_format_custom_template() {
         let cli = Cli::try_parse_from([
             "dabctl",
-            "dablin",
+            "eti-reader",
             "one-service-out",
             "-i",
             "test.eti",
@@ -452,8 +452,8 @@ mod tests {
         .unwrap();
 
         match cli.command {
-            Commands::Dablin {
-                command: DablinCommand::OneServiceOut(args),
+            Commands::EtiReader {
+                command: EtiReaderCommand::OneServiceOut(args),
             } => {
                 assert_eq!(
                     args.datetime_format,
@@ -467,10 +467,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_dablin_all_services_out_rejects_sid() {
+    fn test_parse_eti_reader_all_services_out_rejects_sid() {
         let cli = Cli::try_parse_from([
             "dabctl",
-            "dablin",
+            "eti-reader",
             "all-services-out",
             "-i",
             "test.eti",

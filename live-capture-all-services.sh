@@ -1,5 +1,5 @@
 #!/bin/bash
-# Export ETI -> arborescence par service via dabctl dablin.
+# Export ETI -> arborescence par service via dabctl eti-reader.
 #
 # Usage :
 #   ./live-capture-all-services.sh [ETI_FILE]
@@ -44,7 +44,7 @@ echo "[dablin] Sortie=./${OUT_DIR}"
 echo "[dablin] Log=${LOG_FILE}"
 echo "[dablin] Ctrl-C pour arreter"
 
-RUST_LOG=info ../target/release/dabctl dablin all-services-out \
+RUST_LOG=info ../target/release/dabctl eti-reader all-services-out \
   -i "$ETI_FILE" \
   --out "./${OUT_DIR}" \
   --slide-base64 \

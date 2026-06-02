@@ -1,4 +1,4 @@
-//! Main decoding loop for the `dablin` subcommand
+//! Main decoding loop for the `eti-reader` subcommand
 //!
 //! Pipeline:
 //!   ETI source (file / stdin)
@@ -25,7 +25,8 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use crate::cli::{
-    AacDecoder as AacDecoderChoice, AacGap, AllServicesOutArgs, DablinCommand, DateTimeFormat,
+    AacDecoder as AacDecoderChoice, AacGap, AllServicesOutArgs, DateTimeFormat,
+    EtiReaderCommand,
     ListServicesArgs, OneServiceOutArgs,
 };
 use crate::dablin::audio::AacDecoder;
@@ -230,12 +231,12 @@ fn save_slide_file(dir: &Path, name: &str, data: &[u8]) {
     }
 }
 
-/// Entry point for `dabctl dablin …`
-pub fn run(command: DablinCommand) -> Result<()> {
+/// Entry point for `dabctl eti-reader …`
+pub fn run(command: EtiReaderCommand) -> Result<()> {
     match command {
-        DablinCommand::OneServiceOut(args) => run_one_service(args),
-        DablinCommand::AllServicesOut(args) => run_all_services_cmd(args),
-        DablinCommand::ListServices(args) => run_list_services(args),
+        EtiReaderCommand::OneServiceOut(args) => run_one_service(args),
+        EtiReaderCommand::AllServicesOut(args) => run_all_services_cmd(args),
+        EtiReaderCommand::ListServices(args) => run_list_services(args),
     }
 }
 
@@ -1070,7 +1071,7 @@ fn init_aac_decoder(backend: &AacDecoderChoice, gap: &AacGap) -> Option<AacDecod
     }
 }
 
-/// Print the list of discovered services to stderr (for `dablin list-services`).
+/// Print the list of discovered services to stderr (for `eti-reader list-services`).
 fn print_services(fic: &FicDecoder) {
     eprintln!(
         "Ensemble: EId={:#06x} label={}",

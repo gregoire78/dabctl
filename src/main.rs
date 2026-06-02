@@ -8,6 +8,6 @@ use cli::{Cli, Commands};
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Commands::Dablin { command } => dablin::runner::run(command),
+        Commands::EtiReader { command } => dablin::runner::run(command),
     }
 }
