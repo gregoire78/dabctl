@@ -140,7 +140,7 @@ JSONL events are emitted one per line on **file descriptor 3**.
 Open it with a shell redirect: `3>metadata.jsonl`
 
 ```jsonl
-{"ensemble":{"eid":"0xf043","label":"Ile-de-France"}}
+{"ensemble":{"eid":"0xf043","label":"Ile-de-France","shortLabel":"IDF"}}
 {"service":{"sid":"0xf2f8","label":"NRJ"}}
 {"time":{"utc":"2023-02-25, Sat - 12:34:45.321","local":"2023-02-25, Sat - 13:34:45","lto":"+01:00"}}
 {"subchannel":{"id":3,"dabplus":true,"protection":"EEP-3A"}}

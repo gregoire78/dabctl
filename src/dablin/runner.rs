@@ -51,6 +51,7 @@ struct ServiceDumpContext {
     pad_decoder: PadDecoder,
     sf_work_buf: Vec<u8>,
     emitted_ensemble_label: Option<String>,
+    emitted_ensemble_short_label: Option<String>,
     emitted_service_label: Option<String>,
     last_dl: Option<String>,
     last_slide_hash: Option<u64>,
@@ -257,6 +258,7 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
     let mut selected_sid: Option<u32> = None;
     let mut emitted_ensemble_eid: Option<u16> = None;
     let mut emitted_ensemble_label: Option<String> = None;
+    let mut emitted_ensemble_short_label: Option<String> = None;
     let mut emitted_service_sid: Option<u32> = None;
     let mut emitted_service_label: Option<String> = None;
     let mut emitted_time: Option<(String, String, String)> = None;
@@ -392,6 +394,7 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
 
         if let Some(sid) = selected_sid {
             let current_ensemble_label = fic.ensemble.label.clone();
+            let current_ensemble_short_label = fic.ensemble.short_label.clone();
 
             if let Some(svc) = fic.services.iter().find(|s| s.sid == sid) {
                 let current_service_label = svc.label.clone();
@@ -418,13 +421,19 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
 
             if current_ensemble_label.is_some()
                 && (emitted_ensemble_eid != Some(fic.ensemble.eid)
-                    || emitted_ensemble_label != current_ensemble_label)
+                    || emitted_ensemble_label != current_ensemble_label
+                    || emitted_ensemble_short_label != current_ensemble_short_label)
             {
                 if let Some(m) = meta.as_mut() {
-                    m.emit_ensemble(fic.ensemble.eid, current_ensemble_label.as_deref());
+                    m.emit_ensemble(
+                        fic.ensemble.eid,
+                        current_ensemble_label.as_deref(),
+                        current_ensemble_short_label.as_deref(),
+                    );
                 }
                 emitted_ensemble_eid = Some(fic.ensemble.eid);
                 emitted_ensemble_label = current_ensemble_label;
+                emitted_ensemble_short_label = current_ensemble_short_label;
             }
         }
 
@@ -751,11 +760,13 @@ fn run_all_services(
             let mut meta = BufWriter::new(meta_file);
 
             let ensemble_label = fic.ensemble.label.clone();
+            let ensemble_short_label = fic.ensemble.short_label.clone();
             if let Some(l) = ensemble_label.as_deref() {
-                write_jsonl(
-                    &mut meta,
-                    json!({"ensemble": {"eid": format!("{:#06x}", fic.ensemble.eid), "label": l}}),
-                );
+                let mut ensemble = json!({"eid": format!("{:#06x}", fic.ensemble.eid), "label": l});
+                if let Some(s) = ensemble_short_label.as_deref() {
+                    ensemble["shortLabel"] = json!(s);
+                }
+                write_jsonl(&mut meta, json!({"ensemble": ensemble}));
             }
             if let Some(l) = svc.label.as_deref() {
                 write_jsonl(&mut meta, json!({"service": {"sid": sid_hex, "label": l}}));
@@ -788,6 +799,7 @@ fn run_all_services(
                 pad_decoder: PadDecoder::new(),
                 sf_work_buf: Vec::new(),
                 emitted_ensemble_label: ensemble_label,
+                emitted_ensemble_short_label: ensemble_short_label,
                 emitted_service_label: svc.label.clone(),
                 last_dl: None,
                 last_slide_hash: None,
@@ -809,12 +821,20 @@ fn run_all_services(
         // Phase 1 (serial): label sync.
         for ctx in contexts.values_mut() {
             if let Some(current_ensemble_label) = fic.ensemble.label.clone() {
-                if ctx.emitted_ensemble_label.as_deref() != Some(current_ensemble_label.as_str()) {
-                    write_jsonl(
-                        &mut ctx.meta,
-                        json!({"ensemble": {"eid": format!("{:#06x}", fic.ensemble.eid), "label": current_ensemble_label}}),
-                    );
+                let current_ensemble_short_label = fic.ensemble.short_label.clone();
+                if ctx.emitted_ensemble_label.as_deref() != Some(current_ensemble_label.as_str())
+                    || ctx.emitted_ensemble_short_label != current_ensemble_short_label
+                {
+                    let mut ensemble = json!({
+                        "eid": format!("{:#06x}", fic.ensemble.eid),
+                        "label": current_ensemble_label,
+                    });
+                    if let Some(s) = current_ensemble_short_label.as_deref() {
+                        ensemble["shortLabel"] = json!(s);
+                    }
+                    write_jsonl(&mut ctx.meta, json!({"ensemble": ensemble}));
                     ctx.emitted_ensemble_label = Some(current_ensemble_label);
+                    ctx.emitted_ensemble_short_label = current_ensemble_short_label;
                 }
             }
 

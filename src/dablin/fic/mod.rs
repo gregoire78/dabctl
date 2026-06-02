@@ -38,6 +38,7 @@ fn crc16_ccitt(data: &[u8]) -> u16 {
 pub struct EnsembleInfo {
     pub eid: u16,
     pub label: Option<String>,
+    pub short_label: Option<String>,
     pub lto: Option<i8>,
     #[allow(dead_code)]
     pub ecc: u8,
@@ -503,7 +504,16 @@ impl FicDecoder {
         }
         // 2 bytes EId + 16 bytes label + 2 bytes abbreviation mask
         let label_bytes = &data[2..18];
-        self.ensemble.label = decode_dab_label(label_bytes, charset);
+        let label = decode_dab_label(label_bytes, charset);
+        self.ensemble.label = label.clone();
+        self.ensemble.short_label = if data.len() >= 20 {
+            let short_mask = u16::from_be_bytes([data[18], data[19]]);
+            label
+                .as_deref()
+                .and_then(|l| short_label_from_mask(l, short_mask))
+        } else {
+            None
+        };
     }
 
     /// FIG 1/1 or 1/5: Programme service label (SID 16-bit or 32-bit)
@@ -649,6 +659,30 @@ fn decode_dab_label(bytes: &[u8], charset: u8) -> Option<String> {
     } else {
         let (cow, _, _) = WINDOWS_1252.decode(&trimmed);
         Some(cow.into_owned())
+    }
+}
+
+/// Build the DAB short label from a full label and its 16-bit abbreviation mask.
+///
+/// Mask bit 15 maps to character 0, bit 0 maps to character 15.
+fn short_label_from_mask(label: &str, mask: u16) -> Option<String> {
+    if mask == 0 {
+        return None;
+    }
+
+    let mut out = String::new();
+    for (idx, ch) in label.chars().take(16).enumerate() {
+        let bit_index = 15usize.saturating_sub(idx);
+        if (mask & (1u16 << bit_index)) != 0 {
+            out.push(ch);
+        }
+    }
+
+    let out = out.trim();
+    if out.is_empty() {
+        None
+    } else {
+        Some(out.to_string())
     }
 }
 
@@ -803,6 +837,12 @@ mod tests {
         let svc = decoder.services.iter().find(|s| s.sid == 0x0001_2345);
         assert!(svc.is_some());
         assert_eq!(svc.and_then(|s| s.label.clone()).as_deref(), Some("RADIO"));
+    }
+
+    #[test]
+    fn test_short_label_from_mask_msb_first() {
+        let short = short_label_from_mask("METROPOLITAIN 2", 0b1111_0000_0000_0000);
+        assert_eq!(short.as_deref(), Some("METR"));
     }
 
     #[test]

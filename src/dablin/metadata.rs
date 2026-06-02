@@ -44,11 +44,15 @@ impl MetadataEmitter {
     }
 
     /// Emit ensemble information.
-    pub fn emit_ensemble(&mut self, eid: u16, label: Option<&str>) {
-        let v = match label {
-            Some(l) => json!({"ensemble": {"eid": format!("{:#06x}", eid), "label": l}}),
-            None => json!({"ensemble": {"eid": format!("{:#06x}", eid)}}),
-        };
+    pub fn emit_ensemble(&mut self, eid: u16, label: Option<&str>, short_label: Option<&str>) {
+        let mut ensemble = json!({"eid": format!("{:#06x}", eid)});
+        if let Some(l) = label {
+            ensemble["label"] = json!(l);
+        }
+        if let Some(s) = short_label {
+            ensemble["shortLabel"] = json!(s);
+        }
+        let v = json!({"ensemble": ensemble});
         self.emit(v);
     }
 
