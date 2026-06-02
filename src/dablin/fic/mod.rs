@@ -600,8 +600,8 @@ impl FicDecoder {
         let local_dt = apply_lto(utc, lto);
         let lto_str = format_lto(lto);
 
-        // UTC is always emitted in ISO 8601 for stable machine parsing.
-        let utc_str = format_dab_datetime_iso8601(utc, true, Some("Z"), time_only);
+        // UTC is always emitted as a full ISO 8601 date-time for stable machine parsing.
+        let utc_str = format_dab_datetime_iso8601(utc, true, Some("Z"), false);
 
         let local_str = if let Some(pattern) = custom_pattern {
             format_dab_datetime_custom(&local_dt, Some(lto_str.as_str()), pattern)
@@ -921,7 +921,7 @@ mod tests {
             .current_dab_time_metadata(false, true, None)
             .expect("time metadata");
         assert_eq!(lto, "+01:00");
-        assert_eq!(utc, "12:34:45.321Z");
+        assert_eq!(utc, "2023-02-25T12:34:45.321Z");
         assert_eq!(local, "13:34:45");
     }
 
@@ -940,5 +940,27 @@ mod tests {
         assert_eq!(lto, "+01:00");
         assert_eq!(utc, "2023-02-25T12:34:45.321Z");
         assert_eq!(local, "YYYYescape 2023-02-25T13:34:45+01:00Z");
+    }
+
+    #[test]
+    fn test_parse_fig0_9_and_fig0_10_time_metadata_utc_is_stable_across_options() {
+        let fig_lto = [0x04u8, 0x09, 0x02, 0xe0, 0x01];
+        let fig_time = [0x07u8, 0x0a, 0x3a, 0x98, 0x0b, 0x22, 0xb5, 0x41];
+
+        let mut decoder = FicDecoder::new();
+        decoder.process_fic(&make_fib(&fig_lto));
+        decoder.process_fic(&make_fib(&fig_time));
+
+        let utc_time_only = decoder
+            .current_dab_time_metadata(false, true, None)
+            .expect("time metadata")
+            .0;
+        let utc_custom = decoder
+            .current_dab_time_metadata(false, false, Some("%H:%M"))
+            .expect("time metadata")
+            .0;
+
+        assert_eq!(utc_time_only, "2023-02-25T12:34:45.321Z");
+        assert_eq!(utc_custom, "2023-02-25T12:34:45.321Z");
     }
 }

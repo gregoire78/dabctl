@@ -317,7 +317,7 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
             let mnsc_changed = frame.mnsc != last_mnsc;
             last_mnsc = frame.mnsc;
 
-            if !fic_stable || mnsc_changed {
+            if !fic_stable || mnsc_changed || datetime_mode.is_some() {
                 if mnsc_changed && fic_stable {
                     info!("MNSC changed ({:#06x}), re-parsing FIC", frame.mnsc);
                 }

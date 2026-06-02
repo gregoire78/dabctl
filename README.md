@@ -165,22 +165,18 @@ Audio/profile notes:
 
 When enabled, `time` event format is configurable with `--datetime-format`:
 
-- `utc` is always emitted in ISO 8601 (`...Z`) for stable machine parsing.
+- `utc` is always emitted as a full ISO 8601 date-time (`YYYY-MM-DDTHH:MM[:SS[.mmm]]Z`), regardless of the selected preset or custom template.
 - `local` follows the selected preset or custom template.
 
 - `human`: human-readable display format (weekday language follows system locale)
-  - `utc`: `YYYY-MM-DDTHH:MM[:SS[.mmm]]Z`
   - `local`: `YYYY-MM-DD, Ddd - HH:MM[:SS]`
   - `lto`: `+/-HH:MM`
 - `iso8601` (default when `--datetime-format` has no value): machine-friendly format
-  - `utc`: `YYYY-MM-DDTHH:MM[:SS[.mmm]]Z`
   - `local`: `YYYY-MM-DDTHH:MM[:SS][+/-HH:MM]`
   - `lto`: `+/-HH:MM`
 - `time-human`: human-readable time-only format
-  - `utc`: `HH:MM[:SS[.mmm]]Z`
   - `local`: `HH:MM[:SS]`
 - `time-iso8601`: ISO 8601 time-only format
-  - `utc`: `HH:MM[:SS[.mmm]]Z`
   - `local`: `HH:MM[:SS][+/-HH:MM]`
 
 You can also pass a custom template directly to `--datetime-format`.

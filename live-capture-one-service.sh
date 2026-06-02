@@ -10,7 +10,7 @@
 set -e
 
 ETI_FILE="${1:-multiplex.eti}"
-SID="${2:-0xF2F8}"
+SID="${2:-0xF201}"
 
 RUN_TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 LOG_FILE="dablin-${RUN_TIMESTAMP}.log"
@@ -60,6 +60,7 @@ sudo sh -c '
     --aac-decoder fdk \
     --aac-gap silence \
     --dedup-pad \
+    --datetime-format time-iso8601 \
   2>"$LOG_FILE" \
 | ffmpeg -y \
     -f s16le -ar 48000 -ac 2 \

@@ -56,7 +56,7 @@ LC_TIME="${DATETIME_LOCALE}" RUST_LOG=info ../target/release/dabctl dablin all-s
   --aac-decoder fdk \
   --aac-gap silence \
   --dedup-pad \
-  --datetime-format human \
+  --datetime-format time-iso8601 \
   2>"$LOG_FILE"
 
 echo
