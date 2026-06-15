@@ -2,7 +2,7 @@
 
 # dabctl
 
-ETI → PCM/LOAS audio pipeline for DAB/DAB+ radio, written in Rust.
+ETI → PCM/ADTS audio pipeline for DAB/DAB+ radio, written in Rust.
 
 Adapted from [gregoire78/dablin](https://github.com/gregoire78/dablin) — integrated as a strict CLI subcommand.
 
@@ -34,7 +34,7 @@ cargo build --release
 Audio output on **stdout** is configurable:
 
 - `--audio-out pcm` (default): raw signed 16-bit PCM, stereo, 48 kHz
-- `--audio-out loas`: raw AAC in LOAS/LATM (no faad2/fdk decode path)
+- `--audio-out adts`: raw AAC in ADTS (no faad2/fdk decode path)
 
 ---
 
@@ -89,7 +89,7 @@ dabctl dablin <subcommand> [options]
 
 | Subcommand | Purpose |
 |---|---|
-| `one-service-out` | Decode one service to stdout (`pcm` or `loas`) |
+| `one-service-out` | Decode one service to stdout (`pcm` or `adts`) |
 | `all-services-out` | Export all DAB+ services to a directory tree |
 | `list-services` | List ensemble services then exit |
 
@@ -100,8 +100,7 @@ dabctl dablin <subcommand> [options]
 | `--input` | `-i` | ETI input file or `-` for stdin | required |
 | `--sid` | `-s` | Service ID in hex (e.g. `0xF2F8`) | — |
 | `--label` | `-l` | Select service by label instead of SID | — |
-| `--audio-out` | | Stdout format: `pcm` or `loas` | `pcm` |
-| `--loas-gap` | | LOAS gap behavior: `drop` or `repeat-last` | `drop` |
+| `--audio-out` | | Stdout format: `pcm` or `adts` | `pcm` |
 | `--aac-decoder` | | AAC backend: `faad2` or `fdk` (requires `fdk-aac` feature) | `faad2` |
 | `--aac-gap` | | Behavior on missing/invalid AAC frames: `freeze` or `silence` | `freeze` |
 | `--slide-dir` | | Save MOT slideshow images to this directory | — |
@@ -113,16 +112,13 @@ dabctl dablin <subcommand> [options]
 Notes:
 
 - `--aac-decoder` and `--aac-gap` apply only when `--audio-out pcm`.
-- With `--audio-out loas`, AAC is not decoded to PCM; AUs are emitted as LOAS/LATM.
-- `--loas-gap` applies only when `--audio-out loas`:
-  - `drop` (default): drop missing/corrupted segments.
-  - `repeat-last`: re-emit the last valid AU as best-effort continuity.
+- With `--audio-out adts`, AAC is not decoded to PCM; AUs are emitted as ADTS.
 
-### LOAS output example
+### ADTS output example
 
 ```bash
-./target/release/dabctl dablin one-service-out -i multiplex.eti -s 0xF2F8 --audio-out loas \
-  | ffmpeg -f latm -i - -c copy out.latm
+./target/release/dabctl dablin one-service-out -i multiplex.eti -s 0xF2F8 --audio-out adts \
+  | ffmpeg -i - -c copy out.aac
 ```
 
 ### `all-services-out` options

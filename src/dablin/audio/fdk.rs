@@ -44,7 +44,7 @@ struct FdkStreamInfo {
     _padding: [u8; 512],
 }
 
-/// Transport type: RAW AAC access units (no ADTS/LOAS headers).
+/// Transport type: RAW AAC access units (no ADTS headers).
 const TT_MP4_RAW: c_int = 0;
 /// Maximum output buffer size (2048 samples × 8 channels × 2 bytes)
 const MAX_BUF_SAMPLES: usize = 2048 * 8;

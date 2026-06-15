@@ -3,9 +3,9 @@
 //! Wraps faad2 (default) or fdk-aac (feature-gated) and applies
 //! the AAC gap policy (`freeze` or `silence`).
 
+pub mod adts;
 pub mod asc;
 pub mod faad2;
-pub mod loas;
 
 #[cfg(feature = "fdk-aac")]
 pub mod fdk;

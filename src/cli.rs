@@ -52,10 +52,6 @@ pub struct OneServiceOutArgs {
     #[arg(long = "audio-out", default_value = "pcm")]
     pub audio_out: AudioOut,
 
-    /// Behavior on LOAS output gaps
-    #[arg(long = "loas-gap", default_value = "drop")]
-    pub loas_gap: LoasGap,
-
     /// Behavior on missing/invalid AAC frames
     #[arg(long = "aac-gap", default_value = "freeze")]
     pub aac_gap: AacGap,
@@ -148,17 +144,8 @@ pub enum AacDecoder {
 pub enum AudioOut {
     /// Raw PCM (s16le, 48 kHz, stereo)
     Pcm,
-    /// Raw AAC wrapped as LOAS/LATM
-    Loas,
-}
-
-/// Behavior on missing/corrupted data when output is LOAS
-#[derive(Debug, Clone, ValueEnum, PartialEq)]
-pub enum LoasGap {
-    /// Drop gap segments (default)
-    Drop,
-    /// Repeat last valid AU as best-effort continuity
-    RepeatLast,
+    /// Raw AAC wrapped as ADTS (Audio Data Transport Stream)
+    Adts,
 }
 
 /// Behavior on missing/invalid AAC frames
@@ -302,7 +289,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_dablin_loas_output() {
+    fn test_parse_dablin_adts_output() {
         let cli = Cli::try_parse_from([
             "dabctl",
             "dablin",
@@ -312,7 +299,7 @@ mod tests {
             "-s",
             "0xF2F8",
             "--audio-out",
-            "loas",
+            "adts",
         ])
         .unwrap();
 
@@ -320,36 +307,7 @@ mod tests {
             Commands::Dablin {
                 command: DablinCommand::OneServiceOut(args),
             } => {
-                assert_eq!(args.audio_out, AudioOut::Loas);
-                assert_eq!(args.loas_gap, LoasGap::Drop);
-            }
-            _ => panic!("unexpected command"),
-        }
-    }
-
-    #[test]
-    fn test_parse_dablin_loas_repeat_last() {
-        let cli = Cli::try_parse_from([
-            "dabctl",
-            "dablin",
-            "one-service-out",
-            "-i",
-            "test.eti",
-            "-s",
-            "0xF2F8",
-            "--audio-out",
-            "loas",
-            "--loas-gap",
-            "repeat-last",
-        ])
-        .unwrap();
-
-        match cli.command {
-            Commands::Dablin {
-                command: DablinCommand::OneServiceOut(args),
-            } => {
-                assert_eq!(args.audio_out, AudioOut::Loas);
-                assert_eq!(args.loas_gap, LoasGap::RepeatLast);
+                assert_eq!(args.audio_out, AudioOut::Adts);
             }
             _ => panic!("unexpected command"),
         }

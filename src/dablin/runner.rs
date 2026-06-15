@@ -7,8 +7,8 @@
 //!     → MSC sub-channel extractor
 //!     → DAB+ super frame assembler
 //!     → Reed-Solomon + FireCode
-//!     → AAC decoder (faad2 or fdk-aac) OR LOAS/LATM packetizer
-//!     → stdout (raw PCM s16le 48 kHz stereo OR raw LOAS/LATM)
+//!     → AAC decoder (faad2 or fdk-aac) OR ADTS framing
+//!     → stdout (raw PCM s16le 48 kHz stereo OR raw AAC ADTS)
 //!     → FD 3  (JSONL metadata)
 
 use anyhow::{Context, Result};
@@ -26,9 +26,8 @@ use tracing::{debug, info, warn};
 
 use crate::cli::{
     AacDecoder as AacDecoderChoice, AacGap, AllServicesOutArgs, AudioOut, DablinCommand,
-    DateTimeFormat, ListServicesArgs, LoasGap, OneServiceOutArgs,
+    DateTimeFormat, ListServicesArgs, OneServiceOutArgs,
 };
-use crate::dablin::audio::loas::LoasPacketizer;
 use crate::dablin::audio::AacDecoder;
 use crate::dablin::dabplus::{process_superframe_inplace, SuperframeFormat};
 use crate::dablin::eti::{parse_frame, FsyncState, ETI_FRAME_SIZE};
@@ -224,42 +223,6 @@ fn should_emit_slide_metadata(slide_dir: Option<&Path>, slide_base64: bool) -> b
     slide_dir.is_some() || slide_base64
 }
 
-fn maybe_emit_loas_repeat_last(
-    out: &mut dyn Write,
-    loas: Option<&mut LoasPacketizer>,
-    loas_gap: &LoasGap,
-    last_format: Option<&SuperframeFormat>,
-    last_au: Option<&[u8]>,
-    repeats: usize,
-) -> Result<()> {
-    if *loas_gap != LoasGap::RepeatLast || repeats == 0 {
-        return Ok(());
-    }
-    let Some(loas_out) = loas else {
-        return Ok(());
-    };
-    let Some(fmt) = last_format else {
-        return Ok(());
-    };
-    let Some(au) = last_au else {
-        return Ok(());
-    };
-
-    for _ in 0..repeats {
-        let Some(packet) = loas_out.packetize_au(fmt, au) else {
-            continue;
-        };
-        if let Err(e) = out.write_all(&packet) {
-            if e.kind() == io::ErrorKind::BrokenPipe {
-                return Ok(());
-            }
-            return Err(e).context("LOAS write error");
-        }
-    }
-
-    Ok(())
-}
-
 /// Save a slide file to disk, logging a warning on failure.
 fn save_slide_file(dir: &Path, name: &str, data: &[u8]) {
     let path = dir.join(name);
@@ -279,10 +242,10 @@ pub fn run(command: DablinCommand) -> Result<()> {
 
 fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
     init_logger(args.silent);
-    if args.audio_out == AudioOut::Loas
+    if args.audio_out == AudioOut::Adts
         && (args.aac_decoder != AacDecoderChoice::Faad2 || args.aac_gap != AacGap::Freeze)
     {
-        warn!("--aac-decoder/--aac-gap are ignored when --audio-out=loas");
+        warn!("--aac-decoder/--aac-gap are ignored when --audio-out=adts");
     }
     let running = setup_ctrlc();
     let mut reader = open_eti_reader(&args.input)?;
@@ -321,9 +284,6 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
         });
 
     let mut aac: Option<AacDecoder> = None;
-    let mut loas: Option<LoasPacketizer> = None;
-    let mut last_loas_au: Option<Vec<u8>> = None;
-    let mut last_loas_format: Option<SuperframeFormat> = None;
     let mut subch_buf: Option<SubchannelBuffer> = None;
     let mut pad_decoder = PadDecoder::new();
     let mut fsync_state = FsyncState::new();
@@ -436,8 +396,8 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
                         AudioOut::Pcm => {
                             aac = init_aac_decoder(&args.aac_decoder, &args.aac_gap);
                         }
-                        AudioOut::Loas => {
-                            loas = Some(LoasPacketizer::new());
+                        AudioOut::Adts => {
+                            // No initialization needed for ADTS - just wrap AUs
                         }
                     }
                 }
@@ -547,14 +507,6 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
                         }
                     }
                 }
-                maybe_emit_loas_repeat_last(
-                    &mut out,
-                    loas.as_mut(),
-                    &args.loas_gap,
-                    last_loas_format.as_ref(),
-                    last_loas_au.as_deref(),
-                    1,
-                )?;
                 buf.advance_one_cif();
                 continue;
             }
@@ -578,14 +530,6 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
                         }
                     }
                 }
-                maybe_emit_loas_repeat_last(
-                    &mut out,
-                    loas.as_mut(),
-                    &args.loas_gap,
-                    last_loas_format.as_ref(),
-                    last_loas_au.as_deref(),
-                    5,
-                )?;
                 buf.consume_superframe();
                 continue;
             }
@@ -617,9 +561,6 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
             }
 
             let current_format = result.format.clone();
-            if args.audio_out == AudioOut::Loas {
-                last_loas_format = current_format.clone();
-            }
             for au in result.units {
                 if let Some(scid) = selected_scid {
                     let mot_app_type = selected_sid
@@ -685,23 +626,18 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
                             }
                         }
                     }
-                    AudioOut::Loas => {
+                    AudioOut::Adts => {
+                        use crate::dablin::audio::adts::wrap_au_in_adts;
                         let Some(fmt) = current_format.as_ref() else {
                             continue;
                         };
-                        let loas_out = match loas.as_mut() {
-                            Some(l) => l,
-                            None => continue,
-                        };
-                        if let Some(packet) = loas_out.packetize_au(fmt, &au.data) {
-                            if let Err(e) = out.write_all(&packet) {
-                                if e.kind() == io::ErrorKind::BrokenPipe {
-                                    info!("stdout closed, exiting");
-                                    return Ok(());
-                                }
-                                return Err(e).context("LOAS write error");
+                        let adts_frame = wrap_au_in_adts(fmt, &au.data);
+                        if let Err(e) = out.write_all(&adts_frame) {
+                            if e.kind() == io::ErrorKind::BrokenPipe {
+                                info!("stdout closed, exiting");
+                                return Ok(());
                             }
-                            last_loas_au = Some(au.data.clone());
+                            return Err(e).context("ADTS write error");
                         }
                     }
                 }
@@ -1225,12 +1161,9 @@ fn print_services(fic: &FicDecoder) {
 mod tests {
     use super::{
         audio_codec_label, audio_mode_label, current_subchannel_protection, encode_slide_base64,
-        hash_bytes, maybe_emit_loas_repeat_last, protection_label, save_slide_file,
+        hash_bytes, protection_label, save_slide_file,
         service_dir_name, should_emit_slide_metadata,
     };
-    use crate::cli::LoasGap;
-    use crate::dablin::audio::loas::LoasPacketizer;
-    use crate::dablin::dabplus::SuperframeFormat;
     use std::path::Path;
 
     #[test]
@@ -1343,57 +1276,6 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    #[test]
-    fn loas_repeat_last_drop_emits_nothing() {
-        let mut out = Vec::new();
-        let mut loas = LoasPacketizer::new();
-        let fmt = SuperframeFormat {
-            dac_rate: true,
-            sbr_flag: true,
-            aac_channel_mode: true,
-            ps_flag: false,
-            mpeg_surround_config: 0,
-        };
-        let _ = loas.packetize_au(&fmt, &[0x11, 0x22]).unwrap();
-
-        maybe_emit_loas_repeat_last(
-            &mut out,
-            Some(&mut loas),
-            &LoasGap::Drop,
-            Some(&fmt),
-            Some(&[0x11, 0x22]),
-            1,
-        )
-        .unwrap();
-
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn loas_repeat_last_emits_packets() {
-        let mut out = Vec::new();
-        let mut loas = LoasPacketizer::new();
-        let fmt = SuperframeFormat {
-            dac_rate: true,
-            sbr_flag: true,
-            aac_channel_mode: true,
-            ps_flag: false,
-            mpeg_surround_config: 0,
-        };
-        let _ = loas.packetize_au(&fmt, &[0x11, 0x22]).unwrap();
-
-        maybe_emit_loas_repeat_last(
-            &mut out,
-            Some(&mut loas),
-            &LoasGap::RepeatLast,
-            Some(&fmt),
-            Some(&[0x11, 0x22]),
-            2,
-        )
-        .unwrap();
-
-        assert!(!out.is_empty());
-    }
 }
 
 // Note: Integration tests for the full decoding pipeline (ETI → PCM)
