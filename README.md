@@ -2,7 +2,7 @@
 
 # dabctl
 
-ETI → PCM audio pipeline for DAB/DAB+ radio, written in Rust.
+ETI → PCM/LOAS audio pipeline for DAB/DAB+ radio, written in Rust.
 
 Adapted from [gregoire78/dablin](https://github.com/gregoire78/dablin) — integrated as a strict CLI subcommand.
 
@@ -31,7 +31,10 @@ cargo build --release
   | ffplay -f s16le -ar 48000 -ac 2 -nodisp -i -
 ```
 
-Audio output is raw signed 16-bit PCM, stereo, 48 kHz on **stdout**.
+Audio output on **stdout** is configurable:
+
+- `--audio-out pcm` (default): raw signed 16-bit PCM, stereo, 48 kHz
+- `--audio-out loas`: raw AAC in LOAS/LATM (no faad2/fdk decode path)
 
 ---
 
@@ -86,7 +89,7 @@ dabctl dablin <subcommand> [options]
 
 | Subcommand | Purpose |
 |---|---|
-| `one-service-out` | Decode one service to stdout PCM |
+| `one-service-out` | Decode one service to stdout (`pcm` or `loas`) |
 | `all-services-out` | Export all DAB+ services to a directory tree |
 | `list-services` | List ensemble services then exit |
 
@@ -97,6 +100,8 @@ dabctl dablin <subcommand> [options]
 | `--input` | `-i` | ETI input file or `-` for stdin | required |
 | `--sid` | `-s` | Service ID in hex (e.g. `0xF2F8`) | — |
 | `--label` | `-l` | Select service by label instead of SID | — |
+| `--audio-out` | | Stdout format: `pcm` or `loas` | `pcm` |
+| `--loas-gap` | | LOAS gap behavior: `drop` or `repeat-last` | `drop` |
 | `--aac-decoder` | | AAC backend: `faad2` or `fdk` (requires `fdk-aac` feature) | `faad2` |
 | `--aac-gap` | | Behavior on missing/invalid AAC frames: `freeze` or `silence` | `freeze` |
 | `--slide-dir` | | Save MOT slideshow images to this directory | — |
@@ -104,6 +109,21 @@ dabctl dablin <subcommand> [options]
 | `--dedup-pad` | | Suppress consecutive identical PAD events (DL and slides) in JSONL output | off |
 | `--datetime-format` | | Date/time format for `time` metadata events: preset (`human`, `iso8601`, `time-human`, `time-iso8601`) or custom chrono template | off (no `time` event) |
 | `--silent` | | No log output on stderr | off |
+
+Notes:
+
+- `--aac-decoder` and `--aac-gap` apply only when `--audio-out pcm`.
+- With `--audio-out loas`, AAC is not decoded to PCM; AUs are emitted as LOAS/LATM.
+- `--loas-gap` applies only when `--audio-out loas`:
+  - `drop` (default): drop missing/corrupted segments.
+  - `repeat-last`: re-emit the last valid AU as best-effort continuity.
+
+### LOAS output example
+
+```bash
+./target/release/dabctl dablin one-service-out -i multiplex.eti -s 0xF2F8 --audio-out loas \
+  | ffmpeg -f latm -i - -c copy out.latm
+```
 
 ### `all-services-out` options
 

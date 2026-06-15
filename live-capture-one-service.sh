@@ -60,7 +60,7 @@ sudo sh -c '
     --aac-decoder fdk \
     --aac-gap silence \
     --dedup-pad \
-    --datetime-format time-iso8601 \
+    --datetime-format %H:%M:%S.%3f \
   2>"$LOG_FILE" \
 | ffmpeg -y \
     -f s16le -ar 48000 -ac 2 \

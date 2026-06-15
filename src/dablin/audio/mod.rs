@@ -3,13 +3,15 @@
 //! Wraps faad2 (default) or fdk-aac (feature-gated) and applies
 //! the AAC gap policy (`freeze` or `silence`).
 
+pub mod asc;
 pub mod faad2;
+pub mod loas;
 
 #[cfg(feature = "fdk-aac")]
 pub mod fdk;
 
 use crate::cli::AacGap;
-use crate::dablin::audio::faad2::build_asc;
+use crate::dablin::audio::asc::build_asc;
 use crate::dablin::dabplus::{AudioUnit, SuperframeFormat};
 
 /// Number of samples per AAC frame per channel (standard AAC-LC / HE-AAC).

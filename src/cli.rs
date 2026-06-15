@@ -48,6 +48,14 @@ pub struct OneServiceOutArgs {
     #[arg(long = "aac-decoder", default_value = "faad2")]
     pub aac_decoder: AacDecoder,
 
+    /// Audio output format on stdout
+    #[arg(long = "audio-out", default_value = "pcm")]
+    pub audio_out: AudioOut,
+
+    /// Behavior on LOAS output gaps
+    #[arg(long = "loas-gap", default_value = "drop")]
+    pub loas_gap: LoasGap,
+
     /// Behavior on missing/invalid AAC frames
     #[arg(long = "aac-gap", default_value = "freeze")]
     pub aac_gap: AacGap,
@@ -135,6 +143,24 @@ pub enum AacDecoder {
     Fdk,
 }
 
+/// Audio output format for one-service-out
+#[derive(Debug, Clone, ValueEnum, PartialEq)]
+pub enum AudioOut {
+    /// Raw PCM (s16le, 48 kHz, stereo)
+    Pcm,
+    /// Raw AAC wrapped as LOAS/LATM
+    Loas,
+}
+
+/// Behavior on missing/corrupted data when output is LOAS
+#[derive(Debug, Clone, ValueEnum, PartialEq)]
+pub enum LoasGap {
+    /// Drop gap segments (default)
+    Drop,
+    /// Repeat last valid AU as best-effort continuity
+    RepeatLast,
+}
+
 /// Behavior on missing/invalid AAC frames
 #[derive(Debug, Clone, ValueEnum, PartialEq)]
 pub enum AacGap {
@@ -204,6 +230,7 @@ mod tests {
                 assert_eq!(args.sid, Some("0xF2F8".to_string()));
                 assert!(!args.silent);
                 assert_eq!(args.aac_gap, AacGap::Freeze);
+                assert_eq!(args.audio_out, AudioOut::Pcm);
                 assert_eq!(args.datetime_format, None);
             }
             _ => panic!("unexpected command"),
@@ -269,6 +296,60 @@ mod tests {
                 command: DablinCommand::OneServiceOut(args),
             } => {
                 assert_eq!(args.label, Some("France Inter".to_string()));
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_dablin_loas_output() {
+        let cli = Cli::try_parse_from([
+            "dabctl",
+            "dablin",
+            "one-service-out",
+            "-i",
+            "test.eti",
+            "-s",
+            "0xF2F8",
+            "--audio-out",
+            "loas",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Dablin {
+                command: DablinCommand::OneServiceOut(args),
+            } => {
+                assert_eq!(args.audio_out, AudioOut::Loas);
+                assert_eq!(args.loas_gap, LoasGap::Drop);
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_dablin_loas_repeat_last() {
+        let cli = Cli::try_parse_from([
+            "dabctl",
+            "dablin",
+            "one-service-out",
+            "-i",
+            "test.eti",
+            "-s",
+            "0xF2F8",
+            "--audio-out",
+            "loas",
+            "--loas-gap",
+            "repeat-last",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Dablin {
+                command: DablinCommand::OneServiceOut(args),
+            } => {
+                assert_eq!(args.audio_out, AudioOut::Loas);
+                assert_eq!(args.loas_gap, LoasGap::RepeatLast);
             }
             _ => panic!("unexpected command"),
         }
