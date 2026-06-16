@@ -29,6 +29,7 @@ use crate::cli::{
     DateTimeFormat, ListServicesArgs, OneServiceOutArgs,
 };
 use crate::dablin::audio::AacDecoder;
+use crate::dablin::audio::latm::LatmPacker;
 use crate::dablin::dabplus::{process_superframe_inplace, SuperframeFormat};
 use crate::dablin::eti::{parse_frame, FsyncState, ETI_FRAME_SIZE};
 use crate::dablin::fic::{FicDecoder, ProtectionProfile, ServiceInfo};
@@ -284,6 +285,7 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
         });
 
     let mut aac: Option<AacDecoder> = None;
+    let mut latm_packer = LatmPacker::new();
     let mut subch_buf: Option<SubchannelBuffer> = None;
     let mut pad_decoder = PadDecoder::new();
     let mut fsync_state = FsyncState::new();
@@ -641,12 +643,11 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
                         }
                     }
                     AudioOut::Latm => {
-                        use crate::dablin::audio::latm::wrap_au_in_latm;
                         let Some(fmt) = current_format.as_ref() else {
                             continue;
                         };
-                        let latm_packet = wrap_au_in_latm(fmt, &au.data);
-                        if let Err(e) = out.write_all(&latm_packet) {
+                        let latm_packet = latm_packer.wrap(fmt, &au.data);
+                        if let Err(e) = out.write_all(latm_packet) {
                             if e.kind() == io::ErrorKind::BrokenPipe {
                                 info!("stdout closed, exiting");
                                 return Ok(());
