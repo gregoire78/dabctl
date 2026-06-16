@@ -6,6 +6,7 @@
 pub mod adts;
 pub mod asc;
 pub mod faad2;
+pub mod latm;
 
 #[cfg(feature = "fdk-aac")]
 pub mod fdk;

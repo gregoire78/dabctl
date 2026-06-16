@@ -7,8 +7,8 @@
 //!     → MSC sub-channel extractor
 //!     → DAB+ super frame assembler
 //!     → Reed-Solomon + FireCode
-//!     → AAC decoder (faad2 or fdk-aac) OR ADTS framing
-//!     → stdout (raw PCM s16le 48 kHz stereo OR raw AAC ADTS)
+//!     → AAC decoder (faad2 or fdk-aac) OR AAC framing (ADTS/LATM)
+//!     → stdout (raw PCM s16le 48 kHz stereo OR raw AAC ADTS/LATM)
 //!     → FD 3  (JSONL metadata)
 
 use anyhow::{Context, Result};
@@ -242,10 +242,10 @@ pub fn run(command: DablinCommand) -> Result<()> {
 
 fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
     init_logger(args.silent);
-    if args.audio_out == AudioOut::Adts
+    if (args.audio_out == AudioOut::Adts || args.audio_out == AudioOut::Latm)
         && (args.aac_decoder != AacDecoderChoice::Faad2 || args.aac_gap != AacGap::Freeze)
     {
-        warn!("--aac-decoder/--aac-gap are ignored when --audio-out=adts");
+        warn!("--aac-decoder/--aac-gap are ignored when --audio-out is adts/latm");
     }
     let running = setup_ctrlc();
     let mut reader = open_eti_reader(&args.input)?;
@@ -396,8 +396,8 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
                         AudioOut::Pcm => {
                             aac = init_aac_decoder(&args.aac_decoder, &args.aac_gap);
                         }
-                        AudioOut::Adts => {
-                            // No initialization needed for ADTS - just wrap AUs
+                        AudioOut::Adts | AudioOut::Latm => {
+                            // No decoder initialization needed for raw AAC outputs.
                         }
                     }
                 }
@@ -638,6 +638,20 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
                                 return Ok(());
                             }
                             return Err(e).context("ADTS write error");
+                        }
+                    }
+                    AudioOut::Latm => {
+                        use crate::dablin::audio::latm::wrap_au_in_latm;
+                        let Some(fmt) = current_format.as_ref() else {
+                            continue;
+                        };
+                        let latm_packet = wrap_au_in_latm(fmt, &au.data);
+                        if let Err(e) = out.write_all(&latm_packet) {
+                            if e.kind() == io::ErrorKind::BrokenPipe {
+                                info!("stdout closed, exiting");
+                                return Ok(());
+                            }
+                            return Err(e).context("LATM write error");
                         }
                     }
                 }
@@ -1161,8 +1175,8 @@ fn print_services(fic: &FicDecoder) {
 mod tests {
     use super::{
         audio_codec_label, audio_mode_label, current_subchannel_protection, encode_slide_base64,
-        hash_bytes, protection_label, save_slide_file,
-        service_dir_name, should_emit_slide_metadata,
+        hash_bytes, protection_label, save_slide_file, service_dir_name,
+        should_emit_slide_metadata,
     };
     use std::path::Path;
 
@@ -1275,7 +1289,6 @@ mod tests {
         assert_eq!(data, b"slide payload");
         let _ = std::fs::remove_file(path);
     }
-
 }
 
 // Note: Integration tests for the full decoding pipeline (ETI → PCM)

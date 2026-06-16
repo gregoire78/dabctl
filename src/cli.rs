@@ -146,6 +146,8 @@ pub enum AudioOut {
     Pcm,
     /// Raw AAC wrapped as ADTS (Audio Data Transport Stream)
     Adts,
+    /// Raw AAC wrapped as LATM/LOAS
+    Latm,
 }
 
 /// Behavior on missing/invalid AAC frames
@@ -308,6 +310,31 @@ mod tests {
                 command: DablinCommand::OneServiceOut(args),
             } => {
                 assert_eq!(args.audio_out, AudioOut::Adts);
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_dablin_latm_output() {
+        let cli = Cli::try_parse_from([
+            "dabctl",
+            "dablin",
+            "one-service-out",
+            "-i",
+            "test.eti",
+            "-s",
+            "0xF2F8",
+            "--audio-out",
+            "latm",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Dablin {
+                command: DablinCommand::OneServiceOut(args),
+            } => {
+                assert_eq!(args.audio_out, AudioOut::Latm);
             }
             _ => panic!("unexpected command"),
         }

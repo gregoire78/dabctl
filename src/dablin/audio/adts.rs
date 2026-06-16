@@ -13,7 +13,7 @@ const ADTS_HEADER_SIZE: usize = 7;
 /// Reference: ISO/IEC 13818-7 (MPEG-2 Advanced Audio Coding)
 fn build_adts_header(fmt: &SuperframeFormat, au_len: usize) -> [u8; ADTS_HEADER_SIZE] {
     let mut header = [0u8; ADTS_HEADER_SIZE];
-    
+
     let frame_length = ADTS_HEADER_SIZE + au_len;
     let sr_index = fmt.core_sr_index();
     let ch_config = fmt.core_ch_config();
@@ -67,7 +67,7 @@ mod tests {
     fn test_adts_syncword() {
         let au = vec![0xAA; 100];
         let frame = wrap_au_in_adts(&fmt_stereo_he_aac(), &au);
-        
+
         // Check syncword (12 bits, all 1s)
         assert_eq!(frame[0], 0xFF);
         assert_eq!(frame[1] & 0xF0, 0xF0);
@@ -77,7 +77,7 @@ mod tests {
     fn test_adts_frame_length() {
         let au = vec![0xBB; 200];
         let frame = wrap_au_in_adts(&fmt_stereo_he_aac(), &au);
-        
+
         // Frame length should be 7 (header) + 200 (AU) = 207
         let length = ((frame[3] as usize & 0x03) << 11)
             | ((frame[4] as usize) << 3)
@@ -90,11 +90,11 @@ mod tests {
         let fmt = fmt_stereo_he_aac();
         let au = vec![0xCC; 50];
         let frame = wrap_au_in_adts(&fmt, &au);
-        
+
         // Profile should be 1 (AAC-LC)
         let profile = (frame[2] >> 6) & 0x03;
         assert_eq!(profile, 1);
-        
+
         // Sampling rate index should match format
         let sr_idx = (frame[2] >> 2) & 0x0F;
         assert_eq!(sr_idx, fmt.core_sr_index());
