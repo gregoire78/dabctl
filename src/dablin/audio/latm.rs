@@ -7,6 +7,9 @@ use crate::dablin::dabplus::SuperframeFormat;
 use crate::dablin::audio::asc::build_asc;
 
 const LOAS_SYNCWORD: u16 = 0x2B7;
+const LOAS_HEADER_LEN: usize = 3;
+const LOAS_MAX_MUX_LEN: usize = 0x1FFF;
+const LATM_LEN_BYTE_CONT: usize = 255;
 
 struct BitWriter {
     data: Vec<u8>,
@@ -46,36 +49,12 @@ impl BitWriter {
     fn into_bytes(self) -> Vec<u8> {
         self.data
     }
-}
 
-struct SliceBitWriter<'a> {
-    data: &'a mut Vec<u8>,
-    bit_pos: u8,
-}
-
-impl<'a> SliceBitWriter<'a> {
-    fn new(data: &'a mut Vec<u8>) -> Self {
-        Self { data, bit_pos: 0 }
-    }
-
-    fn write_bits(&mut self, value: u32, bits: u8) {
-        if bits == 0 {
-            return;
-        }
-
-        if self.bit_pos == 0 && bits == 8 {
-            self.data.push(value as u8);
-            return;
-        }
-
-        for i in (0..bits).rev() {
-            let bit = ((value >> i) & 1) as u8;
-            if self.bit_pos == 0 {
-                self.data.push(0);
-            }
-            let idx = self.data.len() - 1;
-            self.data[idx] |= bit << (7 - self.bit_pos);
-            self.bit_pos = (self.bit_pos + 1) % 8;
+    fn bit_len(&self) -> usize {
+        if self.bit_pos == 0 {
+            self.data.len() * 8
+        } else {
+            (self.data.len().saturating_sub(1) * 8) + usize::from(self.bit_pos)
         }
     }
 }
@@ -98,18 +77,51 @@ fn build_latm_asc(fmt: &SuperframeFormat) -> Vec<u8> {
     build_asc(fmt)
 }
 
-fn append_bits_from_bytes_slice(writer: &mut SliceBitWriter<'_>, bytes: &[u8], bit_len: usize) {
-    let full = bit_len / 8;
-    let rem = bit_len % 8;
-
-    for &b in &bytes[..full] {
-        writer.write_bits(u32::from(b), 8);
+// Append byte-aligned data into a stream currently at `bit_offset` inside its last byte.
+fn append_bytes_with_bit_offset(dst: &mut Vec<u8>, bit_offset: u8, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
     }
 
-    if rem > 0 {
-        let next = bytes[full] >> (8 - rem);
-        writer.write_bits(u32::from(next), rem as u8);
+    if bit_offset == 0 {
+        dst.extend_from_slice(bytes);
+        return;
     }
+
+    let right = bit_offset;
+    let left = 8 - right;
+
+    // The destination must already contain a partial byte to complete.
+    if dst.is_empty() {
+        dst.push(0);
+    }
+
+    for &b in bytes {
+        let last = dst.len() - 1;
+        dst[last] |= b >> right;
+        dst.push(b << left);
+    }
+}
+
+fn payload_length_byte_count(au_len: usize) -> usize {
+    (au_len / LATM_LEN_BYTE_CONT) + 1
+}
+
+fn write_payload_length_bytes(buf: &mut [u8; 8], mut au_len: usize) -> usize {
+    let mut count = 0usize;
+    while au_len >= LATM_LEN_BYTE_CONT {
+        buf[count] = LATM_LEN_BYTE_CONT as u8;
+        count += 1;
+        au_len -= LATM_LEN_BYTE_CONT;
+    }
+    buf[count] = au_len as u8;
+    count + 1
+}
+
+fn write_loas_header(packet: &mut [u8], mux_len: usize) {
+    packet[0] = (LOAS_SYNCWORD >> 3) as u8;
+    packet[1] = (((LOAS_SYNCWORD & 0x07) as u8) << 5) | (((mux_len >> 8) & 0x1F) as u8);
+    packet[2] = (mux_len & 0xFF) as u8;
 }
 
 fn write_stream_mux_config(writer: &mut BitWriter, asc: &[u8]) {
@@ -164,9 +176,9 @@ impl LatmPacker {
         writer.write_bits(0, 1); // useSameStreamMux = 0
         write_stream_mux_config(&mut writer, &asc);
 
+        let prefix_bits = writer.bit_len();
         let prefix = writer.into_bytes();
-        // Prefix currently ends at bit position 2 (90 bits total).
-        self.cached_prefix_bits = 90;
+        self.cached_prefix_bits = prefix_bits;
         self.cached_prefix = prefix;
         self.cached_format = Some(fmt.clone());
     }
@@ -174,35 +186,41 @@ impl LatmPacker {
     pub fn wrap<'a>(&'a mut self, fmt: &SuperframeFormat, au: &[u8]) -> &'a [u8] {
         self.refresh_cache(fmt);
 
-        let payload_len_bytes = (au.len() / 255) + 1;
+        let payload_len_bytes = payload_length_byte_count(au.len());
         let mux_bits = self.cached_prefix_bits + (payload_len_bytes + au.len()) * 8;
         let mux_len = mux_bits.div_ceil(8);
-        assert!(mux_len <= 0x1FFF, "LATM payload too large for LOAS");
+        assert!(mux_len <= LOAS_MAX_MUX_LEN, "LATM payload too large for LOAS");
 
         // Build final LOAS packet directly into a reusable buffer.
         self.packet_buf.clear();
-        self.packet_buf.reserve(3 + mux_len);
-        let mut writer = SliceBitWriter::new(&mut self.packet_buf);
-        writer.write_bits(0, 8);
-        writer.write_bits(0, 8);
-        writer.write_bits(0, 8);
+        self.packet_buf.reserve(LOAS_HEADER_LEN + mux_len);
+        self.packet_buf.extend_from_slice(&[0, 0, 0]);
 
-        append_bits_from_bytes_slice(&mut writer, &self.cached_prefix, self.cached_prefix_bits);
+        let prefix_byte_len = self.cached_prefix_bits / 8;
+        let prefix_bit_offset = (self.cached_prefix_bits % 8) as u8;
 
-        let mut remaining = au.len();
-        while remaining >= 255 {
-            writer.write_bits(255, 8);
-            remaining -= 255;
+        if prefix_byte_len > 0 {
+            self.packet_buf
+                .extend_from_slice(&self.cached_prefix[..prefix_byte_len]);
         }
-        writer.write_bits(remaining as u32, 8);
-
-        for &b in au {
-            writer.write_bits(u32::from(b), 8);
+        if prefix_bit_offset > 0 {
+            self.packet_buf.push(self.cached_prefix[prefix_byte_len]);
         }
 
-        self.packet_buf[0] = (LOAS_SYNCWORD >> 3) as u8;
-        self.packet_buf[1] = (((LOAS_SYNCWORD & 0x07) as u8) << 5) | (((mux_len >> 8) & 0x1F) as u8);
-        self.packet_buf[2] = (mux_len & 0xFF) as u8;
+        let mut len_bytes = [0u8; 8];
+        let len_count = write_payload_length_bytes(&mut len_bytes, au.len());
+
+        append_bytes_with_bit_offset(&mut self.packet_buf, prefix_bit_offset, &len_bytes[..len_count]);
+        append_bytes_with_bit_offset(&mut self.packet_buf, prefix_bit_offset, au);
+
+        let expected_len = LOAS_HEADER_LEN + mux_len;
+        if self.packet_buf.len() > expected_len {
+            self.packet_buf.truncate(expected_len);
+        } else if self.packet_buf.len() < expected_len {
+            self.packet_buf.resize(expected_len, 0);
+        }
+
+        write_loas_header(&mut self.packet_buf[..LOAS_HEADER_LEN], mux_len);
         &self.packet_buf
     }
 }
