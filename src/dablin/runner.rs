@@ -171,7 +171,7 @@ fn hash_bytes(data: &[u8]) -> u64 {
 /// Outcome of one ETI frame read+parse+fsync step.
 enum EtiStep<'a> {
     /// Successfully parsed frame.
-    Frame(Box<crate::dablin::eti::EtiFrame<'a>>),
+    Frame(crate::dablin::eti::EtiFrame<'a>),
     /// Parse error or bad frame — caller should `continue`.
     BadFrame,
     /// End of stream — caller should `break`.
@@ -208,7 +208,7 @@ fn read_eti_step<'buf>(
         fsync_state.check(fsync);
     }
     *frame_count += 1;
-    Ok(EtiStep::Frame(Box::new(frame)))
+    Ok(EtiStep::Frame(frame))
 }
 
 /// Optionally encode slide data as base64. Returns empty string when `do_base64` is false.
@@ -317,7 +317,7 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
                 break;
             }
             EtiStep::BadFrame => continue,
-            EtiStep::Frame(f) => *f,
+            EtiStep::Frame(f) => f,
         };
 
         if frame.ficf && !frame.fic.is_empty() {
@@ -699,7 +699,7 @@ fn run_list_services(args: ListServicesArgs) -> Result<()> {
                 break;
             }
             EtiStep::BadFrame => continue,
-            EtiStep::Frame(f) => *f,
+            EtiStep::Frame(f) => f,
         };
 
         if frame.ficf && !frame.fic.is_empty() {
@@ -762,7 +762,7 @@ fn run_all_services(
                 break;
             }
             EtiStep::BadFrame => continue,
-            EtiStep::Frame(f) => *f,
+            EtiStep::Frame(f) => f,
         };
 
         if frame.ficf && !frame.fic.is_empty() {

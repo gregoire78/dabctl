@@ -77,30 +77,32 @@ fn build_latm_asc(fmt: &SuperframeFormat) -> Vec<u8> {
     build_asc(fmt)
 }
 
-// Append byte-aligned data into a stream currently at `bit_offset` inside its last byte.
-fn append_bytes_with_bit_offset(dst: &mut Vec<u8>, bit_offset: u8, bytes: &[u8]) {
+// Append bytes into `dst` at `cursor`, while continuing a bit-packed stream.
+// Returns the updated cursor.
+fn append_bytes_with_bit_offset(dst: &mut [u8], mut cursor: usize, bit_offset: u8, bytes: &[u8]) -> usize {
     if bytes.is_empty() {
-        return;
+        return cursor;
     }
 
     if bit_offset == 0 {
-        dst.extend_from_slice(bytes);
-        return;
+        let end = cursor + bytes.len();
+        dst[cursor..end].copy_from_slice(bytes);
+        return end;
     }
 
     let right = bit_offset;
     let left = 8 - right;
 
     // The destination must already contain a partial byte to complete.
-    if dst.is_empty() {
-        dst.push(0);
-    }
+    debug_assert!(cursor > 0);
 
     for &b in bytes {
-        let last = dst.len() - 1;
-        dst[last] |= b >> right;
-        dst.push(b << left);
+        dst[cursor - 1] |= b >> right;
+        dst[cursor] = b << left;
+        cursor += 1;
     }
+
+    cursor
 }
 
 fn payload_length_byte_count(au_len: usize) -> usize {
@@ -190,35 +192,38 @@ impl LatmPacker {
         let mux_bits = self.cached_prefix_bits + (payload_len_bytes + au.len()) * 8;
         let mux_len = mux_bits.div_ceil(8);
         assert!(mux_len <= LOAS_MAX_MUX_LEN, "LATM payload too large for LOAS");
+        let expected_len = LOAS_HEADER_LEN + mux_len;
 
-        // Build final LOAS packet directly into a reusable buffer.
+        // Build final LOAS packet directly into a reusable, exactly-sized buffer.
         self.packet_buf.clear();
-        self.packet_buf.reserve(LOAS_HEADER_LEN + mux_len);
-        self.packet_buf.extend_from_slice(&[0, 0, 0]);
+        self.packet_buf.resize(expected_len, 0);
 
         let prefix_byte_len = self.cached_prefix_bits / 8;
         let prefix_bit_offset = (self.cached_prefix_bits % 8) as u8;
+        let mut cursor = LOAS_HEADER_LEN;
 
         if prefix_byte_len > 0 {
-            self.packet_buf
-                .extend_from_slice(&self.cached_prefix[..prefix_byte_len]);
+            let end = cursor + prefix_byte_len;
+            self.packet_buf[cursor..end].copy_from_slice(&self.cached_prefix[..prefix_byte_len]);
+            cursor = end;
         }
         if prefix_bit_offset > 0 {
-            self.packet_buf.push(self.cached_prefix[prefix_byte_len]);
+            self.packet_buf[cursor] = self.cached_prefix[prefix_byte_len];
+            cursor += 1;
         }
 
         let mut len_bytes = [0u8; 8];
         let len_count = write_payload_length_bytes(&mut len_bytes, au.len());
 
-        append_bytes_with_bit_offset(&mut self.packet_buf, prefix_bit_offset, &len_bytes[..len_count]);
-        append_bytes_with_bit_offset(&mut self.packet_buf, prefix_bit_offset, au);
+        cursor = append_bytes_with_bit_offset(
+            &mut self.packet_buf,
+            cursor,
+            prefix_bit_offset,
+            &len_bytes[..len_count],
+        );
+        cursor = append_bytes_with_bit_offset(&mut self.packet_buf, cursor, prefix_bit_offset, au);
 
-        let expected_len = LOAS_HEADER_LEN + mux_len;
-        if self.packet_buf.len() > expected_len {
-            self.packet_buf.truncate(expected_len);
-        } else if self.packet_buf.len() < expected_len {
-            self.packet_buf.resize(expected_len, 0);
-        }
+        debug_assert_eq!(cursor, expected_len);
 
         write_loas_header(&mut self.packet_buf[..LOAS_HEADER_LEN], mux_len);
         &self.packet_buf

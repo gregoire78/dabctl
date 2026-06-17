@@ -29,6 +29,8 @@ pub struct SubchannelBuffer {
     cif_bytes: usize,
     /// Accumulated raw bytes from ETI frames (bounded to ≤6×cif_bytes)
     buffer: Vec<u8>,
+    /// Logical start offset of valid bytes in `buffer`.
+    head: usize,
 }
 
 impl SubchannelBuffer {
@@ -41,11 +43,13 @@ impl SubchannelBuffer {
         Self {
             cif_bytes,
             buffer: Vec::with_capacity(cif_bytes * 6),
+            head: 0,
         }
     }
 
     /// Feed one CIF of sub-channel data.
     pub fn push_cif(&mut self, data: &[u8]) {
+        self.compact_if_needed(data.len());
         self.buffer.extend_from_slice(data);
     }
 
@@ -64,30 +68,53 @@ impl SubchannelBuffer {
     /// Returns a slice if at least one superframe worth of bytes is available.
     pub fn try_peek_superframe_slice(&self) -> Option<&[u8]> {
         let sf_size = self.superframe_size();
-        if self.buffer.len() < sf_size {
+        if self.len() < sf_size {
             return None;
         }
-        Some(&self.buffer[..sf_size])
+        Some(&self.buffer[self.head..self.head + sf_size])
     }
 
     /// Consume (discard) one complete super frame from the buffer.
     pub fn consume_superframe(&mut self) {
         let sf_size = self.superframe_size();
-        if self.buffer.len() >= sf_size {
-            self.buffer.drain(..sf_size);
+        if self.len() >= sf_size {
+            self.head += sf_size;
+            self.compact_if_needed(0);
         }
     }
 
     /// Advance one CIF (used in sliding-window sync to shift by one frame).
     pub fn advance_one_cif(&mut self) {
-        if self.buffer.len() >= self.cif_bytes {
-            self.buffer.drain(..self.cif_bytes);
+        if self.len() >= self.cif_bytes {
+            self.head += self.cif_bytes;
+            self.compact_if_needed(0);
         }
     }
 
     /// Number of bytes currently buffered.
     pub fn len(&self) -> usize {
-        self.buffer.len()
+        self.buffer.len().saturating_sub(self.head)
+    }
+
+    fn compact_if_needed(&mut self, incoming_len: usize) {
+        let active_len = self.len();
+        let needs_tail_space = self.buffer.len() + incoming_len > self.buffer.capacity();
+        let should_compact = self.head > 0 && (self.head >= self.cif_bytes * 2 || needs_tail_space);
+
+        if !should_compact {
+            return;
+        }
+
+        if active_len > 0 {
+            let tail_len = self.buffer.len();
+            self.buffer.copy_within(self.head..tail_len, 0);
+        }
+        self.buffer.truncate(active_len);
+        self.head = 0;
+
+        if self.buffer.is_empty() {
+            self.buffer.clear();
+        }
     }
 }
 
@@ -97,20 +124,22 @@ impl SubchannelBuffer {
     /// Drain one complete super frame from the buffer, returning it.
     pub fn try_pop_superframe(&mut self) -> Option<Vec<u8>> {
         let sf_size = self.superframe_size();
-        if self.buffer.len() < sf_size {
+        if self.len() < sf_size {
             return None;
         }
-        let result = self.buffer[..sf_size].to_vec();
-        self.buffer.drain(..sf_size);
+        let result = self.buffer[self.head..self.head + sf_size].to_vec();
+        self.head += sf_size;
+        self.compact_if_needed(0);
         Some(result)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.buffer.is_empty()
+        self.len() == 0
     }
 
     pub fn flush(&mut self) {
         self.buffer.clear();
+        self.head = 0;
     }
 }
 
