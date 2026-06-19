@@ -68,7 +68,25 @@ cargo build --release
 
 # With Fraunhofer FDK-AAC backend
 cargo build --release --features fdk-aac
+
+# LATM-only flavor (transport output only)
+cargo build --release --features latm-only
 ```
+
+### Build flavors
+
+| Flavor | Cargo features | Behavior |
+|---|---|---|
+| Default | none | Full CLI: `one-service-out` (`pcm` default, plus `adts`/`latm`), `all-services-out`, `list-services` |
+| FDK | `fdk-aac` | Same as default, with optional `--aac-decoder fdk` |
+| LATM-only | `latm-only` | Transport-oriented flavor: `one-service-out` forced to LATM, `all-services-out` disabled, `list-services` kept |
+
+In `latm-only` builds:
+
+- `one-service-out` defaults to `--audio-out latm`.
+- `one-service-out --audio-out pcm|adts` is rejected.
+- `all-services-out` is not available.
+- `list-services` remains available.
 
 ### Dev Container
 
@@ -101,7 +119,7 @@ dabctl dablin <subcommand> [options]
 | `--input` | `-i` | ETI input file or `-` for stdin | required |
 | `--sid` | `-s` | Service ID in hex (e.g. `0xF2F8`) | — |
 | `--label` | `-l` | Select service by label instead of SID | — |
-| `--audio-out` | | Stdout format: `pcm`, `adts`, or `latm` | `pcm` |
+| `--audio-out` | | Stdout format: `pcm`, `adts`, or `latm` | `pcm` (or `latm` with `latm-only`) |
 | `--aac-decoder` | | AAC backend: `faad2` or `fdk` (requires `fdk-aac` feature) | `faad2` |
 | `--aac-gap` | | Behavior on missing/invalid AAC frames: `freeze` or `silence` | `freeze` |
 | `--slide-dir` | | Save MOT slideshow images to this directory | — |
@@ -114,6 +132,7 @@ Notes:
 
 - `--aac-decoder` and `--aac-gap` apply only when `--audio-out pcm`.
 - With `--audio-out adts` or `--audio-out latm`, AAC is not decoded to PCM; AUs are emitted as framed AAC.
+- In `latm-only` builds, `--audio-out` must be `latm`.
 
 ### ADTS output example
 
@@ -302,7 +321,7 @@ bash live-capture-iq2pcm.sh multiplex.eti 0xF2F8
 
 | Stream | Content |
 |---|---|
-| **stdout** | Raw PCM — `s16le`, 48 kHz, stereo, no headers |
+| **stdout** | Selected by `--audio-out`: PCM `s16le` 48 kHz stereo, or AAC framed as ADTS/LATM |
 | **stderr** | Logs only (tracing) — fully suppressed with `--silent` |
 | **FD 3** | JSONL metadata — one event per line |
 
@@ -320,10 +339,17 @@ ETI (file / stdin)
                  └─ DAB+ superframe assembler (5 CIFs)
                       └─ Reed-Solomon FEC (120,110)
                            └─ FireCode sync
-                                └─ AAC decoder (faad2 / fdk-aac)
-                                     ├─ PCM → stdout (s16le 48 kHz stereo)
-                                     └─ PAD decoder (DLS + MOT slideshow)
-                                          └─ JSONL events → FD 3
+              └─ AAC access units
+                ├─ audio-out=pcm
+                │    └─ AAC decoder (faad2 / fdk-aac)
+                │         └─ PCM → stdout (s16le 48 kHz stereo)
+                ├─ audio-out=adts
+                │    └─ ADTS framer → stdout
+                └─ audio-out=latm
+                  └─ LATM/LOAS framer → stdout
+
+PAD decoder (DLS + MOT slideshow)
+  └─ JSONL events → FD 3
 ```
 
 ### Source tree
@@ -345,8 +371,11 @@ src/
       rs_decoder.rs        Reed-Solomon (120,110) pure Rust
     audio/
       mod.rs               AacDecoder wrapper + gap policy
+      adts.rs              AAC AU to ADTS framing
+      asc.rs               AudioSpecificConfig builder
       faad2.rs             FFI → libfaad2
       fdk.rs               FFI → libfdk-aac (feature-gated)
+      latm.rs              AAC AU to LATM/LOAS framing
     pad/mod.rs             F-PAD / X-PAD, DLS, MOT slideshow
     utils/
       ebu_latin.rs         EBU Latin-1 → UTF-8 (ETSI EN 300 401 §8.1.1.1)

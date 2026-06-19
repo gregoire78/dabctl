@@ -1,6 +1,6 @@
 [package]
 name = "dabctl"
-version = "4.2.3"
+version = "4.2.4"
 edition = "2021"
 authors = ["gregoire78"]
 
@@ -22,6 +22,8 @@ chrono = { version = "0.4", default-features = false, features = ["std", "unstab
 # Enable the Fraunhofer fdk-aac decoder instead of the default faad2.
 # Install libfdk-aac-dev and build with: cargo build --features fdk-aac
 fdk-aac = []
+# Restrict runtime behavior to LATM output (release flavor for transport-only usage).
+latm-only = []
 
 [[bin]]
 name = "dabctl"

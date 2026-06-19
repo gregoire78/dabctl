@@ -28,8 +28,8 @@ use crate::cli::{
     AacDecoder as AacDecoderChoice, AacGap, AllServicesOutArgs, AudioOut, DablinCommand,
     DateTimeFormat, ListServicesArgs, OneServiceOutArgs,
 };
-use crate::dablin::audio::AacDecoder;
 use crate::dablin::audio::latm::LatmPacker;
+use crate::dablin::audio::AacDecoder;
 use crate::dablin::dabplus::{process_superframe_inplace, SuperframeFormat};
 use crate::dablin::eti::{parse_frame, FsyncState, ETI_FRAME_SIZE};
 use crate::dablin::fic::{FicDecoder, ProtectionProfile, ServiceInfo};
@@ -234,11 +234,38 @@ fn save_slide_file(dir: &Path, name: &str, data: &[u8]) {
 
 /// Entry point for `dabctl dablin …`
 pub fn run(command: DablinCommand) -> Result<()> {
+    enforce_latm_only_constraints(&command)?;
     match command {
         DablinCommand::OneServiceOut(args) => run_one_service(args),
         DablinCommand::AllServicesOut(args) => run_all_services_cmd(args),
         DablinCommand::ListServices(args) => run_list_services(args),
     }
+}
+
+fn enforce_latm_only_constraints(command: &DablinCommand) -> Result<()> {
+    #[cfg(feature = "latm-only")]
+    {
+        use anyhow::bail;
+
+        match command {
+            DablinCommand::OneServiceOut(args) => {
+                if args.audio_out != AudioOut::Latm {
+                    bail!("this build is latm-only: use --audio-out latm (or omit --audio-out)");
+                }
+            }
+            DablinCommand::AllServicesOut(_) => {
+                bail!("this build is latm-only: all-services-out is not available");
+            }
+            DablinCommand::ListServices(_) => {}
+        }
+    }
+
+    #[cfg(not(feature = "latm-only"))]
+    {
+        let _ = command;
+    }
+
+    Ok(())
 }
 
 fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
@@ -1119,6 +1146,7 @@ fn select_service<'a>(fic: &'a FicDecoder, args: &OneServiceOutArgs) -> Option<&
     fic.services.iter().find(|s| !s.components.is_empty())
 }
 
+#[cfg(not(feature = "latm-only"))]
 fn init_aac_decoder(backend: &AacDecoderChoice, gap: &AacGap) -> Option<AacDecoder> {
     match backend {
         AacDecoderChoice::Faad2 => {
@@ -1137,6 +1165,11 @@ fn init_aac_decoder(backend: &AacDecoderChoice, gap: &AacGap) -> Option<AacDecod
             dec
         }
     }
+}
+
+#[cfg(feature = "latm-only")]
+fn init_aac_decoder(_backend: &AacDecoderChoice, _gap: &AacGap) -> Option<AacDecoder> {
+    None
 }
 
 /// Print the list of discovered services to stderr (for `dablin list-services`).
@@ -1176,8 +1209,12 @@ fn print_services(fic: &FicDecoder) {
 mod tests {
     use super::{
         audio_codec_label, audio_mode_label, current_subchannel_protection, encode_slide_base64,
-        hash_bytes, protection_label, save_slide_file, service_dir_name,
-        should_emit_slide_metadata,
+        enforce_latm_only_constraints, hash_bytes, protection_label, save_slide_file,
+        service_dir_name, should_emit_slide_metadata,
+    };
+    use crate::cli::{
+        AacDecoder, AacGap, AllServicesOutArgs, AudioOut, DablinCommand, ListServicesArgs,
+        OneServiceOutArgs,
     };
     use std::path::Path;
 
@@ -1289,6 +1326,54 @@ mod tests {
         let data = std::fs::read(&path).expect("slide file should exist");
         assert_eq!(data, b"slide payload");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(feature = "latm-only")]
+    #[test]
+    fn latm_only_rejects_one_service_out_non_latm_audio() {
+        let cmd = DablinCommand::OneServiceOut(OneServiceOutArgs {
+            input: "test.eti".to_string(),
+            sid: Some("0xF2F8".to_string()),
+            label: None,
+            aac_decoder: AacDecoder::Faad2,
+            audio_out: AudioOut::Pcm,
+            aac_gap: AacGap::Freeze,
+            silent: true,
+            slide_dir: None,
+            slide_base64: false,
+            dedup_pad: false,
+            datetime_format: None,
+        });
+
+        assert!(enforce_latm_only_constraints(&cmd).is_err());
+    }
+
+    #[cfg(feature = "latm-only")]
+    #[test]
+    fn latm_only_rejects_all_services_out() {
+        let cmd = DablinCommand::AllServicesOut(AllServicesOutArgs {
+            input: "test.eti".to_string(),
+            out_dir: "out".to_string(),
+            aac_decoder: AacDecoder::Faad2,
+            aac_gap: AacGap::Freeze,
+            silent: true,
+            slide_base64: false,
+            dedup_pad: false,
+            datetime_format: None,
+        });
+
+        assert!(enforce_latm_only_constraints(&cmd).is_err());
+    }
+
+    #[cfg(feature = "latm-only")]
+    #[test]
+    fn latm_only_accepts_list_services() {
+        let cmd = DablinCommand::ListServices(ListServicesArgs {
+            input: "test.eti".to_string(),
+            silent: true,
+        });
+
+        assert!(enforce_latm_only_constraints(&cmd).is_ok());
     }
 }
 

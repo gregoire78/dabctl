@@ -14,14 +14,34 @@ permissions:
 
 jobs:
   build:
-    runs-on: ${{ fromJSON(matrix.info).runner }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
-        info:
-          - '{ "name": "linux_amd64",     "runner": "ubuntu-latest",    "cargo_args": "--target x86_64-unknown-linux-gnu",                    "artifact": "target/x86_64-unknown-linux-gnu/release/dabctl", "fdk": false }'
-          - '{ "name": "linux_arm64",     "runner": "ubuntu-24.04-arm", "cargo_args": "",                                                     "artifact": "target/release/dabctl",                          "fdk": false }'
-          - '{ "name": "linux_amd64_fdk", "runner": "ubuntu-latest",    "cargo_args": "--target x86_64-unknown-linux-gnu --features fdk-aac", "artifact": "target/x86_64-unknown-linux-gnu/release/dabctl", "fdk": true  }'
-          - '{ "name": "linux_arm64_fdk", "runner": "ubuntu-24.04-arm", "cargo_args": "--features fdk-aac",                                   "artifact": "target/release/dabctl",                          "fdk": true  }'
+        include:
+          - name: linux_amd64
+            runner: ubuntu-latest
+            cargo_args: --target x86_64-unknown-linux-gnu
+            artifact: target/x86_64-unknown-linux-gnu/release/dabctl
+          - name: linux_arm64
+            runner: ubuntu-24.04-arm
+            cargo_args: ""
+            artifact: target/release/dabctl
+          - name: linux_amd64_fdk
+            runner: ubuntu-latest
+            cargo_args: --target x86_64-unknown-linux-gnu --features fdk-aac
+            artifact: target/x86_64-unknown-linux-gnu/release/dabctl
+          - name: linux_arm64_fdk
+            runner: ubuntu-24.04-arm
+            cargo_args: --features fdk-aac
+            artifact: target/release/dabctl
+          - name: linux_amd64_latm
+            runner: ubuntu-latest
+            cargo_args: --target x86_64-unknown-linux-gnu --features latm-only
+            artifact: target/x86_64-unknown-linux-gnu/release/dabctl
+          - name: linux_arm64_latm
+            runner: ubuntu-24.04-arm
+            cargo_args: --features latm-only
+            artifact: target/release/dabctl
 
     steps:
       - uses: actions/checkout@v4
@@ -33,12 +53,16 @@ jobs:
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             pkg-config libusb-1.0-0-dev librtlsdr-dev \
-            libfaad-dev libmpg123-dev libfec-dev \
+            libmpg123-dev libfec-dev \
             clang libclang-dev \
             jq cmake
 
+      - name: Install libfaad-dev
+        if: ${{ !contains(matrix.name, '_latm') }}
+        run: sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libfaad-dev
+
       - name: Install libfdk-aac-dev
-        if: fromJSON(matrix.info).fdk
+        if: ${{ contains(matrix.name, '_fdk') }}
         run: sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libfdk-aac-dev
 
       - name: Set up Rust
@@ -48,15 +72,15 @@ jobs:
         run: |
           VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
           echo "VERSION=$VERSION" >> $GITHUB_ENV
-          cargo build --release ${{ fromJSON(matrix.info).cargo_args }}
-          BIN="dabctl-$VERSION-${{ fromJSON(matrix.info).name }}"
-          cp ${{ fromJSON(matrix.info).artifact }} "$BIN"
+          cargo build --release ${{ matrix.cargo_args }}
+          BIN="dabctl-$VERSION-${{ matrix.name }}"
+          cp ${{ matrix.artifact }} "$BIN"
           tar -czf "$BIN.tar.gz" "$BIN"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: binary-${{ fromJSON(matrix.info).name }}
-          path: dabctl-*-${{ fromJSON(matrix.info).name }}.tar.gz
+          name: binary-${{ matrix.name }}
+          path: dabctl-*-${{ matrix.name }}.tar.gz
 
   release:
     needs: build

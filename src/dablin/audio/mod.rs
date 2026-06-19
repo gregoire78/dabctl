@@ -5,18 +5,22 @@
 
 pub mod adts;
 pub mod asc;
-pub mod faad2;
 pub mod latm;
+
+#[cfg(not(feature = "latm-only"))]
+pub mod faad2;
 
 #[cfg(feature = "fdk-aac")]
 pub mod fdk;
 
 use crate::cli::AacGap;
+#[cfg(any(not(feature = "latm-only"), feature = "fdk-aac"))]
 use crate::dablin::audio::asc::build_asc;
 use crate::dablin::dabplus::{AudioUnit, SuperframeFormat};
 
 /// Number of samples per AAC frame per channel (standard AAC-LC / HE-AAC).
 /// Used to compute the silence buffer size when gap policy = `silence`.
+#[cfg(any(not(feature = "latm-only"), test))]
 pub const AAC_SAMPLES_PER_FRAME: usize = 1024;
 pub const PCM_SAMPLES_PER_CIF_48K: usize = 1152;
 
@@ -105,12 +109,17 @@ pub struct AacDecoder {
 }
 
 enum AacDecoderInner {
+    #[cfg(not(feature = "latm-only"))]
     Faad2(faad2::Faad2Decoder),
     #[cfg(feature = "fdk-aac")]
     Fdk(fdk::FdkDecoder),
+    #[cfg(feature = "latm-only")]
+    #[allow(dead_code)]
+    Disabled,
 }
 
 impl AacDecoder {
+    #[cfg(not(feature = "latm-only"))]
     /// Create a new faad2-backed decoder.
     pub fn new_faad2(gap_policy: AacGap) -> Option<Self> {
         let inner = faad2::Faad2Decoder::new()?;
@@ -142,11 +151,19 @@ impl AacDecoder {
         if self.initialized {
             return true;
         }
-        let asc = build_asc(fmt);
         let ok = match &mut self.inner {
-            AacDecoderInner::Faad2(dec) => dec.init_with_asc(&asc),
+            #[cfg(not(feature = "latm-only"))]
+            AacDecoderInner::Faad2(dec) => {
+                let asc = build_asc(fmt);
+                dec.init_with_asc(&asc)
+            }
             #[cfg(feature = "fdk-aac")]
-            AacDecoderInner::Fdk(dec) => dec.init_with_asc(&asc),
+            AacDecoderInner::Fdk(dec) => {
+                let asc = build_asc(fmt);
+                dec.init_with_asc(&asc)
+            }
+            #[cfg(feature = "latm-only")]
+            AacDecoderInner::Disabled => false,
         };
         if ok {
             self.initialized = true;
@@ -161,14 +178,17 @@ impl AacDecoder {
     /// Returns `Some(Vec<i16>)` on success, or:
     ///   - `None` if gap policy is `freeze`
     ///   - `Some(silence)` if gap policy is `silence`
-    pub fn decode(&mut self, au: &AudioUnit) -> Option<Vec<i16>> {
+    pub fn decode(&mut self, _au: &AudioUnit) -> Option<Vec<i16>> {
         if !self.initialized {
             return None;
         }
-        let result = match &mut self.inner {
-            AacDecoderInner::Faad2(dec) => dec.decode(&au.data),
+        let result: Option<Vec<i16>> = match &mut self.inner {
+            #[cfg(not(feature = "latm-only"))]
+            AacDecoderInner::Faad2(dec) => dec.decode(&_au.data),
             #[cfg(feature = "fdk-aac")]
-            AacDecoderInner::Fdk(dec) => dec.decode(&au.data),
+            AacDecoderInner::Fdk(dec) => dec.decode(&_au.data),
+            #[cfg(feature = "latm-only")]
+            AacDecoderInner::Disabled => None,
         };
 
         match result {

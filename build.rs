@@ -1,11 +1,13 @@
 fn main() {
-    // Link faad2 (default AAC decoder)
-    println!("cargo:rustc-link-lib=faad");
-
-    // Link libfec (Phil Karn's RS decoder, same as dablin)
+    // Always needed for DAB+ RS decode.
     println!("cargo:rustc-link-lib=fec");
 
-    // Link fdk-aac if feature enabled
-    #[cfg(feature = "fdk-aac")]
-    println!("cargo:rustc-link-lib=fdk-aac");
+    // AAC decode is not required in latm-only flavor.
+    if std::env::var_os("CARGO_FEATURE_LATM_ONLY").is_none() {
+        println!("cargo:rustc-link-lib=faad");
+    }
+
+    if std::env::var_os("CARGO_FEATURE_FDK_AAC").is_some() {
+        println!("cargo:rustc-link-lib=fdk-aac");
+    }
 }

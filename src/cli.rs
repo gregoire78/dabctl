@@ -49,7 +49,11 @@ pub struct OneServiceOutArgs {
     pub aac_decoder: AacDecoder,
 
     /// Audio output format on stdout
-    #[arg(long = "audio-out", default_value = "pcm")]
+    #[cfg_attr(feature = "latm-only", arg(long = "audio-out", default_value = "latm"))]
+    #[cfg_attr(
+        not(feature = "latm-only"),
+        arg(long = "audio-out", default_value = "pcm")
+    )]
     pub audio_out: AudioOut,
 
     /// Behavior on missing/invalid AAC frames
@@ -219,7 +223,10 @@ mod tests {
                 assert_eq!(args.sid, Some("0xF2F8".to_string()));
                 assert!(!args.silent);
                 assert_eq!(args.aac_gap, AacGap::Freeze);
+                #[cfg(not(feature = "latm-only"))]
                 assert_eq!(args.audio_out, AudioOut::Pcm);
+                #[cfg(feature = "latm-only")]
+                assert_eq!(args.audio_out, AudioOut::Latm);
                 assert_eq!(args.datetime_format, None);
             }
             _ => panic!("unexpected command"),
@@ -546,5 +553,29 @@ mod tests {
             "0xF2F8",
         ]);
         assert!(cli.is_err());
+    }
+
+    #[cfg(feature = "latm-only")]
+    #[test]
+    fn test_parse_dablin_default_audio_out_is_latm_in_latm_only() {
+        let cli = Cli::try_parse_from([
+            "dabctl",
+            "dablin",
+            "one-service-out",
+            "-i",
+            "test.eti",
+            "-s",
+            "0xF2F8",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Dablin {
+                command: DablinCommand::OneServiceOut(args),
+            } => {
+                assert_eq!(args.audio_out, AudioOut::Latm);
+            }
+            _ => panic!("unexpected command"),
+        }
     }
 }
