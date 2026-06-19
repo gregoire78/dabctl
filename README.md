@@ -71,6 +71,10 @@ cargo build --release --features fdk-aac
 
 # LATM-only flavor (transport output only)
 cargo build --release --features latm-only
+
+# WebAssembly (ETI → LATM in-memory, RS correction via vendored libfec)
+LIBFEC_WASM_LIB_DIR=third_party/libfec/wasm \
+  cargo build --target wasm32-unknown-unknown --features wasm-runtime
 ```
 
 ### Build flavors
@@ -80,6 +84,7 @@ cargo build --release --features latm-only
 | Default | none | Full CLI: `one-service-out` (`pcm` default, plus `adts`/`latm`), `all-services-out`, `list-services` |
 | FDK | `fdk-aac` | Same as default, with optional `--aac-decoder fdk` |
 | LATM-only | `latm-only` | Transport-oriented flavor: `one-service-out` forced to LATM, `all-services-out` disabled, `list-services` kept |
+| WebAssembly | `wasm-runtime` | wasm32 target, LATM-only output, RS correction via vendored `third_party/libfec/wasm/libfec.a` |
 
 In `latm-only` builds:
 
@@ -87,6 +92,13 @@ In `latm-only` builds:
 - `one-service-out --audio-out pcm|adts` is rejected.
 - `all-services-out` is not available.
 - `list-services` remains available.
+
+In `wasm-runtime` builds:
+
+- Output is forced to LATM (same constraint as `latm-only`).
+- `all-services-out` is not available.
+- Requires a wasm32-compatible `libfec.a` — vendored in `third_party/libfec/wasm/`.
+- Rebuilt if needed with `bash scripts/build-libfec-wasm.sh` (requires `clang`, `llvm-ar`, `wasi-libc`).
 
 ### Dev Container
 
@@ -362,13 +374,14 @@ src/
     mod.rs
     runner.rs              Main decoding loop
     metadata.rs            JSONL emitter (FD 3)
+    wasm_runtime.rs        WebAssembly memory-based API scaffold (`wasm-runtime` feature)
     eti/mod.rs             ETI-NI frame parser + FSYNC
     fic/mod.rs             FIC/FIG decoder (FIG 0/0, 0/1, 0/2, 0/9, 0/10, 0/13, 1/0, 1/1, 1/5)
     msc/mod.rs             MSC sub-channel extraction
     dabplus/
       mod.rs               DAB+ superframe assembly
       firecode.rs          FireCode CRC-16 sync
-      rs_decoder.rs        Reed-Solomon (120,110) pure Rust
+      rs_decoder.rs        Reed-Solomon (120,110) via libfec FFI
     audio/
       mod.rs               AacDecoder wrapper + gap policy
       adts.rs              AAC AU to ADTS framing

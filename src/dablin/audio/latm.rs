@@ -3,8 +3,8 @@
 //! The generated stream is LOAS (sync + length) carrying one LATM AudioMuxElement
 //! per AAC access unit. We include StreamMuxConfig in each element for robustness.
 
-use crate::dablin::dabplus::SuperframeFormat;
 use crate::dablin::audio::asc::build_asc;
+use crate::dablin::dabplus::SuperframeFormat;
 
 const LOAS_SYNCWORD: u16 = 0x2B7;
 const LOAS_HEADER_LEN: usize = 3;
@@ -79,7 +79,12 @@ fn build_latm_asc(fmt: &SuperframeFormat) -> Vec<u8> {
 
 // Append bytes into `dst` at `cursor`, while continuing a bit-packed stream.
 // Returns the updated cursor.
-fn append_bytes_with_bit_offset(dst: &mut [u8], mut cursor: usize, bit_offset: u8, bytes: &[u8]) -> usize {
+fn append_bytes_with_bit_offset(
+    dst: &mut [u8],
+    mut cursor: usize,
+    bit_offset: u8,
+    bytes: &[u8],
+) -> usize {
     if bytes.is_empty() {
         return cursor;
     }
@@ -191,7 +196,10 @@ impl LatmPacker {
         let payload_len_bytes = payload_length_byte_count(au.len());
         let mux_bits = self.cached_prefix_bits + (payload_len_bytes + au.len()) * 8;
         let mux_len = mux_bits.div_ceil(8);
-        assert!(mux_len <= LOAS_MAX_MUX_LEN, "LATM payload too large for LOAS");
+        assert!(
+            mux_len <= LOAS_MAX_MUX_LEN,
+            "LATM payload too large for LOAS"
+        );
         let expected_len = LOAS_HEADER_LEN + mux_len;
 
         // Build final LOAS packet directly into a reusable, exactly-sized buffer.
@@ -261,7 +269,9 @@ mod tests {
     fn test_latm_packet_size_grows_with_au_size() {
         let mut packer = LatmPacker::new();
         let packet_small_len = packer.wrap(&fmt_stereo_he_aac(), &[0xDE, 0xAD]).len();
-        let packet_large_len = packer.wrap(&fmt_stereo_he_aac(), &[0xDE, 0xAD, 0xBE, 0xEF]).len();
+        let packet_large_len = packer
+            .wrap(&fmt_stereo_he_aac(), &[0xDE, 0xAD, 0xBE, 0xEF])
+            .len();
 
         // LATM payload may be bit-packed, so compare structure through size growth.
         assert!(packet_large_len > packet_small_len);

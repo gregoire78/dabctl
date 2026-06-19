@@ -6,6 +6,7 @@
 //!   - NEVER writes to stdout or stderr
 
 use serde_json::json;
+#[cfg(not(target_arch = "wasm32"))]
 use std::os::unix::io::FromRawFd;
 
 use crate::dablin::utils::jsonl::write_jsonl;
@@ -31,11 +32,18 @@ impl MetadataEmitter {
     ///
     /// # Safety
     /// FD 3 must be opened by the shell before dabctl starts (e.g. `3>meta.json`).
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn open() -> anyhow::Result<Self> {
         // SAFETY: FD 3 is expected to be opened by the shell before dabctl starts.
         // We don't own the fd's lifetime – we just wrap it.
         let writer = unsafe { std::fs::File::from_raw_fd(3) };
         Ok(Self { writer })
+    }
+
+    /// WebAssembly targets do not expose POSIX file descriptors.
+    #[cfg(target_arch = "wasm32")]
+    pub fn open() -> anyhow::Result<Self> {
+        anyhow::bail!("fd3 metadata emitter is not available on wasm32")
     }
 
     /// Serialize a JSON value and emit it as one line.

@@ -1,6 +1,6 @@
 [package]
 name = "dabctl"
-version = "4.2.4"
+version = "4.3.0"
 edition = "2021"
 authors = ["gregoire78"]
 
@@ -11,12 +11,14 @@ arrayvec = "0.7"
 thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-ctrlc = "3.4"
 base64 = "0.22"
 encoding_rs = "0.8.35"
 serde_json = "1.0"
 rayon = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "unstable-locales"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ctrlc = "3.4"
 
 [features]
 # Enable the Fraunhofer fdk-aac decoder instead of the default faad2.
@@ -24,6 +26,8 @@ chrono = { version = "0.4", default-features = false, features = ["std", "unstab
 fdk-aac = []
 # Restrict runtime behavior to LATM output (release flavor for transport-only usage).
 latm-only = []
+# Prepare runtime constraints for future WebAssembly embedding.
+wasm-runtime = []
 
 [[bin]]
 name = "dabctl"

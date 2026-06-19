@@ -139,6 +139,7 @@ fn init_logger(silent: bool) {
 }
 
 /// Register a Ctrl+C handler and return the shared running flag.
+#[cfg(not(target_arch = "wasm32"))]
 fn setup_ctrlc() -> Arc<AtomicBool> {
     let running = Arc::new(AtomicBool::new(true));
     let r = Arc::clone(&running);
@@ -147,6 +148,12 @@ fn setup_ctrlc() -> Arc<AtomicBool> {
     })
     .expect("Error setting Ctrl+C handler");
     running
+}
+
+/// WebAssembly builds do not provide POSIX signals, so we keep a static running flag.
+#[cfg(target_arch = "wasm32")]
+fn setup_ctrlc() -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(true))
 }
 
 /// Open an ETI input: `-` for stdin, otherwise a file path.
@@ -169,6 +176,7 @@ fn hash_bytes(data: &[u8]) -> u64 {
 }
 
 /// Outcome of one ETI frame read+parse+fsync step.
+#[allow(clippy::large_enum_variant)]
 enum EtiStep<'a> {
     /// Successfully parsed frame.
     Frame(crate::dablin::eti::EtiFrame<'a>),
@@ -243,7 +251,11 @@ pub fn run(command: DablinCommand) -> Result<()> {
 }
 
 fn enforce_latm_only_constraints(command: &DablinCommand) -> Result<()> {
-    #[cfg(feature = "latm-only")]
+    #[cfg(any(
+        feature = "latm-only",
+        feature = "wasm-runtime",
+        target_arch = "wasm32"
+    ))]
     {
         use anyhow::bail;
 
@@ -260,7 +272,11 @@ fn enforce_latm_only_constraints(command: &DablinCommand) -> Result<()> {
         }
     }
 
-    #[cfg(not(feature = "latm-only"))]
+    #[cfg(not(any(
+        feature = "latm-only",
+        feature = "wasm-runtime",
+        target_arch = "wasm32"
+    )))]
     {
         let _ = command;
     }
