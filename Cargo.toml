@@ -27,7 +27,7 @@ fdk-aac = []
 # Restrict runtime behavior to LATM output (release flavor for transport-only usage).
 latm-only = []
 # Prepare runtime constraints for future WebAssembly embedding.
-wasm-runtime = []
+wasm-runtime = ["latm-only"]
 
 [[bin]]
 name = "dabctl"

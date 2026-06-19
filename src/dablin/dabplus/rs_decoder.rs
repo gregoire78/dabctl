@@ -14,6 +14,10 @@ use std::sync::OnceLock;
 const RS_N: usize = 120;
 const RS_K: usize = 110;
 
+#[cfg(any(target_arch = "wasm32", test))]
+#[path = "wasm/alloc_shims.rs"]
+mod wasm_c_alloc_shims;
+
 // libfec FFI
 #[link(name = "fec")]
 extern "C" {
