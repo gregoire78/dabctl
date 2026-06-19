@@ -1223,11 +1223,14 @@ fn print_services(fic: &FicDecoder) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "latm-only")]
+    use super::enforce_latm_only_constraints;
     use super::{
         audio_codec_label, audio_mode_label, current_subchannel_protection, encode_slide_base64,
-        enforce_latm_only_constraints, hash_bytes, protection_label, save_slide_file,
-        service_dir_name, should_emit_slide_metadata,
+        hash_bytes, protection_label, save_slide_file, service_dir_name,
+        should_emit_slide_metadata,
     };
+    #[cfg(feature = "latm-only")]
     use crate::cli::{
         AacDecoder, AacGap, AllServicesOutArgs, AudioOut, DablinCommand, ListServicesArgs,
         OneServiceOutArgs,
