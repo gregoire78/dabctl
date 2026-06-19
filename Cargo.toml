@@ -22,6 +22,11 @@ chrono = { version = "0.4", default-features = false, features = ["std", "unstab
 # Enable the Fraunhofer fdk-aac decoder instead of the default faad2.
 # Install libfdk-aac-dev and build with: cargo build --features fdk-aac
 fdk-aac = []
+# LATM/ADTS-only build: no libfaad2/libfdk-aac dependency.
+# Disables PCM decode and all-services-out; supports only one-service-out
+# with --audio-out adts or --audio-out latm (default: latm).
+# Build with: cargo build --release --features latm-only
+latm-only = []
 
 [[bin]]
 name = "dabctl"

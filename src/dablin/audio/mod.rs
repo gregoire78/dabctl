@@ -5,21 +5,28 @@
 
 pub mod adts;
 pub mod asc;
+#[cfg(not(feature = "latm-only"))]
 pub mod faad2;
 pub mod latm;
 
 #[cfg(feature = "fdk-aac")]
 pub mod fdk;
 
+#[cfg(not(feature = "latm-only"))]
 use crate::cli::AacGap;
+#[cfg(not(feature = "latm-only"))]
 use crate::dablin::audio::asc::build_asc;
+#[cfg(not(feature = "latm-only"))]
 use crate::dablin::dabplus::{AudioUnit, SuperframeFormat};
 
 /// Number of samples per AAC frame per channel (standard AAC-LC / HE-AAC).
 /// Used to compute the silence buffer size when gap policy = `silence`.
+#[allow(dead_code)]
 pub const AAC_SAMPLES_PER_FRAME: usize = 1024;
+#[allow(dead_code)]
 pub const PCM_SAMPLES_PER_CIF_48K: usize = 1152;
 
+#[cfg(not(feature = "latm-only"))]
 fn expected_output_samples_per_au(fmt: &SuperframeFormat) -> usize {
     match (fmt.dac_rate, fmt.sbr_flag) {
         (true, true) => 1920,
@@ -29,6 +36,7 @@ fn expected_output_samples_per_au(fmt: &SuperframeFormat) -> usize {
     }
 }
 
+#[cfg(not(feature = "latm-only"))]
 fn resample_frame_to_len(
     pcm: &[i16],
     channels: usize,
@@ -93,6 +101,7 @@ fn resample_frame_to_len(
 }
 
 /// Audio decoder: wraps the backend and applies gap policy.
+#[cfg(not(feature = "latm-only"))]
 pub struct AacDecoder {
     inner: AacDecoderInner,
     gap_policy: AacGap,
@@ -104,12 +113,14 @@ pub struct AacDecoder {
     initialized: bool,
 }
 
+#[cfg(not(feature = "latm-only"))]
 enum AacDecoderInner {
     Faad2(faad2::Faad2Decoder),
     #[cfg(feature = "fdk-aac")]
     Fdk(fdk::FdkDecoder),
 }
 
+#[cfg(not(feature = "latm-only"))]
 impl AacDecoder {
     /// Create a new faad2-backed decoder.
     pub fn new_faad2(gap_policy: AacGap) -> Option<Self> {
@@ -230,6 +241,7 @@ impl AacDecoder {
 mod tests {
     use super::*;
 
+    #[cfg(not(feature = "latm-only"))]
     #[test]
     fn test_silence_on_gap_freeze_returns_none() {
         let gap = AacGap::Freeze;
@@ -244,6 +256,7 @@ mod tests {
         assert!(output.is_none());
     }
 
+    #[cfg(not(feature = "latm-only"))]
     #[test]
     fn test_silence_on_gap_silence_returns_zeros() {
         let gap = AacGap::Silence;
@@ -273,6 +286,7 @@ mod tests {
         assert!(silence.iter().all(|&s| s == 0));
     }
 
+    #[cfg(not(feature = "latm-only"))]
     #[test]
     fn test_expected_output_samples_per_au_matches_dabplus_grid() {
         let fmt = SuperframeFormat {
@@ -294,6 +308,7 @@ mod tests {
         assert_eq!(expected_output_samples_per_au(&fmt), 960);
     }
 
+    #[cfg(not(feature = "latm-only"))]
     #[test]
     fn test_resample_frame_to_len_expands_stereo_frame() {
         let pcm = [0i16, 100, 1000, 1100, 2000, 2100, 3000, 3100];
@@ -305,6 +320,7 @@ mod tests {
         assert_eq!(out[11], 3100);
     }
 
+    #[cfg(not(feature = "latm-only"))]
     #[test]
     fn test_resample_frame_to_len_smooth_extrapolation_for_single_sample() {
         // Single sample frame should be smoothly extrapolated, not harshly repeated
@@ -323,6 +339,7 @@ mod tests {
         assert_eq!(out[7], 2000);
     }
 
+    #[cfg(not(feature = "latm-only"))]
     #[test]
     fn test_resample_frame_to_len_smooth_transition_for_two_samples() {
         // Two samples should use smooth linear interpolation
@@ -339,6 +356,7 @@ mod tests {
         // (not creating harsh jumps)
     }
 
+    #[cfg(not(feature = "latm-only"))]
     #[test]
     fn test_gap_policy_freeze_and_silence_are_distinct() {
         // Ensure gap policies are properly enumerated
@@ -357,6 +375,7 @@ mod tests {
         assert!(silence_pcm.iter().all(|&s| s == 0));
     }
 
+    #[cfg(not(feature = "latm-only"))]
     #[test]
     fn test_silence_for_missing_cifs_respects_policy() {
         // Verify the behavior boundary for silence vs freeze
@@ -384,6 +403,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "latm-only"))]
     #[test]
     fn test_all_audio_formats_produce_same_superframe_duration() {
         // Verify that all DAB+ audio formats produce 5760 samples per superframe

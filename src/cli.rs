@@ -24,6 +24,7 @@ pub enum DablinCommand {
     /// Decode one DAB/DAB+ service to stdout PCM
     OneServiceOut(OneServiceOutArgs),
     /// Export all DAB+ services into per-service directories
+    #[cfg(not(feature = "latm-only"))]
     AllServicesOut(AllServicesOutArgs),
     /// List ensemble services then exit
     ListServices(ListServicesArgs),
@@ -45,14 +46,22 @@ pub struct OneServiceOutArgs {
     pub label: Option<String>,
 
     /// AAC decoder backend
+    #[cfg(not(feature = "latm-only"))]
     #[arg(long = "aac-decoder", default_value = "faad2")]
     pub aac_decoder: AacDecoder,
 
     /// Audio output format on stdout
+    #[cfg(not(feature = "latm-only"))]
     #[arg(long = "audio-out", default_value = "pcm")]
     pub audio_out: AudioOut,
 
+    /// Audio output format on stdout (latm-only build: adts or latm)
+    #[cfg(feature = "latm-only")]
+    #[arg(long = "audio-out", default_value = "latm")]
+    pub audio_out: AudioOut,
+
     /// Behavior on missing/invalid AAC frames
+    #[cfg(not(feature = "latm-only"))]
     #[arg(long = "aac-gap", default_value = "freeze")]
     pub aac_gap: AacGap,
 
@@ -81,6 +90,7 @@ pub struct OneServiceOutArgs {
 }
 
 /// Arguments for `dabctl dablin all-services-out`
+#[cfg(not(feature = "latm-only"))]
 #[derive(Parser, Debug)]
 pub struct AllServicesOutArgs {
     /// ETI input file or stdin (use `-` for stdin)
@@ -132,6 +142,7 @@ pub struct ListServicesArgs {
 }
 
 /// AAC decoder backend selection
+#[cfg(not(feature = "latm-only"))]
 #[derive(Debug, Clone, ValueEnum, PartialEq)]
 pub enum AacDecoder {
     Faad2,
@@ -143,6 +154,7 @@ pub enum AacDecoder {
 #[derive(Debug, Clone, ValueEnum, PartialEq)]
 pub enum AudioOut {
     /// Raw PCM (s16le, 48 kHz, stereo)
+    #[cfg(not(feature = "latm-only"))]
     Pcm,
     /// Raw AAC wrapped as ADTS (Audio Data Transport Stream)
     Adts,
@@ -151,6 +163,7 @@ pub enum AudioOut {
 }
 
 /// Behavior on missing/invalid AAC frames
+#[cfg(not(feature = "latm-only"))]
 #[derive(Debug, Clone, ValueEnum, PartialEq)]
 pub enum AacGap {
     /// Preserve legacy behavior: no PCM output on error (default)
@@ -199,6 +212,7 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    #[cfg(not(feature = "latm-only"))]
     #[test]
     fn test_parse_dablin_basic() {
         let cli = Cli::try_parse_from([
@@ -226,6 +240,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "latm-only"))]
     #[test]
     fn test_parse_dablin_silence_gap() {
         let cli = Cli::try_parse_from([
@@ -340,6 +355,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "latm-only"))]
     #[test]
     fn test_parse_dablin_all_services_out() {
         let cli = Cli::try_parse_from([
@@ -532,6 +548,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "latm-only"))]
     #[test]
     fn test_parse_dablin_all_services_out_rejects_sid() {
         let cli = Cli::try_parse_from([
@@ -546,5 +563,125 @@ mod tests {
             "0xF2F8",
         ]);
         assert!(cli.is_err());
+    }
+
+    // ── latm-only feature tests ───────────────────────────────────────────────
+
+    #[cfg(feature = "latm-only")]
+    #[test]
+    fn test_latm_only_default_audio_out_is_latm() {
+        let cli = Cli::try_parse_from([
+            "dabctl",
+            "dablin",
+            "one-service-out",
+            "-i",
+            "test.eti",
+            "-s",
+            "0xF2F8",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Dablin {
+                command: DablinCommand::OneServiceOut(args),
+            } => {
+                assert_eq!(args.audio_out, AudioOut::Latm);
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[cfg(feature = "latm-only")]
+    #[test]
+    fn test_latm_only_accepts_adts() {
+        let cli = Cli::try_parse_from([
+            "dabctl",
+            "dablin",
+            "one-service-out",
+            "-i",
+            "test.eti",
+            "-s",
+            "0xF2F8",
+            "--audio-out",
+            "adts",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Dablin {
+                command: DablinCommand::OneServiceOut(args),
+            } => {
+                assert_eq!(args.audio_out, AudioOut::Adts);
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[cfg(feature = "latm-only")]
+    #[test]
+    fn test_latm_only_rejects_pcm_value() {
+        // In latm-only builds, --audio-out pcm is not a valid variant.
+        let result = Cli::try_parse_from([
+            "dabctl",
+            "dablin",
+            "one-service-out",
+            "-i",
+            "test.eti",
+            "-s",
+            "0xF2F8",
+            "--audio-out",
+            "pcm",
+        ]);
+        assert!(result.is_err(), "--audio-out pcm must be rejected in latm-only mode");
+    }
+
+    #[cfg(feature = "latm-only")]
+    #[test]
+    fn test_latm_only_rejects_aac_decoder_flag() {
+        // In latm-only builds, --aac-decoder is not a known flag.
+        let result = Cli::try_parse_from([
+            "dabctl",
+            "dablin",
+            "one-service-out",
+            "-i",
+            "test.eti",
+            "-s",
+            "0xF2F8",
+            "--aac-decoder",
+            "faad2",
+        ]);
+        assert!(result.is_err(), "--aac-decoder must be rejected in latm-only mode");
+    }
+
+    #[cfg(feature = "latm-only")]
+    #[test]
+    fn test_latm_only_rejects_aac_gap_flag() {
+        // In latm-only builds, --aac-gap is not a known flag.
+        let result = Cli::try_parse_from([
+            "dabctl",
+            "dablin",
+            "one-service-out",
+            "-i",
+            "test.eti",
+            "-s",
+            "0xF2F8",
+            "--aac-gap",
+            "silence",
+        ]);
+        assert!(result.is_err(), "--aac-gap must be rejected in latm-only mode");
+    }
+
+    #[cfg(feature = "latm-only")]
+    #[test]
+    fn test_latm_only_rejects_all_services_out() {
+        // In latm-only builds, all-services-out is not a valid subcommand.
+        let result = Cli::try_parse_from([
+            "dabctl",
+            "dablin",
+            "all-services-out",
+            "-i",
+            "test.eti",
+            "--out",
+            "out",
+        ]);
+        assert!(result.is_err(), "all-services-out must be rejected in latm-only mode");
     }
 }

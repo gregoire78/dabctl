@@ -13,21 +13,31 @@
 
 use anyhow::{Context, Result};
 use base64::Engine;
+#[cfg(not(feature = "latm-only"))]
 use rayon::prelude::*;
+#[cfg(not(feature = "latm-only"))]
 use serde_json::json;
+#[cfg(not(feature = "latm-only"))]
 use std::collections::BTreeMap;
+#[cfg(not(feature = "latm-only"))]
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::path::{Path, PathBuf};
+use std::io::{self, BufReader, Read, Write};
+#[cfg(not(feature = "latm-only"))]
+use std::io::BufWriter;
+#[cfg(not(feature = "latm-only"))]
+use std::path::PathBuf;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use crate::cli::{
-    AacDecoder as AacDecoderChoice, AacGap, AllServicesOutArgs, AudioOut, DablinCommand,
-    DateTimeFormat, ListServicesArgs, OneServiceOutArgs,
+    AudioOut, DablinCommand, DateTimeFormat, ListServicesArgs, OneServiceOutArgs,
 };
+#[cfg(not(feature = "latm-only"))]
+use crate::cli::{AacDecoder as AacDecoderChoice, AacGap, AllServicesOutArgs};
+#[cfg(not(feature = "latm-only"))]
 use crate::dablin::audio::AacDecoder;
 use crate::dablin::audio::latm::LatmPacker;
 use crate::dablin::dabplus::{process_superframe_inplace, SuperframeFormat};
@@ -36,10 +46,12 @@ use crate::dablin::fic::{FicDecoder, ProtectionProfile, ServiceInfo};
 use crate::dablin::metadata::{AudioMeta, MetadataEmitter};
 use crate::dablin::msc::{extract_subchannel, SubchannelBuffer};
 use crate::dablin::pad::PadDecoder;
+#[cfg(not(feature = "latm-only"))]
 use crate::dablin::utils::jsonl::write_jsonl;
-use crate::dablin::utils::path::sanitize_for_path;
+#[cfg(not(feature = "latm-only"))]
 use crate::dablin::utils::wav_writer::WavWriter;
 
+#[cfg(not(feature = "latm-only"))]
 struct ServiceDumpContext {
     sid: u32,
     scid: u8,
@@ -101,6 +113,7 @@ fn emit_subchannel_fd3(meta: &mut MetadataEmitter, fic: &FicDecoder, scid: u8) -
     protection
 }
 
+#[cfg(not(feature = "latm-only"))]
 fn write_subchannel_jsonl(
     meta: &mut BufWriter<std::fs::File>,
     fic: &FicDecoder,
@@ -169,6 +182,7 @@ fn hash_bytes(data: &[u8]) -> u64 {
 }
 
 /// Outcome of one ETI frame read+parse+fsync step.
+#[allow(clippy::large_enum_variant)]
 enum EtiStep<'a> {
     /// Successfully parsed frame.
     Frame(crate::dablin::eti::EtiFrame<'a>),
@@ -236,6 +250,7 @@ fn save_slide_file(dir: &Path, name: &str, data: &[u8]) {
 pub fn run(command: DablinCommand) -> Result<()> {
     match command {
         DablinCommand::OneServiceOut(args) => run_one_service(args),
+        #[cfg(not(feature = "latm-only"))]
         DablinCommand::AllServicesOut(args) => run_all_services_cmd(args),
         DablinCommand::ListServices(args) => run_list_services(args),
     }
@@ -243,6 +258,7 @@ pub fn run(command: DablinCommand) -> Result<()> {
 
 fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
     init_logger(args.silent);
+    #[cfg(not(feature = "latm-only"))]
     if (args.audio_out == AudioOut::Adts || args.audio_out == AudioOut::Latm)
         && (args.aac_decoder != AacDecoderChoice::Faad2 || args.aac_gap != AacGap::Freeze)
     {
@@ -284,6 +300,7 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
             (use_iso8601_time, use_time_only, custom_datetime_format)
         });
 
+    #[cfg(not(feature = "latm-only"))]
     let mut aac: Option<AacDecoder> = None;
     let mut latm_packer = LatmPacker::new();
     let mut subch_buf: Option<SubchannelBuffer> = None;
@@ -395,6 +412,7 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
                     }
 
                     match args.audio_out {
+                        #[cfg(not(feature = "latm-only"))]
                         AudioOut::Pcm => {
                             aac = init_aac_decoder(&args.aac_decoder, &args.aac_gap);
                         }
@@ -497,6 +515,7 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
 
             if !result.firecode_ok {
                 debug!("DAB+ FireCode mismatch – advancing one CIF");
+                #[cfg(not(feature = "latm-only"))]
                 if let Some(aac_dec) = aac.as_ref() {
                     if let Some(pcm) = aac_dec.silence_for_missing_cifs(1) {
                         let bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
@@ -519,6 +538,7 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
                     "Superframe too corrupted (RS corrected {} codewords) – applying gap policy",
                     result.rs_corrected
                 );
+                #[cfg(not(feature = "latm-only"))]
                 if let Some(aac_dec) = aac.as_ref() {
                     // A superframe represents 5 CIFs = 5 * 24ms = 120ms
                     if let Some(pcm) = aac_dec.silence_for_corrupted_superframe(5) {
@@ -543,6 +563,7 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
             }
 
             if let Some(fmt) = result.format.as_ref() {
+                #[cfg(not(feature = "latm-only"))]
                 if let Some(aac_dec) = aac.as_mut() {
                     aac_dec.init_format(fmt);
                 }
@@ -604,6 +625,7 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
                 }
 
                 match args.audio_out {
+                    #[cfg(not(feature = "latm-only"))]
                     AudioOut::Pcm => {
                         let aac_dec = match aac.as_mut() {
                             Some(d) => d,
@@ -663,6 +685,7 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(feature = "latm-only"))]
 fn run_all_services_cmd(args: AllServicesOutArgs) -> Result<()> {
     init_logger(args.silent);
     let running = setup_ctrlc();
@@ -720,6 +743,7 @@ fn run_list_services(args: ListServicesArgs) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(feature = "latm-only"))]
 fn run_all_services(
     args: &AllServicesOutArgs,
     reader: &mut BufReader<Box<dyn Read>>,
@@ -1103,7 +1127,9 @@ fn run_all_services(
     Ok(())
 }
 
+#[cfg_attr(all(not(test), feature = "latm-only"), allow(dead_code))]
 fn service_dir_name(sid: u32, label: Option<&str>) -> String {
+    use crate::dablin::utils::path::sanitize_for_path;
     let sid_hex = format!("{:#06x}", sid);
     let safe_label = sanitize_for_path(label.unwrap_or("no-label"));
     format!("{}-{}", sid_hex, safe_label)
@@ -1119,6 +1145,7 @@ fn select_service<'a>(fic: &'a FicDecoder, args: &OneServiceOutArgs) -> Option<&
     fic.services.iter().find(|s| !s.components.is_empty())
 }
 
+#[cfg(not(feature = "latm-only"))]
 fn init_aac_decoder(backend: &AacDecoderChoice, gap: &AacGap) -> Option<AacDecoder> {
     match backend {
         AacDecoderChoice::Faad2 => {

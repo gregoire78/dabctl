@@ -37,6 +37,12 @@ Audio output on **stdout** is configurable:
 - `--audio-out adts`: raw AAC in ADTS (no faad2/fdk decode path)
 - `--audio-out latm`: raw AAC in LATM/LOAS (no faad2/fdk decode path)
 
+> **LATM-only build** — no libfaad2 required:
+> ```bash
+> sudo apt install -y build-essential pkg-config libfec-dev
+> cargo build --release --features latm-only
+> ```
+
 ---
 
 ## Prerequisites
@@ -47,7 +53,7 @@ Audio output on **stdout** is configurable:
 |---|---|
 | `build-essential` | C compiler (required by libfaad2 / libfdk-aac) |
 | `pkg-config` | Library discovery |
-| `libfaad-dev` | AAC decoder for DAB+ (default backend) |
+| `libfaad-dev` | AAC decoder for DAB+ (default backend, not needed for `latm-only`) |
 | `libfdk-aac-dev` | Alternative AAC decoder — Fraunhofer FDK (optional, `fdk-aac` feature) |
 
 > `libfdk-aac-dev` is in the `non-free` component on Debian (Fraunhofer audio patents). Use the default faad2 backend unless FDK-AAC quality is specifically required.
@@ -68,6 +74,30 @@ cargo build --release
 
 # With Fraunhofer FDK-AAC backend
 cargo build --release --features fdk-aac
+
+# LATM-only: no libfaad2 dependency, outputs ADTS/LATM only (no PCM decode)
+cargo build --release --features latm-only
+```
+
+### LATM-only build
+
+The `latm-only` feature produces a binary that **does not link against libfaad2** (or libfdk-aac).
+It supports `--audio-out adts` and `--audio-out latm` exclusively — raw AAC bitstream output
+that can be muxed directly into HLS or piped to an external decoder such as ffmpeg.
+
+`list-services` continues to work normally. `one-service-out` defaults to `--audio-out latm`.
+`all-services-out` is not available in this variant.
+
+```bash
+# Minimal system dependencies for latm-only
+sudo apt install -y pkg-config libfec-dev
+
+# Build
+cargo build --release --features latm-only
+
+# Pipe LATM stream to ffmpeg
+./target/release/dabctl dablin one-service-out -i multiplex.eti -s 0xF2F8 \
+  | ffmpeg -i pipe:0 -c:a aac output.m4a
 ```
 
 ### Dev Container

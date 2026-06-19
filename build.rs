@@ -1,5 +1,6 @@
 fn main() {
-    // Link faad2 (default AAC decoder)
+    // Link faad2 only when PCM decode is needed (i.e. not latm-only mode)
+    #[cfg(not(feature = "latm-only"))]
     println!("cargo:rustc-link-lib=faad");
 
     // Link libfec (Phil Karn's RS decoder, same as dablin)
