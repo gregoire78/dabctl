@@ -95,10 +95,41 @@ In `latm-only` builds:
 
 In `wasm-runtime` builds:
 
-- Output is forced to LATM (same constraint as `latm-only`).
-- `all-services-out` is not available.
-- Requires a wasm32-compatible `libfec.a` — vendored in `third_party/libfec/wasm/`.
-- Rebuilt if needed with `bash scripts/build-libfec-wasm.sh` (requires `clang`, `llvm-ar`, `wasi-libc`).
+- CLI runtime is constrained like `latm-only`:
+  - `one-service-out` is LATM-only.
+  - `all-services-out` is rejected on CLI.
+  - `list-services` remains available.
+- Requires a wasm32-compatible `libfec.a` (vendored at `third_party/libfec/wasm/`).
+- Rebuild helper: `bash scripts/build-libfec-wasm.sh` (needs `clang`, `llvm-ar`, `wasi-libc`).
+
+WASM memory API (wasm32 + `wasm-runtime`):
+
+- Runtime core: `src/wasm/runtime.rs`
+  - `decode_eti_to_latm_memory`
+  - `decode_eti_to_latm_memory_with_options`
+  - `decode_eti_to_latm_all_services_memory`
+  - `decode_eti_to_latm_all_services_memory_with_options`
+- wasm-bindgen exports: `src/wasm/bindings.rs`
+  - functions: `decodeEtiToLatmMemory`, `decodeEtiToLatmMemoryWithOptions`, `decodeEtiToLatmAllServicesMemory`, `decodeEtiToLatmAllServicesMemoryWithOptions`, `dabctlVersion`
+  - classes: `WasmLatmDecodeOptions`, `WasmAllServicesDecodeOptions`, `WasmLatmDecodeOutput`, `WasmLatmServiceOutput`, `WasmAllServicesLatmDecodeOutput`
+- Returned payloads:
+  - `latm_bytes`: concatenated LOAS/LATM bytes (stdout-equivalent)
+  - `metadata_jsonl`: JSONL events (fd3-equivalent)
+
+Examples:
+
+- Node.js minimal integration: `examples/wasm/minimal-integration.mjs`
+- Browser minimal integration: `examples/wasm/minimal-browser-integration.mjs`
+- Browser Worker all-services:
+  - main thread: `examples/wasm/all-services-worker-main.mjs`
+  - worker: `examples/wasm/all-services.worker.mjs`
+
+Generate JS bindings (`pkg/dabctl.js`, `pkg/dabctl_bg.wasm`):
+
+```bash
+wasm-bindgen target/wasm32-unknown-unknown/debug/dabctl.wasm \
+  --target web --out-dir pkg --out-name dabctl
+```
 
 ### Dev Container
 
@@ -346,22 +377,23 @@ bash live-capture-iq2pcm.sh multiplex.eti 0xF2F8
 ```
 ETI (file / stdin)
   └─ ETI-NI frame parser
-       └─ FIC / FIG decoder  (ensemble, service, labels)
-            └─ MSC sub-channel extractor
-                 └─ DAB+ superframe assembler (5 CIFs)
-                      └─ Reed-Solomon FEC (120,110)
-                           └─ FireCode sync
-              └─ AAC access units
-                ├─ audio-out=pcm
-                │    └─ AAC decoder (faad2 / fdk-aac)
-                │         └─ PCM → stdout (s16le 48 kHz stereo)
-                ├─ audio-out=adts
-                │    └─ ADTS framer → stdout
-                └─ audio-out=latm
-                  └─ LATM/LOAS framer → stdout
+    ├─ FIC / FIG decoder (ensemble, services, labels, time)
+    └─ MSC sub-channel extractor
+      └─ DAB+ superframe assembler (5 CIF)
+        └─ Reed-Solomon FEC (120,110) + FireCode sync
+          └─ AAC access units
+            ├─ CLI one-service-out
+            │    ├─ audio-out=pcm  -> AAC decode (faad2/fdk) -> stdout PCM
+            │    ├─ audio-out=adts -> ADTS framing            -> stdout AAC
+            │    └─ audio-out=latm -> LATM/LOAS framing       -> stdout AAC
+            ├─ CLI all-services-out (default build only)
+            │    └─ AAC decode (faad2/fdk) -> per-service WAV files
+            └─ WASM memory runtime (wasm-runtime)
+              └─ LATM/LOAS bytes in memory (no stdout)
 
 PAD decoder (DLS + MOT slideshow)
-  └─ JSONL events → FD 3
+  ├─ CLI: JSONL events -> FD 3
+  └─ WASM: JSONL lines in memory (`metadata_jsonl`)
 ```
 
 ### Source tree
@@ -370,11 +402,14 @@ PAD decoder (DLS + MOT slideshow)
 src/
   main.rs                  CLI entry point
   cli.rs                   clap argument definitions
+  wasm/
+    mod.rs
+    runtime.rs             Memory decode core (`wasm-runtime`)
+    bindings.rs            wasm-bindgen exports (wasm32 + `wasm-runtime`)
   dablin/
     mod.rs
     runner.rs              Main decoding loop
     metadata.rs            JSONL emitter (FD 3)
-    wasm_runtime.rs        WebAssembly memory-based API scaffold (`wasm-runtime` feature)
     eti/mod.rs             ETI-NI frame parser + FSYNC
     fic/mod.rs             FIC/FIG decoder (FIG 0/0, 0/1, 0/2, 0/9, 0/10, 0/13, 1/0, 1/1, 1/5)
     msc/mod.rs             MSC sub-channel extraction

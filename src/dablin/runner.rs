@@ -12,12 +12,10 @@
 //!     → FD 3  (JSONL metadata)
 
 use anyhow::{Context, Result};
-use base64::Engine;
 use rayon::prelude::*;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,16 +24,20 @@ use tracing::{debug, info, warn};
 
 use crate::cli::{
     AacDecoder as AacDecoderChoice, AacGap, AllServicesOutArgs, AudioOut, DablinCommand,
-    DateTimeFormat, ListServicesArgs, OneServiceOutArgs,
+    ListServicesArgs, OneServiceOutArgs,
 };
 use crate::dablin::audio::latm::LatmPacker;
 use crate::dablin::audio::AacDecoder;
 use crate::dablin::dabplus::{process_superframe_inplace, SuperframeFormat};
 use crate::dablin::eti::{parse_frame, FsyncState, ETI_FRAME_SIZE};
-use crate::dablin::fic::{FicDecoder, ProtectionProfile, ServiceInfo};
+use crate::dablin::fic::{FicDecoder, ServiceInfo};
 use crate::dablin::metadata::{AudioMeta, MetadataEmitter};
 use crate::dablin::msc::{extract_subchannel, SubchannelBuffer};
 use crate::dablin::pad::PadDecoder;
+use crate::dablin::shared::{
+    audio_codec_label, audio_mode_label, current_subchannel_protection, datetime_mode_from_option,
+    encode_slide_base64, hash_bytes, protection_label,
+};
 use crate::dablin::utils::jsonl::write_jsonl;
 use crate::dablin::utils::path::sanitize_for_path;
 use crate::dablin::utils::wav_writer::WavWriter;
@@ -63,35 +65,6 @@ struct ServiceDumpContext {
 }
 
 const OUTPUT_SAMPLE_RATE_HZ: u32 = 48_000;
-
-fn protection_label(p: &ProtectionProfile) -> String {
-    match p {
-        ProtectionProfile::EepA(level) => format!("EEP-{}A", level),
-        ProtectionProfile::EepB(level) => format!("EEP-{}B", level),
-        ProtectionProfile::Uep(index) => format!("UEP-{}", index),
-    }
-}
-
-fn audio_codec_label(fmt: &SuperframeFormat) -> &'static str {
-    match (fmt.sbr_flag, fmt.ps_flag) {
-        (false, _) => "AAC-LC",
-        (true, false) => "HE-AAC",
-        (true, true) => "HE-AAC v2",
-    }
-}
-
-fn audio_mode_label(fmt: &SuperframeFormat) -> &'static str {
-    if fmt.core_ch_config() == 2 {
-        "stereo"
-    } else {
-        "mono"
-    }
-}
-
-fn current_subchannel_protection(fic: &FicDecoder, scid: u8) -> Option<String> {
-    fic.subchannel_org(scid)
-        .map(|s| protection_label(&s.protection))
-}
 
 fn emit_subchannel_fd3(meta: &mut MetadataEmitter, fic: &FicDecoder, scid: u8) -> Option<String> {
     let protection = current_subchannel_protection(fic, scid);
@@ -168,13 +141,6 @@ fn open_eti_reader(input: &str) -> Result<BufReader<Box<dyn Read>>> {
     Ok(BufReader::with_capacity(ETI_FRAME_SIZE * 4, reader))
 }
 
-/// Hash raw bytes with `DefaultHasher` for slide deduplication.
-fn hash_bytes(data: &[u8]) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    data.hash(&mut hasher);
-    hasher.finish()
-}
-
 /// Outcome of one ETI frame read+parse+fsync step.
 #[allow(clippy::large_enum_variant)]
 enum EtiStep<'a> {
@@ -217,15 +183,6 @@ fn read_eti_step<'buf>(
     }
     *frame_count += 1;
     Ok(EtiStep::Frame(frame))
-}
-
-/// Optionally encode slide data as base64. Returns empty string when `do_base64` is false.
-fn encode_slide_base64(data: &[u8], do_base64: bool) -> String {
-    if do_base64 {
-        base64::engine::general_purpose::STANDARD.encode(data)
-    } else {
-        String::new()
-    }
 }
 
 fn should_emit_slide_metadata(slide_dir: Option<&Path>, slide_base64: bool) -> bool {
@@ -314,18 +271,7 @@ fn run_one_service(args: OneServiceOutArgs) -> Result<()> {
     let mut emitted_audio_format: Option<SuperframeFormat> = None;
     let mut emitted_subchannel_protection: Option<String> = None;
     let mut selected_bitrate_kbps: Option<u32> = None;
-    let datetime_mode: Option<(bool, bool, Option<&str>)> =
-        args.datetime_format.as_ref().map(|fmt| {
-            let custom_datetime_format = match fmt {
-                DateTimeFormat::Custom(pattern) => Some(pattern.as_str()),
-                _ => None,
-            };
-            let use_iso8601_time =
-                matches!(fmt, DateTimeFormat::Iso8601 | DateTimeFormat::TimeIso8601);
-            let use_time_only =
-                matches!(fmt, DateTimeFormat::TimeHuman | DateTimeFormat::TimeIso8601);
-            (use_iso8601_time, use_time_only, custom_datetime_format)
-        });
+    let datetime_mode = datetime_mode_from_option(args.datetime_format.as_ref());
 
     let mut aac: Option<AacDecoder> = None;
     let mut latm_packer = LatmPacker::new();
@@ -779,18 +725,7 @@ fn run_all_services(
     let mut frame_count = 0u64;
     let mut contexts: BTreeMap<u32, ServiceDumpContext> = BTreeMap::new();
     let mut emitted_time: Option<(String, String, String)> = None;
-    let datetime_mode: Option<(bool, bool, Option<&str>)> =
-        args.datetime_format.as_ref().map(|fmt| {
-            let custom_datetime_format = match fmt {
-                DateTimeFormat::Custom(pattern) => Some(pattern.as_str()),
-                _ => None,
-            };
-            let use_iso8601_time =
-                matches!(fmt, DateTimeFormat::Iso8601 | DateTimeFormat::TimeIso8601);
-            let use_time_only =
-                matches!(fmt, DateTimeFormat::TimeHuman | DateTimeFormat::TimeIso8601);
-            (use_iso8601_time, use_time_only, custom_datetime_format)
-        });
+    let datetime_mode = datetime_mode_from_option(args.datetime_format.as_ref());
 
     loop {
         if !running.load(Ordering::Relaxed) {
@@ -1225,15 +1160,15 @@ fn print_services(fic: &FicDecoder) {
 mod tests {
     #[cfg(feature = "latm-only")]
     use super::enforce_latm_only_constraints;
-    use super::{
-        audio_codec_label, audio_mode_label, current_subchannel_protection, encode_slide_base64,
-        hash_bytes, protection_label, save_slide_file, service_dir_name,
-        should_emit_slide_metadata,
-    };
+    use super::{save_slide_file, service_dir_name, should_emit_slide_metadata};
     #[cfg(feature = "latm-only")]
     use crate::cli::{
         AacDecoder, AacGap, AllServicesOutArgs, AudioOut, DablinCommand, ListServicesArgs,
         OneServiceOutArgs,
+    };
+    use crate::dablin::shared::{
+        audio_codec_label, audio_mode_label, current_subchannel_protection, encode_slide_base64,
+        hash_bytes, protection_label,
     };
     use std::path::Path;
 

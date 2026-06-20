@@ -8,6 +8,7 @@ on:
   push:
     tags:
       - 'v*'  # Ex: v1.0.0
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -42,11 +43,6 @@ jobs:
             runner: ubuntu-24.04-arm
             cargo_args: --features latm-only
             artifact: target/release/dabctl
-          - name: wasm
-            runner: ubuntu-latest
-            cargo_args: --target wasm32-unknown-unknown --features wasm-runtime
-            artifact: target/wasm32-unknown-unknown/release/dabctl.wasm
-            libfec_wasm_lib_dir: third_party/libfec/wasm
 
     steps:
       - uses: actions/checkout@v4
@@ -63,7 +59,7 @@ jobs:
             jq cmake
 
       - name: Install libfaad-dev
-        if: ${{ !contains(matrix.name, '_latm') && matrix.name != 'wasm' }}
+        if: ${{ !contains(matrix.name, '_latm') }}
         run: sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libfaad-dev
 
       - name: Install libfdk-aac-dev
@@ -73,20 +69,13 @@ jobs:
       - name: Set up Rust
         run: rustup update stable
 
-      - name: Set up wasm32 target
-        if: matrix.name == 'wasm'
-        run: rustup target add wasm32-unknown-unknown
-
       - name: Build
-        env:
-          LIBFEC_WASM_LIB_DIR: ${{ matrix.libfec_wasm_lib_dir }}
         run: |
           VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
           echo "VERSION=$VERSION" >> $GITHUB_ENV
           cargo build --release ${{ matrix.cargo_args }}
           ARTIFACT="${{ matrix.artifact }}"
           BIN="dabctl-$VERSION-${{ matrix.name }}"
-          [[ "$ARTIFACT" == *.wasm ]] && BIN="$BIN.wasm"
           cp "$ARTIFACT" "$BIN"
           tar -czf "dabctl-$VERSION-${{ matrix.name }}.tar.gz" "$BIN"
 
@@ -95,8 +84,13 @@ jobs:
           name: binary-${{ matrix.name }}
           path: dabctl-*-${{ matrix.name }}.tar.gz
 
+  build-wasm:
+    uses: ./.github/workflows/release-wasm.yml
+
   release:
-    needs: build
+    needs:
+      - build
+      - build-wasm
     runs-on: ubuntu-latest
 
     steps:

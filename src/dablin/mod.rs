@@ -6,6 +6,5 @@ pub mod metadata;
 pub mod msc;
 pub mod pad;
 pub mod runner;
+pub mod shared;
 pub mod utils;
-#[cfg(feature = "wasm-runtime")]
-pub mod wasm_runtime;

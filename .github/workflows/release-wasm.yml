@@ -1,0 +1,63 @@
+name: Build & Release WASM
+
+on:
+  workflow_call:
+
+permissions:
+  contents: write
+
+jobs:
+  build-wasm:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            pkg-config libusb-1.0-0-dev librtlsdr-dev \
+            libmpg123-dev libfec-dev \
+            clang libclang-dev \
+            jq cmake
+
+      - name: Set up Rust
+        run: rustup update stable
+
+      - name: Set up wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Install wasm-bindgen-cli
+        run: cargo install wasm-bindgen-cli --locked
+
+      - name: Build wasm runtime
+        env:
+          LIBFEC_WASM_LIB_DIR: third_party/libfec/wasm
+        run: |
+          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          cargo build --release --target wasm32-unknown-unknown --features wasm-runtime
+
+      - name: Generate bindgen package
+        run: |
+          mkdir -p pkg
+          wasm-bindgen target/wasm32-unknown-unknown/release/dabctl.wasm \
+            --target web \
+            --out-dir pkg \
+            --out-name dabctl
+
+      - name: Package wasm artifacts
+        run: |
+          cp target/wasm32-unknown-unknown/release/dabctl.wasm "dabctl-$VERSION-wasm-raw.wasm"
+          tar -czf "dabctl-$VERSION-wasm-bindgen-pkg.tar.gz" -C pkg .
+          tar -czf "dabctl-$VERSION-wasm-raw.tar.gz" "dabctl-$VERSION-wasm-raw.wasm"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wasm-artifacts
+          path: |
+            dabctl-*-wasm-bindgen-pkg.tar.gz
+            dabctl-*-wasm-raw.tar.gz

@@ -20,3 +20,6 @@ Thumbs.db
 /build/
 # Tests locaux ignorés
 /test-local/
+
+# WASM bindgen generated package
+/pkg/
