@@ -10,6 +10,7 @@ use anyhow::{bail, Result};
 use serde_json::json;
 
 use crate::cli::DateTimeFormat;
+use crate::dablin::audio::adts::AdtsPacker;
 use crate::dablin::audio::latm::LatmPacker;
 use crate::dablin::dabplus::{process_superframe_inplace, SuperframeFormat};
 use crate::dablin::eti::{parse_frame, EtiFrame, ETI_FRAME_SIZE};
@@ -312,6 +313,32 @@ pub struct AllServicesLatmDecodeOutput {
     pub services: Vec<ServiceLatmDecodeOutput>,
 }
 
+// ── ADTS output types ──────────────────────────────────────────────────────
+
+/// Output container for a memory-based ADTS decode call.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AdtsDecodeOutput {
+    /// Concatenated ADTS-framed bytes.
+    pub adts_bytes: Vec<u8>,
+    /// Metadata events as JSONL lines.
+    pub metadata_jsonl: Vec<String>,
+}
+
+/// Per-service memory output in all-services ADTS decode mode.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ServiceAdtsDecodeOutput {
+    pub sid: u32,
+    pub label: Option<String>,
+    pub adts_bytes: Vec<u8>,
+    pub metadata_jsonl: Vec<String>,
+}
+
+/// Output container for all-services ADTS memory decode mode.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AllServicesAdtsDecodeOutput {
+    pub services: Vec<ServiceAdtsDecodeOutput>,
+}
+
 struct WasmAllServicesContext {
     sid: u32,
     scid: u8,
@@ -322,6 +349,18 @@ struct WasmAllServicesContext {
     pad_decoder: PadDecoder,
     sf_work_buf: Vec<u8>,
     out: ServiceLatmDecodeOutput,
+}
+
+struct WasmAllServicesAdtsContext {
+    sid: u32,
+    scid: u8,
+    bitrate_kbps: u32,
+    metadata_state: WasmMetadataState,
+    subch_buf: SubchannelBuffer,
+    adts_packer: AdtsPacker,
+    pad_decoder: PadDecoder,
+    sf_work_buf: Vec<u8>,
+    out: ServiceAdtsDecodeOutput,
 }
 
 fn emit_time_with_mode_if_changed(
@@ -356,6 +395,36 @@ fn emit_time_with_mode_if_changed(
 fn update_all_services_label_sync(
     fic: &FicDecoder,
     contexts: &mut BTreeMap<u32, WasmAllServicesContext>,
+) {
+    for ctx in contexts.values_mut() {
+        emit_ensemble_if_ready(fic, &mut ctx.metadata_state, &mut ctx.out.metadata_jsonl);
+
+        if let Some(svc) = fic.services.iter().find(|s| s.sid == ctx.sid) {
+            if let Some(label) = svc.label.clone() {
+                if ctx.out.label.as_deref() != Some(label.as_str()) {
+                    ctx.out.label = Some(label);
+                    emit_service_if_needed(
+                        fic,
+                        ctx.sid,
+                        &mut ctx.metadata_state,
+                        &mut ctx.out.metadata_jsonl,
+                    );
+                }
+            }
+        }
+
+        emit_subchannel_if_changed(
+            fic,
+            ctx.scid,
+            &mut ctx.metadata_state,
+            &mut ctx.out.metadata_jsonl,
+        );
+    }
+}
+
+fn update_all_services_adts_label_sync(
+    fic: &FicDecoder,
+    contexts: &mut BTreeMap<u32, WasmAllServicesAdtsContext>,
 ) {
     for ctx in contexts.values_mut() {
         emit_ensemble_if_ready(fic, &mut ctx.metadata_state, &mut ctx.out.metadata_jsonl);
@@ -444,6 +513,67 @@ fn process_one_all_services_context(
     }
 }
 
+fn process_one_all_services_adts_context(
+    fic: &FicDecoder,
+    options: &WasmAllServicesDecodeOptions,
+    ctx: &mut WasmAllServicesAdtsContext,
+    cif_data: &[u8],
+) {
+    ctx.subch_buf.push_cif(cif_data);
+
+    while ctx.subch_buf.len() >= ctx.subch_buf.superframe_size() {
+        let sf_size = ctx.subch_buf.superframe_size();
+        let Some(slice) = ctx.subch_buf.try_peek_superframe_slice() else {
+            break;
+        };
+
+        if ctx.sf_work_buf.len() != sf_size {
+            ctx.sf_work_buf.resize(sf_size, 0);
+        }
+        ctx.sf_work_buf.copy_from_slice(slice);
+
+        let result = process_superframe_inplace(&mut ctx.sf_work_buf);
+        if !result.firecode_ok {
+            ctx.subch_buf.advance_one_cif();
+            continue;
+        }
+
+        ctx.subch_buf.consume_superframe();
+        if result.rs_over_threshold {
+            continue;
+        }
+
+        if let Some(fmt) = result.format.as_ref() {
+            process_pad_metadata_for_units(
+                &result.units,
+                fic,
+                ctx.sid,
+                ctx.scid,
+                &WasmLatmDecodeOptions {
+                    slide_base64: options.slide_base64,
+                    dedup_pad: options.dedup_pad,
+                    ..Default::default()
+                },
+                &mut ctx.metadata_state,
+                &mut ctx.out.metadata_jsonl,
+                &mut ctx.pad_decoder,
+            );
+
+            emit_audio_if_changed(
+                fmt,
+                Some(ctx.bitrate_kbps),
+                &mut ctx.metadata_state,
+                &mut ctx.out.metadata_jsonl,
+            );
+
+            for au in result.units {
+                let frame = ctx.adts_packer.wrap(fmt, &au.data);
+                ctx.out.adts_bytes.extend_from_slice(&frame);
+            }
+        }
+    }
+}
+
 fn make_all_services_context(
     fic: &FicDecoder,
     svc: &ServiceInfo,
@@ -465,6 +595,53 @@ fn make_all_services_context(
             sid: svc.sid,
             label: svc.label.clone(),
             latm_bytes: Vec::new(),
+            metadata_jsonl: Vec::new(),
+        },
+    };
+
+    emit_ensemble_if_ready(fic, &mut ctx.metadata_state, &mut ctx.out.metadata_jsonl);
+    emit_service_if_needed(
+        fic,
+        svc.sid,
+        &mut ctx.metadata_state,
+        &mut ctx.out.metadata_jsonl,
+    );
+    emit_subchannel_if_changed(
+        fic,
+        scid,
+        &mut ctx.metadata_state,
+        &mut ctx.out.metadata_jsonl,
+    );
+    emit_time_with_mode_if_changed(
+        fic,
+        datetime_mode_from_option(options.datetime_format.as_ref()),
+        &mut ctx.metadata_state,
+        &mut ctx.out.metadata_jsonl,
+    );
+    ctx
+}
+
+fn make_all_services_adts_context(
+    fic: &FicDecoder,
+    svc: &ServiceInfo,
+    scid: u8,
+    stl: u16,
+    options: &WasmAllServicesDecodeOptions,
+) -> WasmAllServicesAdtsContext {
+    let bitrate_kbps = (u32::from(stl) * 64) / 24;
+    let mut ctx = WasmAllServicesAdtsContext {
+        sid: svc.sid,
+        scid,
+        bitrate_kbps,
+        metadata_state: WasmMetadataState::default(),
+        subch_buf: SubchannelBuffer::new(scid, stl),
+        adts_packer: AdtsPacker::new(),
+        pad_decoder: PadDecoder::new(),
+        sf_work_buf: Vec::new(),
+        out: ServiceAdtsDecodeOutput {
+            sid: svc.sid,
+            label: svc.label.clone(),
+            adts_bytes: Vec::new(),
             metadata_jsonl: Vec::new(),
         },
     };
@@ -760,6 +937,225 @@ pub fn decode_eti_to_latm_all_services_memory_with_options(
     Ok(out)
 }
 
+// ── ADTS single-service decode ────────────────────────────────────────────
+
+/// Decode ETI bytes to ADTS + fd3-equivalent JSONL metadata in memory
+/// using default options.
+pub fn decode_eti_to_adts_memory(eti_bytes: &[u8]) -> Result<AdtsDecodeOutput> {
+    decode_eti_to_adts_memory_with_options(eti_bytes, &WasmLatmDecodeOptions::default())
+}
+
+/// Decode ETI bytes to ADTS + fd3-equivalent JSONL metadata in memory.
+///
+/// Same pipeline as LATM but each AAC access unit is wrapped in an ADTS header.
+pub fn decode_eti_to_adts_memory_with_options(
+    eti_bytes: &[u8],
+    options: &WasmLatmDecodeOptions,
+) -> Result<AdtsDecodeOutput> {
+    if eti_bytes.len() < ETI_FRAME_SIZE {
+        bail!("no complete ETI frame in input");
+    }
+
+    let mut out = AdtsDecodeOutput::default();
+    let mut fic = FicDecoder::new();
+    let mut metadata_state = WasmMetadataState::default();
+    let mut selection = WasmDecodeSelectionState::default();
+    let adts_packer = AdtsPacker::new();
+    let mut pad_decoder = PadDecoder::new();
+    let mut sf_work_buf: Vec<u8> = Vec::new();
+
+    for raw in eti_bytes.chunks_exact(ETI_FRAME_SIZE) {
+        let Ok(frame) = parse_frame(raw) else {
+            continue;
+        };
+
+        if frame.ficf && !frame.fic.is_empty() {
+            fic.process_fic(frame.fic);
+            emit_ensemble_if_ready(&fic, &mut metadata_state, &mut out.metadata_jsonl);
+            emit_time_if_changed(&fic, options, &mut metadata_state, &mut out.metadata_jsonl);
+        }
+
+        select_service_if_needed(
+            &fic,
+            &frame,
+            options,
+            &mut metadata_state,
+            &mut out.metadata_jsonl,
+            &mut selection,
+        );
+
+        let Some(scid) = selection.scid else {
+            continue;
+        };
+
+        emit_subchannel_if_changed(&fic, scid, &mut metadata_state, &mut out.metadata_jsonl);
+
+        let Some(cif_data) = extract_subchannel(&frame, scid) else {
+            continue;
+        };
+
+        if selection.subch_buf.is_none() {
+            init_subchannel_buffer_from_frame(&frame, scid, &mut selection);
+            if selection.subch_buf.is_none() {
+                continue;
+            }
+        }
+
+        let Some(buf) = selection.subch_buf.as_mut() else {
+            continue;
+        };
+        buf.push_cif(cif_data);
+
+        while buf.len() >= buf.superframe_size() {
+            let sf_size = buf.superframe_size();
+            let Some(slice) = buf.try_peek_superframe_slice() else {
+                break;
+            };
+
+            if sf_work_buf.len() != sf_size {
+                sf_work_buf.resize(sf_size, 0);
+            }
+            sf_work_buf.copy_from_slice(slice);
+
+            let result = process_superframe_inplace(&mut sf_work_buf);
+            if !result.firecode_ok {
+                buf.advance_one_cif();
+                continue;
+            }
+
+            buf.consume_superframe();
+            if result.rs_over_threshold {
+                continue;
+            }
+
+            if let Some(fmt) = result.format.as_ref() {
+                if let Some(selected_sid) = selection.sid {
+                    process_pad_metadata_for_units(
+                        &result.units,
+                        &fic,
+                        selected_sid,
+                        scid,
+                        options,
+                        &mut metadata_state,
+                        &mut out.metadata_jsonl,
+                        &mut pad_decoder,
+                    );
+                }
+
+                emit_audio_if_changed(
+                    fmt,
+                    selection.bitrate_kbps,
+                    &mut metadata_state,
+                    &mut out.metadata_jsonl,
+                );
+
+                for au in result.units {
+                    let adts_frame = adts_packer.wrap(fmt, &au.data);
+                    out.adts_bytes.extend_from_slice(&adts_frame);
+                }
+            }
+        }
+    }
+
+    if selection.sid.is_none() {
+        if options.sid.is_some() || options.label.is_some() {
+            bail!("requested service not found in ETI input");
+        }
+        bail!("no service discovered in ETI input");
+    }
+    if out.adts_bytes.is_empty() {
+        bail!("no decodable ADTS output produced from ETI input");
+    }
+
+    Ok(out)
+}
+
+// ── ADTS all-services decode ──────────────────────────────────────────────
+
+/// Decode ETI bytes to ADTS + fd3-equivalent JSONL metadata for all DAB+ services.
+pub fn decode_eti_to_adts_all_services_memory(
+    eti_bytes: &[u8],
+) -> Result<AllServicesAdtsDecodeOutput> {
+    decode_eti_to_adts_all_services_memory_with_options(
+        eti_bytes,
+        &WasmAllServicesDecodeOptions::default(),
+    )
+}
+
+/// Decode ETI bytes to ADTS + fd3-equivalent JSONL metadata for all DAB+ services
+/// with explicit options.
+pub fn decode_eti_to_adts_all_services_memory_with_options(
+    eti_bytes: &[u8],
+    options: &WasmAllServicesDecodeOptions,
+) -> Result<AllServicesAdtsDecodeOutput> {
+    if eti_bytes.len() < ETI_FRAME_SIZE {
+        bail!("no complete ETI frame in input");
+    }
+
+    let mut fic = FicDecoder::new();
+    let mut contexts: BTreeMap<u32, WasmAllServicesAdtsContext> = BTreeMap::new();
+    let datetime_mode = datetime_mode_from_option(options.datetime_format.as_ref());
+
+    for raw in eti_bytes.chunks_exact(ETI_FRAME_SIZE) {
+        let Ok(frame) = parse_frame(raw) else {
+            continue;
+        };
+
+        if frame.ficf && !frame.fic.is_empty() {
+            fic.process_fic(frame.fic);
+        }
+
+        for svc in &fic.services {
+            if svc.components.is_empty() || contexts.contains_key(&svc.sid) {
+                continue;
+            }
+            let scid = svc.components[0].subch_id;
+            if !fic.is_dabplus(scid) {
+                continue;
+            }
+            let Some(stc) = frame.stc.iter().find(|entry| entry.scid == scid) else {
+                continue;
+            };
+
+            let ctx = make_all_services_adts_context(&fic, svc, scid, stc.stl, options);
+            contexts.insert(svc.sid, ctx);
+        }
+
+        if contexts.is_empty() {
+            continue;
+        }
+
+        update_all_services_adts_label_sync(&fic, &mut contexts);
+        for ctx in contexts.values_mut() {
+            emit_time_with_mode_if_changed(
+                &fic,
+                datetime_mode,
+                &mut ctx.metadata_state,
+                &mut ctx.out.metadata_jsonl,
+            );
+
+            let Some(cif_data) = extract_subchannel(&frame, ctx.scid) else {
+                continue;
+            };
+            process_one_all_services_adts_context(&fic, options, ctx, cif_data);
+        }
+    }
+
+    if contexts.is_empty() {
+        bail!("no DAB+ service discovered in ETI input");
+    }
+
+    let mut out = AllServicesAdtsDecodeOutput {
+        services: contexts.into_values().map(|ctx| ctx.out).collect(),
+    };
+    out.services.retain(|svc| !svc.adts_bytes.is_empty());
+    if out.services.is_empty() {
+        bail!("no decodable ADTS output produced from ETI input");
+    }
+
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -774,7 +1170,7 @@ mod tests {
 
     #[test]
     fn decode_fixture_produces_latm_and_fd3_events() {
-        let eti = fs::read("test-local/multiplex-t.eti").expect("fixture ETI must exist");
+        let eti = fs::read("test-local/multiplex.eti").expect("fixture ETI must exist");
         let out = decode_eti_to_latm_memory(&eti).expect("decode should succeed");
 
         assert!(!out.latm_bytes.is_empty());
@@ -787,7 +1183,7 @@ mod tests {
 
     #[test]
     fn decode_with_sid_selects_requested_service() {
-        let eti = fs::read("test-local/multiplex-t.eti").expect("fixture ETI must exist");
+        let eti = fs::read("test-local/multiplex.eti").expect("fixture ETI must exist");
         let options = WasmLatmDecodeOptions {
             sid: Some("0xf201".to_string()),
             ..Default::default()
@@ -807,7 +1203,7 @@ mod tests {
 
     #[test]
     fn decode_with_label_selects_requested_service() {
-        let eti = fs::read("test-local/multiplex-t.eti").expect("fixture ETI must exist");
+        let eti = fs::read("test-local/multiplex.eti").expect("fixture ETI must exist");
         let options = WasmLatmDecodeOptions {
             label: Some("FRANCE INTER".to_string()),
             ..Default::default()
@@ -826,7 +1222,7 @@ mod tests {
 
     #[test]
     fn decode_with_unknown_sid_fails() {
-        let eti = fs::read("test-local/multiplex-t.eti").expect("fixture ETI must exist");
+        let eti = fs::read("test-local/multiplex.eti").expect("fixture ETI must exist");
         let options = WasmLatmDecodeOptions {
             sid: Some("0xffff".to_string()),
             ..Default::default()
@@ -838,7 +1234,7 @@ mod tests {
 
     #[test]
     fn decode_all_services_produces_multiple_service_outputs() {
-        let eti = fs::read("test-local/multiplex-t.eti").expect("fixture ETI must exist");
+        let eti = fs::read("test-local/multiplex.eti").expect("fixture ETI must exist");
         let out = decode_eti_to_latm_all_services_memory(&eti)
             .expect("all-services decode should succeed");
 
@@ -880,5 +1276,85 @@ mod tests {
     fn fd3_display_handles_no_events() {
         let fd3 = format_fd3_display(&[]);
         assert_eq!(fd3, "<empty>");
+    }
+
+    // ── ADTS tests ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn decode_adts_fixture_produces_adts_and_fd3_events() {
+        let eti = fs::read("test-local/multiplex.eti").expect("fixture ETI must exist");
+        let out = decode_eti_to_adts_memory(&eti).expect("decode should succeed");
+
+        assert!(!out.adts_bytes.is_empty());
+        assert!(!out.metadata_jsonl.is_empty());
+        assert!(out
+            .metadata_jsonl
+            .iter()
+            .any(|line| line.contains("\"service\"")));
+    }
+
+    #[test]
+    fn decode_adts_with_sid_selects_requested_service() {
+        let eti = fs::read("test-local/multiplex.eti").expect("fixture ETI must exist");
+        let options = WasmLatmDecodeOptions {
+            sid: Some("0xf201".to_string()),
+            ..Default::default()
+        };
+
+        let out = decode_eti_to_adts_memory_with_options(&eti, &options)
+            .expect("decode with sid should succeed");
+        let service_line = out
+            .metadata_jsonl
+            .iter()
+            .find(|line| line.contains("\"service\""))
+            .expect("service metadata must be present");
+
+        assert!(service_line.contains("0xf201"));
+        assert!(!out.adts_bytes.is_empty());
+    }
+
+    #[test]
+    fn decode_adts_with_label_selects_requested_service() {
+        let eti = fs::read("test-local/multiplex.eti").expect("fixture ETI must exist");
+        let options = WasmLatmDecodeOptions {
+            label: Some("FRANCE INTER".to_string()),
+            ..Default::default()
+        };
+
+        let out = decode_eti_to_adts_memory_with_options(&eti, &options)
+            .expect("decode with label should succeed");
+        let service_line = out
+            .metadata_jsonl
+            .iter()
+            .find(|line| line.contains("\"service\""))
+            .expect("service metadata must be present");
+
+        assert!(service_line.contains("0xf201"));
+    }
+
+    #[test]
+    fn decode_adts_with_unknown_sid_fails() {
+        let eti = fs::read("test-local/multiplex.eti").expect("fixture ETI must exist");
+        let options = WasmLatmDecodeOptions {
+            sid: Some("0xffff".to_string()),
+            ..Default::default()
+        };
+
+        let err = decode_eti_to_adts_memory_with_options(&eti, &options).unwrap_err();
+        assert!(err.to_string().contains("requested service not found"));
+    }
+
+    #[test]
+    fn decode_adts_all_services_produces_multiple_service_outputs() {
+        let eti = fs::read("test-local/multiplex.eti").expect("fixture ETI must exist");
+        let out = decode_eti_to_adts_all_services_memory(&eti)
+            .expect("all-services decode should succeed");
+
+        assert!(out.services.len() > 1);
+        assert!(out.services.iter().all(|svc| !svc.adts_bytes.is_empty()));
+        assert!(out.services.iter().all(|svc| svc
+            .metadata_jsonl
+            .iter()
+            .any(|line| line.contains("\"service\""))));
     }
 }

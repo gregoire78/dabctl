@@ -6,9 +6,13 @@ use wasm_bindgen::prelude::*;
 
 use crate::cli::DateTimeFormat;
 use crate::wasm::runtime::{
+    decode_eti_to_adts_all_services_memory, decode_eti_to_adts_all_services_memory_with_options,
+    decode_eti_to_adts_memory, decode_eti_to_adts_memory_with_options,
     decode_eti_to_latm_all_services_memory, decode_eti_to_latm_all_services_memory_with_options,
-    decode_eti_to_latm_memory, decode_eti_to_latm_memory_with_options, AllServicesLatmDecodeOutput,
-    LatmDecodeOutput, ServiceLatmDecodeOutput, WasmAllServicesDecodeOptions, WasmLatmDecodeOptions,
+    decode_eti_to_latm_memory, decode_eti_to_latm_memory_with_options, AdtsDecodeOutput,
+    AllServicesAdtsDecodeOutput, AllServicesLatmDecodeOutput, LatmDecodeOutput,
+    ServiceAdtsDecodeOutput, ServiceLatmDecodeOutput, WasmAllServicesDecodeOptions,
+    WasmLatmDecodeOptions,
 };
 
 #[wasm_bindgen(js_name = "WasmLatmDecodeOptions")]
@@ -261,6 +265,144 @@ pub fn decode_eti_to_latm_all_services_memory_with_options_js(
 
     decode_eti_to_latm_all_services_memory_with_options(eti_bytes, &decoded_options)
         .map(|inner| WasmAllServicesLatmDecodeOutputJs { inner })
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+// ── ADTS bindings ─────────────────────────────────────────────────────────
+
+#[wasm_bindgen(js_name = "WasmAdtsDecodeOutput")]
+pub struct WasmAdtsDecodeOutputJs {
+    inner: AdtsDecodeOutput,
+}
+
+#[wasm_bindgen(js_class = "WasmAdtsDecodeOutput")]
+impl WasmAdtsDecodeOutputJs {
+    #[wasm_bindgen(getter, js_name = "adtsBytes")]
+    pub fn adts_bytes(&self) -> Vec<u8> {
+        self.inner.adts_bytes.clone()
+    }
+
+    #[wasm_bindgen(getter, js_name = "metadataJsonl")]
+    pub fn metadata_jsonl(&self) -> Array {
+        self.inner
+            .metadata_jsonl
+            .iter()
+            .map(|line| JsValue::from_str(line))
+            .collect::<Array>()
+    }
+
+    #[wasm_bindgen(js_name = "stdoutPreview")]
+    pub fn stdout_preview(&self, max_bytes: usize) -> String {
+        use crate::wasm::runtime::format_stdout_hex_preview;
+        format_stdout_hex_preview(&self.inner.adts_bytes, max_bytes)
+    }
+
+    #[wasm_bindgen(js_name = "fd3Preview")]
+    pub fn fd3_preview(&self) -> String {
+        self.inner.metadata_jsonl.join("\n")
+    }
+}
+
+#[wasm_bindgen(js_name = "WasmAdtsServiceOutput")]
+pub struct WasmAdtsServiceOutputJs {
+    inner: ServiceAdtsDecodeOutput,
+}
+
+#[wasm_bindgen(js_class = "WasmAdtsServiceOutput")]
+impl WasmAdtsServiceOutputJs {
+    #[wasm_bindgen(getter, js_name = "sid")]
+    pub fn sid(&self) -> String {
+        format!("{:#06x}", self.inner.sid)
+    }
+
+    #[wasm_bindgen(getter, js_name = "label")]
+    pub fn label(&self) -> Option<String> {
+        self.inner.label.clone()
+    }
+
+    #[wasm_bindgen(getter, js_name = "adtsBytes")]
+    pub fn adts_bytes(&self) -> Vec<u8> {
+        self.inner.adts_bytes.clone()
+    }
+
+    #[wasm_bindgen(getter, js_name = "metadataJsonl")]
+    pub fn metadata_jsonl(&self) -> Array {
+        self.inner
+            .metadata_jsonl
+            .iter()
+            .map(|line| JsValue::from_str(line))
+            .collect::<Array>()
+    }
+
+    #[wasm_bindgen(js_name = "fd3Preview")]
+    pub fn fd3_preview(&self) -> String {
+        self.inner.metadata_jsonl.join("\n")
+    }
+}
+
+#[wasm_bindgen(js_name = "WasmAllServicesAdtsDecodeOutput")]
+pub struct WasmAllServicesAdtsDecodeOutputJs {
+    inner: AllServicesAdtsDecodeOutput,
+}
+
+#[wasm_bindgen(js_class = "WasmAllServicesAdtsDecodeOutput")]
+impl WasmAllServicesAdtsDecodeOutputJs {
+    #[wasm_bindgen(getter, js_name = "serviceCount")]
+    pub fn service_count(&self) -> usize {
+        self.inner.services.len()
+    }
+
+    #[wasm_bindgen(js_name = "getService")]
+    pub fn get_service(&self, index: usize) -> Option<WasmAdtsServiceOutputJs> {
+        self.inner
+            .services
+            .get(index)
+            .cloned()
+            .map(|inner| WasmAdtsServiceOutputJs { inner })
+    }
+}
+
+#[wasm_bindgen(js_name = "decodeEtiToAdtsMemory")]
+pub fn decode_eti_to_adts_memory_js(
+    eti_bytes: &[u8],
+) -> std::result::Result<WasmAdtsDecodeOutputJs, JsValue> {
+    decode_eti_to_adts_memory(eti_bytes)
+        .map(|inner| WasmAdtsDecodeOutputJs { inner })
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+#[wasm_bindgen(js_name = "decodeEtiToAdtsMemoryWithOptions")]
+pub fn decode_eti_to_adts_memory_with_options_js(
+    eti_bytes: &[u8],
+    options: &WasmLatmDecodeOptionsJs,
+) -> std::result::Result<WasmAdtsDecodeOutputJs, JsValue> {
+    let decoded_options = WasmLatmDecodeOptions::try_from(options)
+        .map_err(|e| JsValue::from_str(&format!("invalid wasm decode options: {}", e)))?;
+
+    decode_eti_to_adts_memory_with_options(eti_bytes, &decoded_options)
+        .map(|inner| WasmAdtsDecodeOutputJs { inner })
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+#[wasm_bindgen(js_name = "decodeEtiToAdtsAllServicesMemory")]
+pub fn decode_eti_to_adts_all_services_memory_js(
+    eti_bytes: &[u8],
+) -> std::result::Result<WasmAllServicesAdtsDecodeOutputJs, JsValue> {
+    decode_eti_to_adts_all_services_memory(eti_bytes)
+        .map(|inner| WasmAllServicesAdtsDecodeOutputJs { inner })
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+#[wasm_bindgen(js_name = "decodeEtiToAdtsAllServicesMemoryWithOptions")]
+pub fn decode_eti_to_adts_all_services_memory_with_options_js(
+    eti_bytes: &[u8],
+    options: &WasmAllServicesDecodeOptionsJs,
+) -> std::result::Result<WasmAllServicesAdtsDecodeOutputJs, JsValue> {
+    let decoded_options = WasmAllServicesDecodeOptions::try_from(options)
+        .map_err(|e| JsValue::from_str(&format!("invalid all-services options: {}", e)))?;
+
+    decode_eti_to_adts_all_services_memory_with_options(eti_bytes, &decoded_options)
+        .map(|inner| WasmAllServicesAdtsDecodeOutputJs { inner })
         .map_err(|e| JsValue::from_str(&e.to_string()))
 }
 

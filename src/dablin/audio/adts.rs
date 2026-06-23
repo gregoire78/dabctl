@@ -41,12 +41,30 @@ fn build_adts_header(fmt: &SuperframeFormat, au_len: usize) -> [u8; ADTS_HEADER_
 }
 
 /// Wrap an AAC access unit in an ADTS frame.
-pub fn wrap_au_in_adts(fmt: &SuperframeFormat, au: &[u8]) -> Vec<u8> {
+fn wrap_au_in_adts(fmt: &SuperframeFormat, au: &[u8]) -> Vec<u8> {
     let header = build_adts_header(fmt, au.len());
     let mut frame = Vec::with_capacity(ADTS_HEADER_SIZE + au.len());
     frame.extend_from_slice(&header);
     frame.extend_from_slice(au);
     frame
+}
+
+/// ADTS framing wrapper for AAC access units.
+/// Provides a symmetric API to `LatmPacker` for consistent codec handling.
+#[derive(Debug, Default)]
+pub struct AdtsPacker;
+
+impl AdtsPacker {
+    /// Create a new ADTS packer.
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Wrap an AAC access unit in an ADTS frame.
+    /// Returns a vector containing the complete ADTS-framed data.
+    pub fn wrap(&self, fmt: &SuperframeFormat, au: &[u8]) -> Vec<u8> {
+        wrap_au_in_adts(fmt, au)
+    }
 }
 
 #[cfg(test)]
@@ -65,8 +83,9 @@ mod tests {
 
     #[test]
     fn test_adts_syncword() {
+        let packer = AdtsPacker::new();
         let au = vec![0xAA; 100];
-        let frame = wrap_au_in_adts(&fmt_stereo_he_aac(), &au);
+        let frame = packer.wrap(&fmt_stereo_he_aac(), &au);
 
         // Check syncword (12 bits, all 1s)
         assert_eq!(frame[0], 0xFF);
@@ -75,8 +94,9 @@ mod tests {
 
     #[test]
     fn test_adts_frame_length() {
+        let packer = AdtsPacker::new();
         let au = vec![0xBB; 200];
-        let frame = wrap_au_in_adts(&fmt_stereo_he_aac(), &au);
+        let frame = packer.wrap(&fmt_stereo_he_aac(), &au);
 
         // Frame length should be 7 (header) + 200 (AU) = 207
         let length = ((frame[3] as usize & 0x03) << 11)
@@ -87,9 +107,10 @@ mod tests {
 
     #[test]
     fn test_adts_profile_and_sr() {
+        let packer = AdtsPacker::new();
         let fmt = fmt_stereo_he_aac();
         let au = vec![0xCC; 50];
-        let frame = wrap_au_in_adts(&fmt, &au);
+        let frame = packer.wrap(&fmt, &au);
 
         // Profile should be 1 (AAC-LC)
         let profile = (frame[2] >> 6) & 0x03;
