@@ -23,6 +23,20 @@ use crate::wasm::runtime::{
     FaadDecodeOutput, ServiceFaadDecodeOutput,
 };
 
+fn jsonl_to_js_array(lines: &[String]) -> Array {
+    lines
+        .iter()
+        .map(|line| JsValue::from_str(line))
+        .collect::<Array>()
+}
+
+fn take_jsonl_to_js_array(lines: &mut Vec<String>) -> Array {
+    std::mem::take(lines)
+        .into_iter()
+        .map(|line| JsValue::from_str(&line))
+        .collect::<Array>()
+}
+
 #[wasm_bindgen(js_name = "WasmLatmDecodeOptions")]
 pub struct WasmLatmDecodeOptionsJs {
     sid: Option<String>,
@@ -228,13 +242,19 @@ impl WasmLatmServiceOutputJs {
         self.inner.latm_bytes.clone()
     }
 
+    #[wasm_bindgen(js_name = "takeLatmBytes")]
+    pub fn take_latm_bytes(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.inner.latm_bytes)
+    }
+
     #[wasm_bindgen(getter, js_name = "metadataJsonl")]
     pub fn metadata_jsonl(&self) -> Array {
-        self.inner
-            .metadata_jsonl
-            .iter()
-            .map(|line| JsValue::from_str(line))
-            .collect::<Array>()
+        jsonl_to_js_array(&self.inner.metadata_jsonl)
+    }
+
+    #[wasm_bindgen(js_name = "takeMetadataJsonl")]
+    pub fn take_metadata_jsonl(&mut self) -> Array {
+        take_jsonl_to_js_array(&mut self.inner.metadata_jsonl)
     }
 
     #[wasm_bindgen(js_name = "fd3Preview")]
@@ -267,11 +287,12 @@ impl WasmServiceDecodeOutputJs {
 
     #[wasm_bindgen(getter, js_name = "metadataJsonl")]
     pub fn metadata_jsonl(&self) -> Array {
-        self.inner
-            .metadata_jsonl
-            .iter()
-            .map(|line| JsValue::from_str(line))
-            .collect::<Array>()
+        jsonl_to_js_array(&self.inner.metadata_jsonl)
+    }
+
+    #[wasm_bindgen(js_name = "takeMetadataJsonl")]
+    pub fn take_metadata_jsonl(&mut self) -> Array {
+        take_jsonl_to_js_array(&mut self.inner.metadata_jsonl)
     }
 
     #[wasm_bindgen(js_name = "fd3Preview")]
@@ -326,13 +347,19 @@ impl WasmLatmDecodeOutputJs {
         self.inner.latm_bytes.clone()
     }
 
+    #[wasm_bindgen(js_name = "takeLatmBytes")]
+    pub fn take_latm_bytes(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.inner.latm_bytes)
+    }
+
     #[wasm_bindgen(getter, js_name = "metadataJsonl")]
     pub fn metadata_jsonl(&self) -> Array {
-        self.inner
-            .metadata_jsonl
-            .iter()
-            .map(|line| JsValue::from_str(line))
-            .collect::<Array>()
+        jsonl_to_js_array(&self.inner.metadata_jsonl)
+    }
+
+    #[wasm_bindgen(js_name = "takeMetadataJsonl")]
+    pub fn take_metadata_jsonl(&mut self) -> Array {
+        take_jsonl_to_js_array(&mut self.inner.metadata_jsonl)
     }
 
     #[wasm_bindgen(js_name = "stdoutPreview")]
@@ -426,13 +453,19 @@ impl WasmAdtsDecodeOutputJs {
         self.inner.adts_bytes.clone()
     }
 
+    #[wasm_bindgen(js_name = "takeAdtsBytes")]
+    pub fn take_adts_bytes(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.inner.adts_bytes)
+    }
+
     #[wasm_bindgen(getter, js_name = "metadataJsonl")]
     pub fn metadata_jsonl(&self) -> Array {
-        self.inner
-            .metadata_jsonl
-            .iter()
-            .map(|line| JsValue::from_str(line))
-            .collect::<Array>()
+        jsonl_to_js_array(&self.inner.metadata_jsonl)
+    }
+
+    #[wasm_bindgen(js_name = "takeMetadataJsonl")]
+    pub fn take_metadata_jsonl(&mut self) -> Array {
+        take_jsonl_to_js_array(&mut self.inner.metadata_jsonl)
     }
 
     #[wasm_bindgen(js_name = "stdoutPreview")]
@@ -469,13 +502,19 @@ impl WasmAdtsServiceOutputJs {
         self.inner.adts_bytes.clone()
     }
 
+    #[wasm_bindgen(js_name = "takeAdtsBytes")]
+    pub fn take_adts_bytes(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.inner.adts_bytes)
+    }
+
     #[wasm_bindgen(getter, js_name = "metadataJsonl")]
     pub fn metadata_jsonl(&self) -> Array {
-        self.inner
-            .metadata_jsonl
-            .iter()
-            .map(|line| JsValue::from_str(line))
-            .collect::<Array>()
+        jsonl_to_js_array(&self.inner.metadata_jsonl)
+    }
+
+    #[wasm_bindgen(js_name = "takeMetadataJsonl")]
+    pub fn take_metadata_jsonl(&mut self) -> Array {
+        take_jsonl_to_js_array(&mut self.inner.metadata_jsonl)
     }
 
     #[wasm_bindgen(js_name = "fd3Preview")]
@@ -572,13 +611,19 @@ impl WasmFaadDecodeOutputJs {
         self.inner.pcm_bytes.clone()
     }
 
+    #[wasm_bindgen(js_name = "takePcmBytes")]
+    pub fn take_pcm_bytes(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.inner.pcm_bytes)
+    }
+
     #[wasm_bindgen(getter, js_name = "metadataJsonl")]
     pub fn metadata_jsonl(&self) -> Array {
-        self.inner
-            .metadata_jsonl
-            .iter()
-            .map(|line| JsValue::from_str(line))
-            .collect::<Array>()
+        jsonl_to_js_array(&self.inner.metadata_jsonl)
+    }
+
+    #[wasm_bindgen(js_name = "takeMetadataJsonl")]
+    pub fn take_metadata_jsonl(&mut self) -> Array {
+        take_jsonl_to_js_array(&mut self.inner.metadata_jsonl)
     }
 
     #[wasm_bindgen(js_name = "fd3Preview")]
@@ -611,13 +656,19 @@ impl WasmFaadServiceOutputJs {
         self.inner.pcm_bytes.clone()
     }
 
+    #[wasm_bindgen(js_name = "takePcmBytes")]
+    pub fn take_pcm_bytes(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.inner.pcm_bytes)
+    }
+
     #[wasm_bindgen(getter, js_name = "metadataJsonl")]
     pub fn metadata_jsonl(&self) -> Array {
-        self.inner
-            .metadata_jsonl
-            .iter()
-            .map(|line| JsValue::from_str(line))
-            .collect::<Array>()
+        jsonl_to_js_array(&self.inner.metadata_jsonl)
+    }
+
+    #[wasm_bindgen(js_name = "takeMetadataJsonl")]
+    pub fn take_metadata_jsonl(&mut self) -> Array {
+        take_jsonl_to_js_array(&mut self.inner.metadata_jsonl)
     }
 
     #[wasm_bindgen(js_name = "fd3Preview")]

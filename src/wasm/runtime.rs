@@ -237,7 +237,8 @@ fn process_pad_metadata_for_units(
     fic: &FicDecoder,
     selected_sid: u32,
     scid: u8,
-    options: &WasmLatmDecodeOptions,
+    slide_base64: bool,
+    dedup_pad: bool,
     metadata_state: &mut WasmMetadataState,
     metadata_jsonl: &mut Vec<String>,
     pad_decoder: &mut PadDecoder,
@@ -250,8 +251,7 @@ fn process_pad_metadata_for_units(
         let pad_events = pad_decoder.process_au(&au.data, mot_app_type);
 
         if let Some(dl) = pad_events.dynamic_label {
-            let is_dup =
-                options.dedup_pad && metadata_state.last_dl.as_deref() == Some(dl.as_str());
+            let is_dup = dedup_pad && metadata_state.last_dl.as_deref() == Some(dl.as_str());
             if !is_dup {
                 push_jsonl_event(metadata_jsonl, json!({"dl": dl}));
                 metadata_state.last_dl = Some(dl);
@@ -260,10 +260,9 @@ fn process_pad_metadata_for_units(
 
         if let Some(slide) = pad_events.slide {
             let slide_hash = hash_bytes(&slide.data);
-            let is_dup_slide =
-                options.dedup_pad && metadata_state.last_slide_hash == Some(slide_hash);
-            if !is_dup_slide && options.slide_base64 {
-                let data_base64 = encode_slide_base64(&slide.data, options.slide_base64);
+            let is_dup_slide = dedup_pad && metadata_state.last_slide_hash == Some(slide_hash);
+            if !is_dup_slide && slide_base64 {
+                let data_base64 = encode_slide_base64(&slide.data, slide_base64);
                 push_jsonl_event(
                     metadata_jsonl,
                     json!({
@@ -533,20 +532,24 @@ fn update_all_services_label_sync_generic<T: AllServicesLabelSyncContext>(
     fic: &FicDecoder,
     contexts: &mut BTreeMap<u32, T>,
 ) {
+    let labels_by_sid: BTreeMap<u32, &str> = fic
+        .services
+        .iter()
+        .filter_map(|s| s.label.as_deref().map(|label| (s.sid, label)))
+        .collect();
+
     for ctx in contexts.values_mut() {
         {
             let (metadata_state, metadata_jsonl) = ctx.metadata_parts_mut();
             emit_ensemble_if_ready(fic, metadata_state, metadata_jsonl);
         }
 
-        if let Some(svc) = fic.services.iter().find(|s| s.sid == ctx.sid()) {
-            if let Some(label) = svc.label.clone() {
-                if ctx.label() != Some(label.as_str()) {
-                    ctx.set_label(label);
-                    let sid = ctx.sid();
-                    let (metadata_state, metadata_jsonl) = ctx.metadata_parts_mut();
-                    emit_service_if_needed(fic, sid, metadata_state, metadata_jsonl);
-                }
+        if let Some(label) = labels_by_sid.get(&ctx.sid()) {
+            if ctx.label() != Some(label) {
+                ctx.set_label((*label).to_owned());
+                let sid = ctx.sid();
+                let (metadata_state, metadata_jsonl) = ctx.metadata_parts_mut();
+                emit_service_if_needed(fic, sid, metadata_state, metadata_jsonl);
             }
         }
 
@@ -857,9 +860,7 @@ fn process_one_all_services_faad_context(
                 dec.init_format(fmt);
                 for au in units {
                     if let Some(pcm) = dec.decode(&au) {
-                        for sample in &pcm {
-                            pcm_bytes.extend_from_slice(&sample.to_le_bytes());
-                        }
+                        append_pcm_samples_le(pcm_bytes, &pcm);
                     }
                 }
             }
@@ -911,11 +912,8 @@ fn process_one_all_services_context_generic(
                 fic,
                 sid,
                 scid,
-                &WasmLatmDecodeOptions {
-                    slide_base64: options.slide_base64,
-                    dedup_pad: options.dedup_pad,
-                    ..Default::default()
-                },
+                options.slide_base64,
+                options.dedup_pad,
                 metadata_state,
                 metadata_jsonl,
                 pad_decoder,
@@ -923,6 +921,25 @@ fn process_one_all_services_context_generic(
 
             emit_audio_if_changed(fmt, Some(bitrate_kbps), metadata_state, metadata_jsonl);
             emit_units(fmt, result.units);
+        }
+    }
+}
+
+fn append_pcm_samples_le(dst: &mut Vec<u8>, pcm: &[i16]) {
+    #[cfg(target_endian = "little")]
+    {
+        let byte_len = std::mem::size_of_val(pcm);
+        dst.reserve(byte_len);
+        // Safe because i16 has no invalid bit patterns and we only reinterpret as bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(pcm.as_ptr() as *const u8, byte_len) };
+        dst.extend_from_slice(bytes);
+    }
+
+    #[cfg(not(target_endian = "little"))]
+    {
+        dst.reserve(pcm.len() * 2);
+        for sample in pcm {
+            dst.extend_from_slice(&sample.to_le_bytes());
         }
     }
 }
@@ -1246,7 +1263,8 @@ pub fn decode_eti_to_latm_memory_with_options(
                         &fic,
                         selected_sid,
                         scid,
-                        options,
+                        options.slide_base64,
+                        options.dedup_pad,
                         &mut metadata_state,
                         &mut out.metadata_jsonl,
                         &mut pad_decoder,
@@ -1451,7 +1469,8 @@ pub fn decode_eti_to_adts_memory_with_options(
                         &fic,
                         selected_sid,
                         scid,
-                        options,
+                        options.slide_base64,
+                        options.dedup_pad,
                         &mut metadata_state,
                         &mut out.metadata_jsonl,
                         &mut pad_decoder,
@@ -1624,7 +1643,8 @@ pub fn decode_eti_to_faad_memory_with_options(
                         &fic,
                         selected_sid,
                         scid,
-                        options,
+                        options.slide_base64,
+                        options.dedup_pad,
                         &mut metadata_state,
                         &mut out.metadata_jsonl,
                         &mut pad_decoder,
@@ -1645,9 +1665,7 @@ pub fn decode_eti_to_faad_memory_with_options(
                     dec.init_format(fmt);
                     for au in result.units {
                         if let Some(pcm) = dec.decode(&au) {
-                            for sample in &pcm {
-                                out.pcm_bytes.extend_from_slice(&sample.to_le_bytes());
-                            }
+                            append_pcm_samples_le(&mut out.pcm_bytes, &pcm);
                         }
                     }
                 }
