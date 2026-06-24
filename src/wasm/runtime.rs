@@ -339,6 +339,19 @@ pub struct AllServicesAdtsDecodeOutput {
     pub services: Vec<ServiceAdtsDecodeOutput>,
 }
 
+// ── FAAD PCM output type ──────────────────────────────────────────────────
+
+/// Output container for a memory-based FAAD (raw PCM) decode call.
+/// Emits s16le stereo 48 kHz PCM, identical to the native CLI stdout output.
+#[cfg(feature = "wasm-faad2")]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct FaadDecodeOutput {
+    /// Raw s16le PCM bytes (stdout-equivalent).
+    pub pcm_bytes: Vec<u8>,
+    /// Metadata events as JSONL lines (fd3-equivalent).
+    pub metadata_jsonl: Vec<String>,
+}
+
 struct WasmAllServicesContext {
     sid: u32,
     scid: u8,
@@ -1151,6 +1164,154 @@ pub fn decode_eti_to_adts_all_services_memory_with_options(
     out.services.retain(|svc| !svc.adts_bytes.is_empty());
     if out.services.is_empty() {
         bail!("no decodable ADTS output produced from ETI input");
+    }
+
+    Ok(out)
+}
+
+// ── FAAD single-service decode ────────────────────────────────────────────
+
+/// Decode ETI bytes to raw s16le PCM using the faad2 AAC decoder.
+/// Uses default options (first available service, no metadata extras).
+#[cfg(feature = "wasm-faad2")]
+pub fn decode_eti_to_faad_memory(eti_bytes: &[u8]) -> Result<FaadDecodeOutput> {
+    decode_eti_to_faad_memory_with_options(eti_bytes, &WasmLatmDecodeOptions::default())
+}
+
+/// Decode ETI bytes to raw s16le PCM using the faad2 AAC decoder.
+///
+/// Output mirrors the native `one-service-out --audio-out pcm` stdout contract:
+/// s16le, 48 kHz, stereo, no framing.
+#[cfg(feature = "wasm-faad2")]
+pub fn decode_eti_to_faad_memory_with_options(
+    eti_bytes: &[u8],
+    options: &WasmLatmDecodeOptions,
+) -> Result<FaadDecodeOutput> {
+    use crate::cli::AacGap;
+    use crate::dablin::audio::AacDecoder;
+
+    if eti_bytes.len() < ETI_FRAME_SIZE {
+        bail!("no complete ETI frame in input");
+    }
+
+    let mut out = FaadDecodeOutput::default();
+    let mut fic = FicDecoder::new();
+    let mut metadata_state = WasmMetadataState::default();
+    let mut selection = WasmDecodeSelectionState::default();
+    let mut aac_decoder: Option<AacDecoder> = None;
+    let mut pad_decoder = PadDecoder::new();
+    let mut sf_work_buf: Vec<u8> = Vec::new();
+
+    for raw in eti_bytes.chunks_exact(ETI_FRAME_SIZE) {
+        let Ok(frame) = parse_frame(raw) else {
+            continue;
+        };
+
+        if frame.ficf && !frame.fic.is_empty() {
+            fic.process_fic(frame.fic);
+            emit_ensemble_if_ready(&fic, &mut metadata_state, &mut out.metadata_jsonl);
+            emit_time_if_changed(&fic, options, &mut metadata_state, &mut out.metadata_jsonl);
+        }
+
+        select_service_if_needed(
+            &fic,
+            &frame,
+            options,
+            &mut metadata_state,
+            &mut out.metadata_jsonl,
+            &mut selection,
+        );
+
+        let Some(scid) = selection.scid else {
+            continue;
+        };
+
+        emit_subchannel_if_changed(&fic, scid, &mut metadata_state, &mut out.metadata_jsonl);
+
+        let Some(cif_data) = extract_subchannel(&frame, scid) else {
+            continue;
+        };
+
+        if selection.subch_buf.is_none() {
+            init_subchannel_buffer_from_frame(&frame, scid, &mut selection);
+            if selection.subch_buf.is_none() {
+                continue;
+            }
+        }
+
+        let Some(buf) = selection.subch_buf.as_mut() else {
+            continue;
+        };
+        buf.push_cif(cif_data);
+
+        while buf.len() >= buf.superframe_size() {
+            let sf_size = buf.superframe_size();
+            let Some(slice) = buf.try_peek_superframe_slice() else {
+                break;
+            };
+
+            if sf_work_buf.len() != sf_size {
+                sf_work_buf.resize(sf_size, 0);
+            }
+            sf_work_buf.copy_from_slice(slice);
+
+            let result = process_superframe_inplace(&mut sf_work_buf);
+            if !result.firecode_ok {
+                buf.advance_one_cif();
+                continue;
+            }
+
+            buf.consume_superframe();
+            if result.rs_over_threshold {
+                continue;
+            }
+
+            if let Some(fmt) = result.format.as_ref() {
+                if let Some(selected_sid) = selection.sid {
+                    process_pad_metadata_for_units(
+                        &result.units,
+                        &fic,
+                        selected_sid,
+                        scid,
+                        options,
+                        &mut metadata_state,
+                        &mut out.metadata_jsonl,
+                        &mut pad_decoder,
+                    );
+                }
+
+                emit_audio_if_changed(
+                    fmt,
+                    selection.bitrate_kbps,
+                    &mut metadata_state,
+                    &mut out.metadata_jsonl,
+                );
+
+                if aac_decoder.is_none() {
+                    aac_decoder = AacDecoder::new_faad2(AacGap::Freeze);
+                }
+                if let Some(ref mut dec) = aac_decoder {
+                    dec.init_format(fmt);
+                    for au in result.units {
+                        if let Some(pcm) = dec.decode(&au) {
+                            for sample in &pcm {
+                                out.pcm_bytes.extend_from_slice(&sample.to_le_bytes());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if selection.sid.is_none() {
+        if options.sid.is_some() || options.label.is_some() {
+            bail!("requested service not found in ETI input");
+        }
+        bail!("no service discovered in ETI input");
+    }
+    if out.pcm_bytes.is_empty() {
+        bail!("no decodable PCM output produced from ETI input");
     }
 
     Ok(out)

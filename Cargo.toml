@@ -1,6 +1,6 @@
 [package]
 name = "dabctl"
-version = "4.5.0"
+version = "4.6.0"
 edition = "2021"
 authors = ["gregoire78"]
 
@@ -32,6 +32,9 @@ fdk-aac = []
 latm-only = []
 # Prepare runtime constraints for future WebAssembly embedding.
 wasm-runtime = ["latm-only"]
+# WebAssembly build with faad2 AAC decoding to raw PCM.
+# Requires a wasm32-compatible libfaad.a provided at link time.
+wasm-faad2 = ["wasm-runtime"]
 
 [[bin]]
 name = "dabctl"

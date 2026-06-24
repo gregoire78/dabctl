@@ -7,20 +7,24 @@ pub mod adts;
 pub mod asc;
 pub mod latm;
 
-#[cfg(not(feature = "latm-only"))]
+#[cfg(any(not(feature = "latm-only"), feature = "wasm-faad2"))]
 pub mod faad2;
 
 #[cfg(feature = "fdk-aac")]
 pub mod fdk;
 
 use crate::cli::AacGap;
-#[cfg(any(not(feature = "latm-only"), feature = "fdk-aac"))]
+#[cfg(any(
+    not(feature = "latm-only"),
+    feature = "fdk-aac",
+    feature = "wasm-faad2"
+))]
 use crate::dablin::audio::asc::build_asc;
 use crate::dablin::dabplus::{AudioUnit, SuperframeFormat};
 
 /// Number of samples per AAC frame per channel (standard AAC-LC / HE-AAC).
 /// Used to compute the silence buffer size when gap policy = `silence`.
-#[cfg(any(not(feature = "latm-only"), test))]
+#[cfg(any(not(feature = "latm-only"), test, feature = "wasm-faad2"))]
 pub const AAC_SAMPLES_PER_FRAME: usize = 1024;
 pub const PCM_SAMPLES_PER_CIF_48K: usize = 1152;
 
@@ -109,17 +113,17 @@ pub struct AacDecoder {
 }
 
 enum AacDecoderInner {
-    #[cfg(not(feature = "latm-only"))]
+    #[cfg(any(not(feature = "latm-only"), feature = "wasm-faad2"))]
     Faad2(faad2::Faad2Decoder),
     #[cfg(feature = "fdk-aac")]
     Fdk(fdk::FdkDecoder),
-    #[cfg(feature = "latm-only")]
+    #[cfg(all(feature = "latm-only", not(feature = "wasm-faad2")))]
     #[allow(dead_code)]
     Disabled,
 }
 
 impl AacDecoder {
-    #[cfg(not(feature = "latm-only"))]
+    #[cfg(any(not(feature = "latm-only"), feature = "wasm-faad2"))]
     /// Create a new faad2-backed decoder.
     pub fn new_faad2(gap_policy: AacGap) -> Option<Self> {
         let inner = faad2::Faad2Decoder::new()?;
@@ -152,7 +156,7 @@ impl AacDecoder {
             return true;
         }
         let ok = match &mut self.inner {
-            #[cfg(not(feature = "latm-only"))]
+            #[cfg(any(not(feature = "latm-only"), feature = "wasm-faad2"))]
             AacDecoderInner::Faad2(dec) => {
                 let asc = build_asc(fmt);
                 dec.init_with_asc(&asc)
@@ -162,7 +166,7 @@ impl AacDecoder {
                 let asc = build_asc(fmt);
                 dec.init_with_asc(&asc)
             }
-            #[cfg(feature = "latm-only")]
+            #[cfg(all(feature = "latm-only", not(feature = "wasm-faad2")))]
             AacDecoderInner::Disabled => false,
         };
         if ok {
@@ -183,11 +187,11 @@ impl AacDecoder {
             return None;
         }
         let result: Option<Vec<i16>> = match &mut self.inner {
-            #[cfg(not(feature = "latm-only"))]
+            #[cfg(any(not(feature = "latm-only"), feature = "wasm-faad2"))]
             AacDecoderInner::Faad2(dec) => dec.decode(&_au.data),
             #[cfg(feature = "fdk-aac")]
             AacDecoderInner::Fdk(dec) => dec.decode(&_au.data),
-            #[cfg(feature = "latm-only")]
+            #[cfg(all(feature = "latm-only", not(feature = "wasm-faad2")))]
             AacDecoderInner::Disabled => None,
         };
 

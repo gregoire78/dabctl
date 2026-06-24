@@ -26,8 +26,8 @@ use crate::cli::{
     AacDecoder as AacDecoderChoice, AacGap, AllServicesOutArgs, AudioOut, DablinCommand,
     ListServicesArgs, OneServiceOutArgs,
 };
-use crate::dablin::audio::latm::LatmPacker;
 use crate::dablin::audio::adts::AdtsPacker;
+use crate::dablin::audio::latm::LatmPacker;
 use crate::dablin::audio::AacDecoder;
 use crate::dablin::dabplus::{process_superframe_inplace, SuperframeFormat};
 use crate::dablin::eti::{parse_frame, FsyncState, ETI_FRAME_SIZE};

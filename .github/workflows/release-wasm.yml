@@ -9,6 +9,17 @@ permissions:
 jobs:
   build-wasm:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: runtime
+            features: wasm-runtime
+          - variant: faad2
+            features: wasm-faad2
+
+    env:
+      LIBFEC_WASM_LIB_DIR: third_party/libfec/wasm
 
     steps:
       - uses: actions/checkout@v4
@@ -20,7 +31,7 @@ jobs:
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             pkg-config libusb-1.0-0-dev librtlsdr-dev \
-            libmpg123-dev libfec-dev \
+            libmpg123-dev libfec-dev wasi-libc \
             clang libclang-dev \
             jq cmake
 
@@ -33,31 +44,35 @@ jobs:
       - name: Install wasm-bindgen-cli
         run: cargo install wasm-bindgen-cli --locked
 
-      - name: Build wasm runtime
-        env:
-          LIBFEC_WASM_LIB_DIR: third_party/libfec/wasm
+      - name: Resolve version
         run: |
           VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
           echo "VERSION=$VERSION" >> $GITHUB_ENV
-          cargo build --release --target wasm32-unknown-unknown --features wasm-runtime
+
+      - name: Build wasm release
+        run: cargo build --release --target wasm32-unknown-unknown --features ${{ matrix.features }}
 
       - name: Generate bindgen package
+        env:
+          VARIANT: ${{ matrix.variant }}
         run: |
-          mkdir -p pkg
+          mkdir -p "pkg-${VARIANT}"
           wasm-bindgen target/wasm32-unknown-unknown/release/dabctl.wasm \
             --target web \
-            --out-dir pkg \
+            --out-dir "pkg-${VARIANT}" \
             --out-name dabctl
 
       - name: Package wasm artifacts
+        env:
+          VARIANT: ${{ matrix.variant }}
         run: |
-          cp target/wasm32-unknown-unknown/release/dabctl.wasm "dabctl-$VERSION-wasm-raw.wasm"
-          tar -czf "dabctl-$VERSION-wasm-bindgen-pkg.tar.gz" -C pkg .
-          tar -czf "dabctl-$VERSION-wasm-raw.tar.gz" "dabctl-$VERSION-wasm-raw.wasm"
+          cp target/wasm32-unknown-unknown/release/dabctl.wasm "dabctl-$VERSION-wasm-$VARIANT-raw.wasm"
+          tar -czf "dabctl-$VERSION-wasm-$VARIANT-bindgen-pkg.tar.gz" -C "pkg-$VARIANT" .
+          tar -czf "dabctl-$VERSION-wasm-$VARIANT-raw.tar.gz" "dabctl-$VERSION-wasm-$VARIANT-raw.wasm"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: wasm-artifacts
+          name: wasm-artifacts-${{ matrix.variant }}
           path: |
-            dabctl-*-wasm-bindgen-pkg.tar.gz
-            dabctl-*-wasm-raw.tar.gz
+            dabctl-*-wasm-${{ matrix.variant }}-bindgen-pkg.tar.gz
+            dabctl-*-wasm-${{ matrix.variant }}-raw.tar.gz

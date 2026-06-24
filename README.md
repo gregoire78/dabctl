@@ -75,6 +75,11 @@ cargo build --release --features latm-only
 # WebAssembly (ETI → LATM in-memory, RS correction via vendored libfec)
 LIBFEC_WASM_LIB_DIR=third_party/libfec/wasm \
   cargo build --target wasm32-unknown-unknown --features wasm-runtime
+
+# WebAssembly + faad2 PCM decode (requires wasm32 libfaad.a)
+LIBFEC_WASM_LIB_DIR=third_party/libfec/wasm \
+LIBFAAD_WASM_LIB_DIR=third_party/libfaad/wasm \
+  cargo build --target wasm32-unknown-unknown --features wasm-faad2
 ```
 
 ### Build flavors
@@ -85,6 +90,7 @@ LIBFEC_WASM_LIB_DIR=third_party/libfec/wasm \
 | FDK | `fdk-aac` | Same as default, with optional `--aac-decoder fdk` |
 | LATM-only | `latm-only` | Transport-oriented flavor: `one-service-out` forced to LATM, `all-services-out` disabled, `list-services` kept |
 | WebAssembly | `wasm-runtime` | wasm32 target, LATM-only output, RS correction via vendored `third_party/libfec/wasm/libfec.a` |
+| WebAssembly + FAAD | `wasm-faad2` | `wasm-runtime` + wasm32 faad2 static link (`libfaad.a`) enabling in-memory PCM decode exports |
 
 In `latm-only` builds:
 
@@ -102,6 +108,13 @@ In `wasm-runtime` builds:
 - Requires a wasm32-compatible `libfec.a` (vendored at `third_party/libfec/wasm/`).
 - Rebuild helper: `bash scripts/build-libfec-wasm.sh` (needs `clang`, `llvm-ar`, `wasi-libc`).
 
+In `wasm-faad2` builds:
+
+- Includes all `wasm-runtime` constraints (CLI remains LATM-only).
+- Adds wasm memory API exports for faad2 PCM decode.
+- Requires a wasm32-compatible `libfaad.a` (expected at `third_party/libfaad/wasm/`).
+- Rebuild helper: `bash scripts/build-libfaad-wasm.sh`.
+
 WASM memory API (wasm32 + `wasm-runtime`):
 
 - Runtime core: `src/wasm/runtime.rs`
@@ -109,11 +122,19 @@ WASM memory API (wasm32 + `wasm-runtime`):
   - `decode_eti_to_latm_memory_with_options`
   - `decode_eti_to_latm_all_services_memory`
   - `decode_eti_to_latm_all_services_memory_with_options`
+  - `decode_eti_to_adts_memory`
+  - `decode_eti_to_adts_memory_with_options`
+  - `decode_eti_to_adts_all_services_memory`
+  - `decode_eti_to_adts_all_services_memory_with_options`
+  - `decode_eti_to_faad_memory` (`wasm-faad2` only)
+  - `decode_eti_to_faad_memory_with_options` (`wasm-faad2` only)
 - wasm-bindgen exports: `src/wasm/bindings.rs`
-  - functions: `decodeEtiToLatmMemory`, `decodeEtiToLatmMemoryWithOptions`, `decodeEtiToLatmAllServicesMemory`, `decodeEtiToLatmAllServicesMemoryWithOptions`, `dabctlVersion`
-  - classes: `WasmLatmDecodeOptions`, `WasmAllServicesDecodeOptions`, `WasmLatmDecodeOutput`, `WasmLatmServiceOutput`, `WasmAllServicesLatmDecodeOutput`
+  - functions: `decodeEtiToLatmMemory`, `decodeEtiToLatmMemoryWithOptions`, `decodeEtiToLatmAllServicesMemory`, `decodeEtiToLatmAllServicesMemoryWithOptions`, `decodeEtiToAdtsMemory`, `decodeEtiToAdtsMemoryWithOptions`, `decodeEtiToAdtsAllServicesMemory`, `decodeEtiToAdtsAllServicesMemoryWithOptions`, `decodeEtiToFaadMemory` (`wasm-faad2` only), `decodeEtiToFaadMemoryWithOptions` (`wasm-faad2` only), `dabctlVersion`
+  - classes: `WasmLatmDecodeOptions`, `WasmAllServicesDecodeOptions`, `WasmLatmDecodeOutput`, `WasmLatmServiceOutput`, `WasmAllServicesLatmDecodeOutput`, `WasmAdtsDecodeOutput`, `WasmAdtsServiceOutput`, `WasmAllServicesAdtsDecodeOutput`, `WasmFaadDecodeOutput` (`wasm-faad2` only)
 - Returned payloads:
   - `latm_bytes`: concatenated LOAS/LATM bytes (stdout-equivalent)
+  - `adts_bytes`: concatenated ADTS bytes (stdout-equivalent)
+  - `pcm_bytes`: raw s16le PCM bytes (stdout-equivalent, `wasm-faad2` only)
   - `metadata_jsonl`: JSONL events (fd3-equivalent)
 
 Examples:

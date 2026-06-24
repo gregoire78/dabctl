@@ -15,6 +15,11 @@ use crate::wasm::runtime::{
     WasmLatmDecodeOptions,
 };
 
+#[cfg(feature = "wasm-faad2")]
+use crate::wasm::runtime::{
+    decode_eti_to_faad_memory, decode_eti_to_faad_memory_with_options, FaadDecodeOutput,
+};
+
 #[wasm_bindgen(js_name = "WasmLatmDecodeOptions")]
 pub struct WasmLatmDecodeOptionsJs {
     sid: Option<String>,
@@ -409,4 +414,62 @@ pub fn decode_eti_to_adts_all_services_memory_with_options_js(
 #[wasm_bindgen(js_name = "dabctlVersion")]
 pub fn dabctl_version_js() -> String {
     env!("CARGO_PKG_VERSION").to_string()
+}
+
+// ── FAAD (raw PCM) bindings ───────────────────────────────────────────────
+
+#[cfg(feature = "wasm-faad2")]
+#[wasm_bindgen(js_name = "WasmFaadDecodeOutput")]
+pub struct WasmFaadDecodeOutputJs {
+    inner: FaadDecodeOutput,
+}
+
+#[cfg(feature = "wasm-faad2")]
+#[wasm_bindgen(js_class = "WasmFaadDecodeOutput")]
+impl WasmFaadDecodeOutputJs {
+    /// Raw s16le PCM bytes (stdout-equivalent, 48 kHz stereo).
+    #[wasm_bindgen(getter, js_name = "pcmBytes")]
+    pub fn pcm_bytes(&self) -> Vec<u8> {
+        self.inner.pcm_bytes.clone()
+    }
+
+    #[wasm_bindgen(getter, js_name = "metadataJsonl")]
+    pub fn metadata_jsonl(&self) -> Array {
+        self.inner
+            .metadata_jsonl
+            .iter()
+            .map(|line| JsValue::from_str(line))
+            .collect::<Array>()
+    }
+
+    #[wasm_bindgen(js_name = "fd3Preview")]
+    pub fn fd3_preview(&self) -> String {
+        self.inner.metadata_jsonl.join("\n")
+    }
+}
+
+/// Decode ETI bytes to raw s16le PCM using the faad2 AAC decoder (default options).
+#[cfg(feature = "wasm-faad2")]
+#[wasm_bindgen(js_name = "decodeEtiToFaadMemory")]
+pub fn decode_eti_to_faad_memory_js(
+    eti_bytes: &[u8],
+) -> std::result::Result<WasmFaadDecodeOutputJs, JsValue> {
+    decode_eti_to_faad_memory(eti_bytes)
+        .map(|inner| WasmFaadDecodeOutputJs { inner })
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// Decode ETI bytes to raw s16le PCM using the faad2 AAC decoder with explicit options.
+#[cfg(feature = "wasm-faad2")]
+#[wasm_bindgen(js_name = "decodeEtiToFaadMemoryWithOptions")]
+pub fn decode_eti_to_faad_memory_with_options_js(
+    eti_bytes: &[u8],
+    options: &WasmLatmDecodeOptionsJs,
+) -> std::result::Result<WasmFaadDecodeOutputJs, JsValue> {
+    let decoded_options = WasmLatmDecodeOptions::try_from(options)
+        .map_err(|e| JsValue::from_str(&format!("invalid wasm decode options: {}", e)))?;
+
+    decode_eti_to_faad_memory_with_options(eti_bytes, &decoded_options)
+        .map(|inner| WasmFaadDecodeOutputJs { inner })
+        .map_err(|e| JsValue::from_str(&e.to_string()))
 }

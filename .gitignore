@@ -23,3 +23,9 @@ Thumbs.db
 
 # WASM bindgen generated package
 /pkg/
+
+# FAAD2 wasm setup artifacts
+/third_party/libfaad/src/
+/third_party/libfaad/wasm/obj/
+!/third_party/libfaad/wasm/libfaad.a
+!/third_party/libfaad/wasm/.gitkeep
