@@ -118,6 +118,8 @@ In `wasm-faad2` builds:
 WASM memory API (wasm32 + `wasm-runtime`):
 
 - Runtime core: `src/wasm/runtime.rs`
+  - `decode_eti_to_all_services_memory`
+  - `decode_eti_to_all_services_memory_with_options`
   - `decode_eti_to_latm_memory`
   - `decode_eti_to_latm_memory_with_options`
   - `decode_eti_to_latm_all_services_memory`
@@ -131,8 +133,9 @@ WASM memory API (wasm32 + `wasm-runtime`):
   - `decode_eti_to_faad_all_services_memory` (`wasm-faad2` only)
   - `decode_eti_to_faad_all_services_memory_with_options` (`wasm-faad2` only)
 - wasm-bindgen exports: `src/wasm/bindings.rs`
-  - functions: `decodeEtiToLatmMemory`, `decodeEtiToLatmMemoryWithOptions`, `decodeEtiToLatmAllServicesMemory`, `decodeEtiToLatmAllServicesMemoryWithOptions`, `decodeEtiToAdtsMemory`, `decodeEtiToAdtsMemoryWithOptions`, `decodeEtiToAdtsAllServicesMemory`, `decodeEtiToAdtsAllServicesMemoryWithOptions`, `decodeEtiToFaadMemory` (`wasm-faad2` only), `decodeEtiToFaadMemoryWithOptions` (`wasm-faad2` only), `decodeEtiToFaadAllServicesMemory` (`wasm-faad2` only), `decodeEtiToFaadAllServicesMemoryWithOptions` (`wasm-faad2` only), `dabctlVersion`
-  - classes: `WasmLatmDecodeOptions`, `WasmAllServicesDecodeOptions`, `WasmLatmDecodeOutput`, `WasmLatmServiceOutput`, `WasmAllServicesLatmDecodeOutput`, `WasmAdtsDecodeOutput`, `WasmAdtsServiceOutput`, `WasmAllServicesAdtsDecodeOutput`, `WasmFaadDecodeOutput` (`wasm-faad2` only), `WasmFaadServiceOutput` (`wasm-faad2` only), `WasmAllServicesFaadDecodeOutput` (`wasm-faad2` only)
+  - functions: `decodeEtiToAllServicesMemory`, `decodeEtiToAllServicesMemoryWithOptions`, `decodeEtiToLatmMemory`, `decodeEtiToLatmMemoryWithOptions`, `decodeEtiToLatmAllServicesMemory`, `decodeEtiToLatmAllServicesMemoryWithOptions`, `decodeEtiToAdtsMemory`, `decodeEtiToAdtsMemoryWithOptions`, `decodeEtiToAdtsAllServicesMemory`, `decodeEtiToAdtsAllServicesMemoryWithOptions`, `decodeEtiToFaadMemory` (`wasm-faad2` only), `decodeEtiToFaadMemoryWithOptions` (`wasm-faad2` only), `decodeEtiToFaadAllServicesMemory` (`wasm-faad2` only), `decodeEtiToFaadAllServicesMemoryWithOptions` (`wasm-faad2` only), `dabctlVersion`
+  - classes: `WasmEtiSession`, `WasmLatmDecodeOptions`, `WasmAllServicesDecodeOptions`, `WasmServiceDecodeOutput`, `WasmAllServicesDecodeOutput`, `WasmLatmDecodeOutput`, `WasmLatmServiceOutput`, `WasmAllServicesLatmDecodeOutput`, `WasmAdtsDecodeOutput`, `WasmAdtsServiceOutput`, `WasmAllServicesAdtsDecodeOutput`, `WasmFaadDecodeOutput` (`wasm-faad2` only), `WasmFaadServiceOutput` (`wasm-faad2` only), `WasmAllServicesFaadDecodeOutput` (`wasm-faad2` only)
+  - `WasmEtiSession` methods: `decodeAllServices(options)`, `decodeFaadServiceBySid(sid)` (`wasm-faad2` only), `decodeFaadServiceBySidWithOptions(sid, options)` (`wasm-faad2` only)
 - Returned payloads:
   - `latm_bytes`: concatenated LOAS/LATM bytes (stdout-equivalent)
   - `adts_bytes`: concatenated ADTS bytes (stdout-equivalent)
@@ -412,7 +415,10 @@ ETI (file / stdin)
             ├─ CLI all-services-out (default build only)
             │    └─ AAC decode (faad2/fdk) -> per-service WAV files
             └─ WASM memory runtime (wasm-runtime)
-              └─ LATM/LOAS bytes in memory (no stdout)
+              ├─ metadata-only all-services output in memory
+              ├─ LATM/LOAS bytes in memory
+              ├─ ADTS bytes in memory
+              └─ optional raw PCM in memory (`wasm-faad2`)
 
 PAD decoder (DLS + MOT slideshow)
   ├─ CLI: JSONL events -> FD 3

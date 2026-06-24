@@ -318,6 +318,20 @@ pub struct AllServicesLatmDecodeOutput {
     pub services: Vec<ServiceLatmDecodeOutput>,
 }
 
+/// Per-service metadata-only output in all-services decode mode.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ServiceMetadataDecodeOutput {
+    pub sid: u32,
+    pub label: Option<String>,
+    pub metadata_jsonl: Vec<String>,
+}
+
+/// Output container for metadata-only all-services memory decode mode.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AllServicesMetadataDecodeOutput {
+    pub services: Vec<ServiceMetadataDecodeOutput>,
+}
+
 // ── ADTS output types ──────────────────────────────────────────────────────
 
 /// Output container for a memory-based ADTS decode call.
@@ -384,6 +398,11 @@ struct WasmAllServicesAdtsContext {
     adts_packer: AdtsPacker,
 }
 
+struct WasmAllServicesMetadataContext {
+    core: AllServicesContextCore<ServiceMetadataDecodeOutput>,
+    emitted_any_audio: bool,
+}
+
 #[cfg(feature = "wasm-faad2")]
 struct WasmAllServicesFaadContext {
     core: AllServicesContextCore<ServiceFaadDecodeOutput>,
@@ -435,6 +454,31 @@ impl AllServicesLabelSyncContext for WasmAllServicesContext {
 }
 
 impl AllServicesLabelSyncContext for WasmAllServicesAdtsContext {
+    fn sid(&self) -> u32 {
+        self.core.sid
+    }
+
+    fn scid(&self) -> u8 {
+        self.core.scid
+    }
+
+    fn label(&self) -> Option<&str> {
+        self.core.out.label.as_deref()
+    }
+
+    fn set_label(&mut self, label: String) {
+        self.core.out.label = Some(label);
+    }
+
+    fn metadata_parts_mut(&mut self) -> (&mut WasmMetadataState, &mut Vec<String>) {
+        (
+            &mut self.core.metadata_state,
+            &mut self.core.out.metadata_jsonl,
+        )
+    }
+}
+
+impl AllServicesLabelSyncContext for WasmAllServicesMetadataContext {
     fn sid(&self) -> u32 {
         self.core.sid
     }
@@ -555,6 +599,13 @@ fn update_all_services_adts_label_sync(
     update_all_services_label_sync_generic(fic, contexts);
 }
 
+fn update_all_services_metadata_label_sync(
+    fic: &FicDecoder,
+    contexts: &mut BTreeMap<u32, WasmAllServicesMetadataContext>,
+) {
+    update_all_services_label_sync_generic(fic, contexts);
+}
+
 #[cfg(feature = "wasm-faad2")]
 fn update_all_services_faad_label_sync(
     fic: &FicDecoder,
@@ -585,6 +636,23 @@ fn finalize_adts_all_services_output(
     out.services.retain(|svc| !svc.adts_bytes.is_empty());
     if out.services.is_empty() {
         bail!("no decodable ADTS output produced from ETI input");
+    }
+    Ok(out)
+}
+
+fn finalize_metadata_all_services_output(
+    contexts: BTreeMap<u32, WasmAllServicesMetadataContext>,
+) -> Result<AllServicesMetadataDecodeOutput> {
+    let mut out = AllServicesMetadataDecodeOutput {
+        services: contexts
+            .into_values()
+            .filter(|ctx| ctx.emitted_any_audio)
+            .map(|ctx| ctx.core.out)
+            .collect(),
+    };
+    out.services.retain(|svc| !svc.metadata_jsonl.is_empty());
+    if out.services.is_empty() {
+        bail!("no decodable metadata output produced from ETI input");
     }
     Ok(out)
 }
@@ -726,6 +794,33 @@ fn process_one_all_services_adts_context(
             for au in units {
                 let frame = adts_packer.wrap(fmt, &au.data);
                 adts_bytes.extend_from_slice(&frame);
+            }
+        },
+    );
+}
+
+fn process_one_all_services_metadata_context(
+    fic: &FicDecoder,
+    options: &WasmAllServicesDecodeOptions,
+    ctx: &mut WasmAllServicesMetadataContext,
+    cif_data: &[u8],
+) {
+    let emitted_any_audio = &mut ctx.emitted_any_audio;
+    process_one_all_services_context_generic(
+        fic,
+        options,
+        ctx.core.sid,
+        ctx.core.scid,
+        ctx.core.bitrate_kbps,
+        &mut ctx.core.subch_buf,
+        &mut ctx.core.sf_work_buf,
+        &mut ctx.core.metadata_state,
+        &mut ctx.core.out.metadata_jsonl,
+        &mut ctx.core.pad_decoder,
+        cif_data,
+        move |_fmt, units| {
+            if !units.is_empty() {
+                *emitted_any_audio = true;
             }
         },
     );
@@ -895,6 +990,43 @@ fn make_all_services_adts_context(
             },
         },
         adts_packer: AdtsPacker::new(),
+    };
+
+    emit_initial_all_services_metadata(
+        fic,
+        svc.sid,
+        scid,
+        options,
+        &mut ctx.core.metadata_state,
+        &mut ctx.core.out.metadata_jsonl,
+    );
+    ctx
+}
+
+fn make_all_services_metadata_context(
+    fic: &FicDecoder,
+    svc: &ServiceInfo,
+    scid: u8,
+    stl: u16,
+    options: &WasmAllServicesDecodeOptions,
+) -> WasmAllServicesMetadataContext {
+    let bitrate_kbps = (u32::from(stl) * 64) / 24;
+    let mut ctx = WasmAllServicesMetadataContext {
+        core: AllServicesContextCore {
+            sid: svc.sid,
+            scid,
+            bitrate_kbps,
+            metadata_state: WasmMetadataState::default(),
+            subch_buf: SubchannelBuffer::new(scid, stl),
+            pad_decoder: PadDecoder::new(),
+            sf_work_buf: Vec::new(),
+            out: ServiceMetadataDecodeOutput {
+                sid: svc.sid,
+                label: svc.label.clone(),
+                metadata_jsonl: Vec::new(),
+            },
+        },
+        emitted_any_audio: false,
     };
 
     emit_initial_all_services_metadata(
@@ -1183,6 +1315,41 @@ pub fn decode_eti_to_latm_all_services_memory_with_options(
             );
         },
         finalize_latm_all_services_output,
+    )
+}
+
+/// Decode ETI bytes to fd3-equivalent JSONL metadata for all DAB+ services.
+pub fn decode_eti_to_all_services_memory(
+    eti_bytes: &[u8],
+) -> Result<AllServicesMetadataDecodeOutput> {
+    decode_eti_to_all_services_memory_with_options(
+        eti_bytes,
+        &WasmAllServicesDecodeOptions::default(),
+    )
+}
+
+/// Decode ETI bytes to fd3-equivalent JSONL metadata for all DAB+ services
+/// with explicit options.
+pub fn decode_eti_to_all_services_memory_with_options(
+    eti_bytes: &[u8],
+    options: &WasmAllServicesDecodeOptions,
+) -> Result<AllServicesMetadataDecodeOutput> {
+    decode_eti_to_all_services_memory_with_options_generic(
+        eti_bytes,
+        options,
+        make_all_services_metadata_context,
+        update_all_services_metadata_label_sync,
+        process_one_all_services_metadata_context,
+        |ctx| ctx.core.scid,
+        |fic, datetime_mode, ctx| {
+            emit_time_with_mode_if_changed(
+                fic,
+                datetime_mode,
+                &mut ctx.core.metadata_state,
+                &mut ctx.core.out.metadata_jsonl,
+            );
+        },
+        finalize_metadata_all_services_output,
     )
 }
 

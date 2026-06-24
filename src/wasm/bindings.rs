@@ -8,11 +8,12 @@ use crate::cli::DateTimeFormat;
 use crate::wasm::runtime::{
     decode_eti_to_adts_all_services_memory, decode_eti_to_adts_all_services_memory_with_options,
     decode_eti_to_adts_memory, decode_eti_to_adts_memory_with_options,
+    decode_eti_to_all_services_memory, decode_eti_to_all_services_memory_with_options,
     decode_eti_to_latm_all_services_memory, decode_eti_to_latm_all_services_memory_with_options,
     decode_eti_to_latm_memory, decode_eti_to_latm_memory_with_options, AdtsDecodeOutput,
-    AllServicesAdtsDecodeOutput, AllServicesLatmDecodeOutput, LatmDecodeOutput,
-    ServiceAdtsDecodeOutput, ServiceLatmDecodeOutput, WasmAllServicesDecodeOptions,
-    WasmLatmDecodeOptions,
+    AllServicesAdtsDecodeOutput, AllServicesLatmDecodeOutput, AllServicesMetadataDecodeOutput,
+    LatmDecodeOutput, ServiceAdtsDecodeOutput, ServiceLatmDecodeOutput,
+    ServiceMetadataDecodeOutput, WasmAllServicesDecodeOptions, WasmLatmDecodeOptions,
 };
 
 #[cfg(feature = "wasm-faad2")]
@@ -101,6 +102,11 @@ pub struct WasmAllServicesDecodeOptionsJs {
     datetime_format: Option<String>,
 }
 
+#[wasm_bindgen(js_name = "WasmEtiSession")]
+pub struct WasmEtiSessionJs {
+    eti_bytes: Vec<u8>,
+}
+
 #[wasm_bindgen(js_class = "WasmAllServicesDecodeOptions")]
 impl WasmAllServicesDecodeOptionsJs {
     #[wasm_bindgen(constructor)]
@@ -145,6 +151,61 @@ impl TryFrom<&WasmAllServicesDecodeOptionsJs> for WasmAllServicesDecodeOptions {
     }
 }
 
+#[wasm_bindgen(js_class = "WasmEtiSession")]
+impl WasmEtiSessionJs {
+    #[wasm_bindgen(constructor)]
+    pub fn new(eti_bytes: &[u8]) -> WasmEtiSessionJs {
+        WasmEtiSessionJs {
+            eti_bytes: eti_bytes.to_vec(),
+        }
+    }
+
+    #[wasm_bindgen(js_name = "decodeAllServices")]
+    pub fn decode_all_services(
+        &self,
+        options: &WasmAllServicesDecodeOptionsJs,
+    ) -> std::result::Result<WasmAllServicesDecodeOutputJs, JsValue> {
+        let decoded_options = WasmAllServicesDecodeOptions::try_from(options)
+            .map_err(|e| JsValue::from_str(&format!("invalid all-services options: {}", e)))?;
+
+        decode_eti_to_all_services_memory_with_options(&self.eti_bytes, &decoded_options)
+            .map(|inner| WasmAllServicesDecodeOutputJs { inner })
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    #[cfg(feature = "wasm-faad2")]
+    #[wasm_bindgen(js_name = "decodeFaadServiceBySid")]
+    pub fn decode_faad_service_by_sid(
+        &self,
+        sid: &str,
+    ) -> std::result::Result<WasmFaadDecodeOutputJs, JsValue> {
+        let decoded_options = WasmLatmDecodeOptions {
+            sid: Some(sid.to_string()),
+            ..Default::default()
+        };
+
+        decode_eti_to_faad_memory_with_options(&self.eti_bytes, &decoded_options)
+            .map(|inner| WasmFaadDecodeOutputJs { inner })
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+
+    #[cfg(feature = "wasm-faad2")]
+    #[wasm_bindgen(js_name = "decodeFaadServiceBySidWithOptions")]
+    pub fn decode_faad_service_by_sid_with_options(
+        &self,
+        sid: &str,
+        options: &WasmLatmDecodeOptionsJs,
+    ) -> std::result::Result<WasmFaadDecodeOutputJs, JsValue> {
+        let mut decoded_options = WasmLatmDecodeOptions::try_from(options)
+            .map_err(|e| JsValue::from_str(&format!("invalid wasm decode options: {}", e)))?;
+        decoded_options.sid = Some(sid.to_string());
+
+        decode_eti_to_faad_memory_with_options(&self.eti_bytes, &decoded_options)
+            .map(|inner| WasmFaadDecodeOutputJs { inner })
+            .map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+}
+
 #[wasm_bindgen(js_name = "WasmLatmServiceOutput")]
 pub struct WasmLatmServiceOutputJs {
     inner: ServiceLatmDecodeOutput,
@@ -185,6 +246,60 @@ impl WasmLatmServiceOutputJs {
 #[wasm_bindgen(js_name = "WasmAllServicesLatmDecodeOutput")]
 pub struct WasmAllServicesLatmDecodeOutputJs {
     inner: AllServicesLatmDecodeOutput,
+}
+
+#[wasm_bindgen(js_name = "WasmServiceDecodeOutput")]
+pub struct WasmServiceDecodeOutputJs {
+    inner: ServiceMetadataDecodeOutput,
+}
+
+#[wasm_bindgen(js_class = "WasmServiceDecodeOutput")]
+impl WasmServiceDecodeOutputJs {
+    #[wasm_bindgen(getter, js_name = "sid")]
+    pub fn sid(&self) -> String {
+        format!("{:#06x}", self.inner.sid)
+    }
+
+    #[wasm_bindgen(getter, js_name = "label")]
+    pub fn label(&self) -> Option<String> {
+        self.inner.label.clone()
+    }
+
+    #[wasm_bindgen(getter, js_name = "metadataJsonl")]
+    pub fn metadata_jsonl(&self) -> Array {
+        self.inner
+            .metadata_jsonl
+            .iter()
+            .map(|line| JsValue::from_str(line))
+            .collect::<Array>()
+    }
+
+    #[wasm_bindgen(js_name = "fd3Preview")]
+    pub fn fd3_preview(&self) -> String {
+        self.inner.metadata_jsonl.join("\n")
+    }
+}
+
+#[wasm_bindgen(js_name = "WasmAllServicesDecodeOutput")]
+pub struct WasmAllServicesDecodeOutputJs {
+    inner: AllServicesMetadataDecodeOutput,
+}
+
+#[wasm_bindgen(js_class = "WasmAllServicesDecodeOutput")]
+impl WasmAllServicesDecodeOutputJs {
+    #[wasm_bindgen(getter, js_name = "serviceCount")]
+    pub fn service_count(&self) -> usize {
+        self.inner.services.len()
+    }
+
+    #[wasm_bindgen(js_name = "getService")]
+    pub fn get_service(&self, index: usize) -> Option<WasmServiceDecodeOutputJs> {
+        self.inner
+            .services
+            .get(index)
+            .cloned()
+            .map(|inner| WasmServiceDecodeOutputJs { inner })
+    }
 }
 
 #[wasm_bindgen(js_class = "WasmAllServicesLatmDecodeOutput")]
@@ -272,6 +387,28 @@ pub fn decode_eti_to_latm_all_services_memory_with_options_js(
 
     decode_eti_to_latm_all_services_memory_with_options(eti_bytes, &decoded_options)
         .map(|inner| WasmAllServicesLatmDecodeOutputJs { inner })
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+#[wasm_bindgen(js_name = "decodeEtiToAllServicesMemory")]
+pub fn decode_eti_to_all_services_memory_js(
+    eti_bytes: &[u8],
+) -> std::result::Result<WasmAllServicesDecodeOutputJs, JsValue> {
+    decode_eti_to_all_services_memory(eti_bytes)
+        .map(|inner| WasmAllServicesDecodeOutputJs { inner })
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+#[wasm_bindgen(js_name = "decodeEtiToAllServicesMemoryWithOptions")]
+pub fn decode_eti_to_all_services_memory_with_options_js(
+    eti_bytes: &[u8],
+    options: &WasmAllServicesDecodeOptionsJs,
+) -> std::result::Result<WasmAllServicesDecodeOutputJs, JsValue> {
+    let decoded_options = WasmAllServicesDecodeOptions::try_from(options)
+        .map_err(|e| JsValue::from_str(&format!("invalid all-services options: {}", e)))?;
+
+    decode_eti_to_all_services_memory_with_options(eti_bytes, &decoded_options)
+        .map(|inner| WasmAllServicesDecodeOutputJs { inner })
         .map_err(|e| JsValue::from_str(&e.to_string()))
 }
 

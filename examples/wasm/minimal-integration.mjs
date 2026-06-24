@@ -3,7 +3,8 @@ import { fileURLToPath } from "node:url";
 
 import init, {
   dabctlVersion,
-  decodeEtiToLatmMemoryWithOptions,
+  WasmAllServicesDecodeOptions,
+  WasmEtiSession,
   WasmLatmDecodeOptions,
 } from "../../pkg/dabctl.js";
 
@@ -16,18 +17,43 @@ async function main() {
   const etiPath = fileURLToPath(new URL("../../test-local/multiplex-t.eti", import.meta.url));
   const etiBytes = readFileSync(etiPath);
 
-  // Mirror one-service-out LATM selection behavior with explicit options.
-  const options = new WasmLatmDecodeOptions();
-  options.sid = "0xf201";
-  options.dedupPad = true;
-  options.slideBase64 = false;
-  options.datetimeFormat = "iso8601";
+  // Create a session so we can list services first, then decode a selected service.
+  const session = new WasmEtiSession(etiBytes);
 
-  const output = decodeEtiToLatmMemoryWithOptions(etiBytes, options);
+  const listOptions = new WasmAllServicesDecodeOptions();
+  listOptions.dedupPad = true;
+  listOptions.slideBase64 = false;
+  listOptions.datetimeFormat = "iso8601";
 
-  console.log("LATM bytes:", output.latmBytes.length);
-  console.log("FD3 events:", output.metadataJsonl.length);
-  console.log("FD3 preview:\n" + output.fd3Preview());
+  const listed = session.decodeAllServices(listOptions);
+  console.log("Discovered services:", listed.serviceCount);
+  if (listed.serviceCount === 0) {
+    throw new Error("No service discovered in ETI input");
+  }
+
+  const selected = listed.getService(0);
+  if (!selected) {
+    throw new Error("Unable to read first listed service");
+  }
+  console.log("Selected SID:", selected.sid, "label:", selected.label ?? "(no label)");
+
+  // decodeFaadServiceBySid* exists only in wasm-faad2 builds.
+  if (typeof session.decodeFaadServiceBySidWithOptions !== "function") {
+    console.log(
+      "This build does not expose FAAD decode methods. Rebuild with --features wasm-faad2.",
+    );
+    return;
+  }
+
+  const decodeOptions = new WasmLatmDecodeOptions();
+  decodeOptions.dedupPad = true;
+  decodeOptions.slideBase64 = false;
+  decodeOptions.datetimeFormat = "iso8601";
+
+  const pcmOut = session.decodeFaadServiceBySidWithOptions(selected.sid, decodeOptions);
+  console.log("PCM bytes:", pcmOut.pcmBytes.length);
+  console.log("FD3 events:", pcmOut.metadataJsonl.length);
+  console.log("FD3 preview:\n" + pcmOut.fd3Preview());
 }
 
 main().catch((err) => {
