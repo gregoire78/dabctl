@@ -23,6 +23,11 @@ use crate::dablin::shared::{
 };
 use std::collections::BTreeMap;
 
+#[cfg(feature = "wasm-faad2")]
+use crate::cli::AacGap;
+#[cfg(feature = "wasm-faad2")]
+use crate::dablin::audio::AacDecoder;
+
 const OUTPUT_SAMPLE_RATE_HZ: u32 = 48_000;
 
 #[derive(Default)]
@@ -352,28 +357,159 @@ pub struct FaadDecodeOutput {
     pub metadata_jsonl: Vec<String>,
 }
 
+/// Per-service memory output in all-services FAAD decode mode.
+#[cfg(feature = "wasm-faad2")]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ServiceFaadDecodeOutput {
+    pub sid: u32,
+    pub label: Option<String>,
+    pub pcm_bytes: Vec<u8>,
+    pub metadata_jsonl: Vec<String>,
+}
+
+/// Output container for all-services FAAD memory decode mode.
+#[cfg(feature = "wasm-faad2")]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AllServicesFaadDecodeOutput {
+    pub services: Vec<ServiceFaadDecodeOutput>,
+}
+
 struct WasmAllServicesContext {
-    sid: u32,
-    scid: u8,
-    bitrate_kbps: u32,
-    metadata_state: WasmMetadataState,
-    subch_buf: SubchannelBuffer,
+    core: AllServicesContextCore<ServiceLatmDecodeOutput>,
     latm_packer: LatmPacker,
-    pad_decoder: PadDecoder,
-    sf_work_buf: Vec<u8>,
-    out: ServiceLatmDecodeOutput,
 }
 
 struct WasmAllServicesAdtsContext {
+    core: AllServicesContextCore<ServiceAdtsDecodeOutput>,
+    adts_packer: AdtsPacker,
+}
+
+#[cfg(feature = "wasm-faad2")]
+struct WasmAllServicesFaadContext {
+    core: AllServicesContextCore<ServiceFaadDecodeOutput>,
+    aac_decoder: Option<AacDecoder>,
+}
+
+struct AllServicesContextCore<O> {
     sid: u32,
     scid: u8,
     bitrate_kbps: u32,
     metadata_state: WasmMetadataState,
     subch_buf: SubchannelBuffer,
-    adts_packer: AdtsPacker,
     pad_decoder: PadDecoder,
     sf_work_buf: Vec<u8>,
-    out: ServiceAdtsDecodeOutput,
+    out: O,
+}
+
+trait AllServicesLabelSyncContext {
+    fn sid(&self) -> u32;
+    fn scid(&self) -> u8;
+    fn label(&self) -> Option<&str>;
+    fn set_label(&mut self, label: String);
+    fn metadata_parts_mut(&mut self) -> (&mut WasmMetadataState, &mut Vec<String>);
+}
+
+impl AllServicesLabelSyncContext for WasmAllServicesContext {
+    fn sid(&self) -> u32 {
+        self.core.sid
+    }
+
+    fn scid(&self) -> u8 {
+        self.core.scid
+    }
+
+    fn label(&self) -> Option<&str> {
+        self.core.out.label.as_deref()
+    }
+
+    fn set_label(&mut self, label: String) {
+        self.core.out.label = Some(label);
+    }
+
+    fn metadata_parts_mut(&mut self) -> (&mut WasmMetadataState, &mut Vec<String>) {
+        (
+            &mut self.core.metadata_state,
+            &mut self.core.out.metadata_jsonl,
+        )
+    }
+}
+
+impl AllServicesLabelSyncContext for WasmAllServicesAdtsContext {
+    fn sid(&self) -> u32 {
+        self.core.sid
+    }
+
+    fn scid(&self) -> u8 {
+        self.core.scid
+    }
+
+    fn label(&self) -> Option<&str> {
+        self.core.out.label.as_deref()
+    }
+
+    fn set_label(&mut self, label: String) {
+        self.core.out.label = Some(label);
+    }
+
+    fn metadata_parts_mut(&mut self) -> (&mut WasmMetadataState, &mut Vec<String>) {
+        (
+            &mut self.core.metadata_state,
+            &mut self.core.out.metadata_jsonl,
+        )
+    }
+}
+
+#[cfg(feature = "wasm-faad2")]
+impl AllServicesLabelSyncContext for WasmAllServicesFaadContext {
+    fn sid(&self) -> u32 {
+        self.core.sid
+    }
+
+    fn scid(&self) -> u8 {
+        self.core.scid
+    }
+
+    fn label(&self) -> Option<&str> {
+        self.core.out.label.as_deref()
+    }
+
+    fn set_label(&mut self, label: String) {
+        self.core.out.label = Some(label);
+    }
+
+    fn metadata_parts_mut(&mut self) -> (&mut WasmMetadataState, &mut Vec<String>) {
+        (
+            &mut self.core.metadata_state,
+            &mut self.core.out.metadata_jsonl,
+        )
+    }
+}
+
+fn update_all_services_label_sync_generic<T: AllServicesLabelSyncContext>(
+    fic: &FicDecoder,
+    contexts: &mut BTreeMap<u32, T>,
+) {
+    for ctx in contexts.values_mut() {
+        {
+            let (metadata_state, metadata_jsonl) = ctx.metadata_parts_mut();
+            emit_ensemble_if_ready(fic, metadata_state, metadata_jsonl);
+        }
+
+        if let Some(svc) = fic.services.iter().find(|s| s.sid == ctx.sid()) {
+            if let Some(label) = svc.label.clone() {
+                if ctx.label() != Some(label.as_str()) {
+                    ctx.set_label(label);
+                    let sid = ctx.sid();
+                    let (metadata_state, metadata_jsonl) = ctx.metadata_parts_mut();
+                    emit_service_if_needed(fic, sid, metadata_state, metadata_jsonl);
+                }
+            }
+        }
+
+        let scid = ctx.scid();
+        let (metadata_state, metadata_jsonl) = ctx.metadata_parts_mut();
+        emit_subchannel_if_changed(fic, scid, metadata_state, metadata_jsonl);
+    }
 }
 
 fn emit_time_with_mode_if_changed(
@@ -409,60 +545,130 @@ fn update_all_services_label_sync(
     fic: &FicDecoder,
     contexts: &mut BTreeMap<u32, WasmAllServicesContext>,
 ) {
-    for ctx in contexts.values_mut() {
-        emit_ensemble_if_ready(fic, &mut ctx.metadata_state, &mut ctx.out.metadata_jsonl);
-
-        if let Some(svc) = fic.services.iter().find(|s| s.sid == ctx.sid) {
-            if let Some(label) = svc.label.clone() {
-                if ctx.out.label.as_deref() != Some(label.as_str()) {
-                    ctx.out.label = Some(label);
-                    emit_service_if_needed(
-                        fic,
-                        ctx.sid,
-                        &mut ctx.metadata_state,
-                        &mut ctx.out.metadata_jsonl,
-                    );
-                }
-            }
-        }
-
-        emit_subchannel_if_changed(
-            fic,
-            ctx.scid,
-            &mut ctx.metadata_state,
-            &mut ctx.out.metadata_jsonl,
-        );
-    }
+    update_all_services_label_sync_generic(fic, contexts);
 }
 
 fn update_all_services_adts_label_sync(
     fic: &FicDecoder,
     contexts: &mut BTreeMap<u32, WasmAllServicesAdtsContext>,
 ) {
-    for ctx in contexts.values_mut() {
-        emit_ensemble_if_ready(fic, &mut ctx.metadata_state, &mut ctx.out.metadata_jsonl);
+    update_all_services_label_sync_generic(fic, contexts);
+}
 
-        if let Some(svc) = fic.services.iter().find(|s| s.sid == ctx.sid) {
-            if let Some(label) = svc.label.clone() {
-                if ctx.out.label.as_deref() != Some(label.as_str()) {
-                    ctx.out.label = Some(label);
-                    emit_service_if_needed(
-                        fic,
-                        ctx.sid,
-                        &mut ctx.metadata_state,
-                        &mut ctx.out.metadata_jsonl,
-                    );
-                }
-            }
+#[cfg(feature = "wasm-faad2")]
+fn update_all_services_faad_label_sync(
+    fic: &FicDecoder,
+    contexts: &mut BTreeMap<u32, WasmAllServicesFaadContext>,
+) {
+    update_all_services_label_sync_generic(fic, contexts);
+}
+
+fn finalize_latm_all_services_output(
+    contexts: BTreeMap<u32, WasmAllServicesContext>,
+) -> Result<AllServicesLatmDecodeOutput> {
+    let mut out = AllServicesLatmDecodeOutput {
+        services: contexts.into_values().map(|ctx| ctx.core.out).collect(),
+    };
+    out.services.retain(|svc| !svc.latm_bytes.is_empty());
+    if out.services.is_empty() {
+        bail!("no decodable LATM output produced from ETI input");
+    }
+    Ok(out)
+}
+
+fn finalize_adts_all_services_output(
+    contexts: BTreeMap<u32, WasmAllServicesAdtsContext>,
+) -> Result<AllServicesAdtsDecodeOutput> {
+    let mut out = AllServicesAdtsDecodeOutput {
+        services: contexts.into_values().map(|ctx| ctx.core.out).collect(),
+    };
+    out.services.retain(|svc| !svc.adts_bytes.is_empty());
+    if out.services.is_empty() {
+        bail!("no decodable ADTS output produced from ETI input");
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "wasm-faad2")]
+fn finalize_faad_all_services_output(
+    contexts: BTreeMap<u32, WasmAllServicesFaadContext>,
+) -> Result<AllServicesFaadDecodeOutput> {
+    let mut out = AllServicesFaadDecodeOutput {
+        services: contexts.into_values().map(|ctx| ctx.core.out).collect(),
+    };
+    out.services.retain(|svc| !svc.pcm_bytes.is_empty());
+    if out.services.is_empty() {
+        bail!("no decodable PCM output produced from ETI input");
+    }
+    Ok(out)
+}
+
+fn decode_eti_to_all_services_memory_with_options_generic<C, O>(
+    eti_bytes: &[u8],
+    options: &WasmAllServicesDecodeOptions,
+    mut make_context: impl FnMut(&FicDecoder, &ServiceInfo, u8, u16, &WasmAllServicesDecodeOptions) -> C,
+    mut update_labels: impl FnMut(&FicDecoder, &mut BTreeMap<u32, C>),
+    mut process_context: impl FnMut(&FicDecoder, &WasmAllServicesDecodeOptions, &mut C, &[u8]),
+    mut context_scid: impl FnMut(&C) -> u8,
+    mut emit_time_for_context: impl FnMut(&FicDecoder, Option<DateTimeMode<'_>>, &mut C),
+    mut finalize: impl FnMut(BTreeMap<u32, C>) -> Result<O>,
+) -> Result<O> {
+    if eti_bytes.len() < ETI_FRAME_SIZE {
+        bail!("no complete ETI frame in input");
+    }
+
+    let mut fic = FicDecoder::new();
+    let mut contexts: BTreeMap<u32, C> = BTreeMap::new();
+    let datetime_mode = datetime_mode_from_option(options.datetime_format.as_ref());
+
+    for raw in eti_bytes.chunks_exact(ETI_FRAME_SIZE) {
+        let Ok(frame) = parse_frame(raw) else {
+            continue;
+        };
+
+        if frame.ficf && !frame.fic.is_empty() {
+            fic.process_fic(frame.fic);
         }
 
-        emit_subchannel_if_changed(
-            fic,
-            ctx.scid,
-            &mut ctx.metadata_state,
-            &mut ctx.out.metadata_jsonl,
-        );
+        for svc in &fic.services {
+            if svc.components.is_empty() || contexts.contains_key(&svc.sid) {
+                continue;
+            }
+
+            let scid = svc.components[0].subch_id;
+            if !fic.is_dabplus(scid) {
+                continue;
+            }
+
+            let Some(stc) = frame.stc.iter().find(|entry| entry.scid == scid) else {
+                continue;
+            };
+
+            let ctx = make_context(&fic, svc, scid, stc.stl, options);
+            contexts.insert(svc.sid, ctx);
+        }
+
+        if contexts.is_empty() {
+            continue;
+        }
+
+        update_labels(&fic, &mut contexts);
+        for ctx in contexts.values_mut() {
+            emit_time_for_context(&fic, datetime_mode, ctx);
+
+            let scid = context_scid(ctx);
+            let Some(cif_data) = extract_subchannel(&frame, scid) else {
+                continue;
+            };
+            process_context(&fic, options, ctx, cif_data);
+        }
     }
+
+    if contexts.is_empty() {
+        bail!("no DAB+ service discovered in ETI input");
+    }
+
+    finalize(contexts)
 }
 
 fn process_one_all_services_context(
@@ -471,59 +677,28 @@ fn process_one_all_services_context(
     ctx: &mut WasmAllServicesContext,
     cif_data: &[u8],
 ) {
-    ctx.subch_buf.push_cif(cif_data);
+    let latm_packer = &mut ctx.latm_packer;
+    let latm_bytes = &mut ctx.core.out.latm_bytes;
 
-    while ctx.subch_buf.len() >= ctx.subch_buf.superframe_size() {
-        let sf_size = ctx.subch_buf.superframe_size();
-        let Some(slice) = ctx.subch_buf.try_peek_superframe_slice() else {
-            break;
-        };
-
-        if ctx.sf_work_buf.len() != sf_size {
-            ctx.sf_work_buf.resize(sf_size, 0);
-        }
-        ctx.sf_work_buf.copy_from_slice(slice);
-
-        let result = process_superframe_inplace(&mut ctx.sf_work_buf);
-        if !result.firecode_ok {
-            ctx.subch_buf.advance_one_cif();
-            continue;
-        }
-
-        ctx.subch_buf.consume_superframe();
-        if result.rs_over_threshold {
-            continue;
-        }
-
-        if let Some(fmt) = result.format.as_ref() {
-            process_pad_metadata_for_units(
-                &result.units,
-                fic,
-                ctx.sid,
-                ctx.scid,
-                &WasmLatmDecodeOptions {
-                    slide_base64: options.slide_base64,
-                    dedup_pad: options.dedup_pad,
-                    ..Default::default()
-                },
-                &mut ctx.metadata_state,
-                &mut ctx.out.metadata_jsonl,
-                &mut ctx.pad_decoder,
-            );
-
-            emit_audio_if_changed(
-                fmt,
-                Some(ctx.bitrate_kbps),
-                &mut ctx.metadata_state,
-                &mut ctx.out.metadata_jsonl,
-            );
-
-            for au in result.units {
-                let packet = ctx.latm_packer.wrap(fmt, &au.data);
-                ctx.out.latm_bytes.extend_from_slice(packet);
+    process_one_all_services_context_generic(
+        fic,
+        options,
+        ctx.core.sid,
+        ctx.core.scid,
+        ctx.core.bitrate_kbps,
+        &mut ctx.core.subch_buf,
+        &mut ctx.core.sf_work_buf,
+        &mut ctx.core.metadata_state,
+        &mut ctx.core.out.metadata_jsonl,
+        &mut ctx.core.pad_decoder,
+        cif_data,
+        move |fmt, units| {
+            for au in units {
+                let packet = latm_packer.wrap(fmt, &au.data);
+                latm_bytes.extend_from_slice(packet);
             }
-        }
-    }
+        },
+    );
 }
 
 fn process_one_all_services_adts_context(
@@ -532,26 +707,105 @@ fn process_one_all_services_adts_context(
     ctx: &mut WasmAllServicesAdtsContext,
     cif_data: &[u8],
 ) {
-    ctx.subch_buf.push_cif(cif_data);
+    let adts_packer = &mut ctx.adts_packer;
+    let adts_bytes = &mut ctx.core.out.adts_bytes;
 
-    while ctx.subch_buf.len() >= ctx.subch_buf.superframe_size() {
-        let sf_size = ctx.subch_buf.superframe_size();
-        let Some(slice) = ctx.subch_buf.try_peek_superframe_slice() else {
+    process_one_all_services_context_generic(
+        fic,
+        options,
+        ctx.core.sid,
+        ctx.core.scid,
+        ctx.core.bitrate_kbps,
+        &mut ctx.core.subch_buf,
+        &mut ctx.core.sf_work_buf,
+        &mut ctx.core.metadata_state,
+        &mut ctx.core.out.metadata_jsonl,
+        &mut ctx.core.pad_decoder,
+        cif_data,
+        move |fmt, units| {
+            for au in units {
+                let frame = adts_packer.wrap(fmt, &au.data);
+                adts_bytes.extend_from_slice(&frame);
+            }
+        },
+    );
+}
+
+#[cfg(feature = "wasm-faad2")]
+fn process_one_all_services_faad_context(
+    fic: &FicDecoder,
+    options: &WasmAllServicesDecodeOptions,
+    ctx: &mut WasmAllServicesFaadContext,
+    cif_data: &[u8],
+) {
+    let aac_decoder = &mut ctx.aac_decoder;
+    let pcm_bytes = &mut ctx.core.out.pcm_bytes;
+
+    process_one_all_services_context_generic(
+        fic,
+        options,
+        ctx.core.sid,
+        ctx.core.scid,
+        ctx.core.bitrate_kbps,
+        &mut ctx.core.subch_buf,
+        &mut ctx.core.sf_work_buf,
+        &mut ctx.core.metadata_state,
+        &mut ctx.core.out.metadata_jsonl,
+        &mut ctx.core.pad_decoder,
+        cif_data,
+        move |fmt, units| {
+            if aac_decoder.is_none() {
+                *aac_decoder = AacDecoder::new_faad2(AacGap::Freeze);
+            }
+
+            if let Some(ref mut dec) = aac_decoder {
+                dec.init_format(fmt);
+                for au in units {
+                    if let Some(pcm) = dec.decode(&au) {
+                        for sample in &pcm {
+                            pcm_bytes.extend_from_slice(&sample.to_le_bytes());
+                        }
+                    }
+                }
+            }
+        },
+    );
+}
+
+fn process_one_all_services_context_generic(
+    fic: &FicDecoder,
+    options: &WasmAllServicesDecodeOptions,
+    sid: u32,
+    scid: u8,
+    bitrate_kbps: u32,
+    subch_buf: &mut SubchannelBuffer,
+    sf_work_buf: &mut Vec<u8>,
+    metadata_state: &mut WasmMetadataState,
+    metadata_jsonl: &mut Vec<String>,
+    pad_decoder: &mut PadDecoder,
+    cif_data: &[u8],
+    mut emit_units: impl FnMut(&SuperframeFormat, Vec<crate::dablin::dabplus::AudioUnit>),
+) {
+    subch_buf.push_cif(cif_data);
+
+    while subch_buf.len() >= subch_buf.superframe_size() {
+        let sf_size = subch_buf.superframe_size();
+        let Some(slice) = subch_buf.try_peek_superframe_slice() else {
             break;
         };
 
-        if ctx.sf_work_buf.len() != sf_size {
-            ctx.sf_work_buf.resize(sf_size, 0);
+        if sf_work_buf.len() != sf_size {
+            sf_work_buf.resize(sf_size, 0);
         }
-        ctx.sf_work_buf.copy_from_slice(slice);
+        sf_work_buf.copy_from_slice(slice);
 
-        let result = process_superframe_inplace(&mut ctx.sf_work_buf);
+        let result = process_superframe_inplace(sf_work_buf);
         if !result.firecode_ok {
-            ctx.subch_buf.advance_one_cif();
+            subch_buf.advance_one_cif();
             continue;
         }
 
-        ctx.subch_buf.consume_superframe();
+        subch_buf.consume_superframe();
         if result.rs_over_threshold {
             continue;
         }
@@ -560,29 +814,20 @@ fn process_one_all_services_adts_context(
             process_pad_metadata_for_units(
                 &result.units,
                 fic,
-                ctx.sid,
-                ctx.scid,
+                sid,
+                scid,
                 &WasmLatmDecodeOptions {
                     slide_base64: options.slide_base64,
                     dedup_pad: options.dedup_pad,
                     ..Default::default()
                 },
-                &mut ctx.metadata_state,
-                &mut ctx.out.metadata_jsonl,
-                &mut ctx.pad_decoder,
+                metadata_state,
+                metadata_jsonl,
+                pad_decoder,
             );
 
-            emit_audio_if_changed(
-                fmt,
-                Some(ctx.bitrate_kbps),
-                &mut ctx.metadata_state,
-                &mut ctx.out.metadata_jsonl,
-            );
-
-            for au in result.units {
-                let frame = ctx.adts_packer.wrap(fmt, &au.data);
-                ctx.out.adts_bytes.extend_from_slice(&frame);
-            }
+            emit_audio_if_changed(fmt, Some(bitrate_kbps), metadata_state, metadata_jsonl);
+            emit_units(fmt, result.units);
         }
     }
 }
@@ -596,40 +841,31 @@ fn make_all_services_context(
 ) -> WasmAllServicesContext {
     let bitrate_kbps = (u32::from(stl) * 64) / 24;
     let mut ctx = WasmAllServicesContext {
-        sid: svc.sid,
-        scid,
-        bitrate_kbps,
-        metadata_state: WasmMetadataState::default(),
-        subch_buf: SubchannelBuffer::new(scid, stl),
-        latm_packer: LatmPacker::new(),
-        pad_decoder: PadDecoder::new(),
-        sf_work_buf: Vec::new(),
-        out: ServiceLatmDecodeOutput {
+        core: AllServicesContextCore {
             sid: svc.sid,
-            label: svc.label.clone(),
-            latm_bytes: Vec::new(),
-            metadata_jsonl: Vec::new(),
+            scid,
+            bitrate_kbps,
+            metadata_state: WasmMetadataState::default(),
+            subch_buf: SubchannelBuffer::new(scid, stl),
+            pad_decoder: PadDecoder::new(),
+            sf_work_buf: Vec::new(),
+            out: ServiceLatmDecodeOutput {
+                sid: svc.sid,
+                label: svc.label.clone(),
+                latm_bytes: Vec::new(),
+                metadata_jsonl: Vec::new(),
+            },
         },
+        latm_packer: LatmPacker::new(),
     };
 
-    emit_ensemble_if_ready(fic, &mut ctx.metadata_state, &mut ctx.out.metadata_jsonl);
-    emit_service_if_needed(
+    emit_initial_all_services_metadata(
         fic,
         svc.sid,
-        &mut ctx.metadata_state,
-        &mut ctx.out.metadata_jsonl,
-    );
-    emit_subchannel_if_changed(
-        fic,
         scid,
-        &mut ctx.metadata_state,
-        &mut ctx.out.metadata_jsonl,
-    );
-    emit_time_with_mode_if_changed(
-        fic,
-        datetime_mode_from_option(options.datetime_format.as_ref()),
-        &mut ctx.metadata_state,
-        &mut ctx.out.metadata_jsonl,
+        options,
+        &mut ctx.core.metadata_state,
+        &mut ctx.core.out.metadata_jsonl,
     );
     ctx
 }
@@ -643,42 +879,91 @@ fn make_all_services_adts_context(
 ) -> WasmAllServicesAdtsContext {
     let bitrate_kbps = (u32::from(stl) * 64) / 24;
     let mut ctx = WasmAllServicesAdtsContext {
-        sid: svc.sid,
-        scid,
-        bitrate_kbps,
-        metadata_state: WasmMetadataState::default(),
-        subch_buf: SubchannelBuffer::new(scid, stl),
-        adts_packer: AdtsPacker::new(),
-        pad_decoder: PadDecoder::new(),
-        sf_work_buf: Vec::new(),
-        out: ServiceAdtsDecodeOutput {
+        core: AllServicesContextCore {
             sid: svc.sid,
-            label: svc.label.clone(),
-            adts_bytes: Vec::new(),
-            metadata_jsonl: Vec::new(),
+            scid,
+            bitrate_kbps,
+            metadata_state: WasmMetadataState::default(),
+            subch_buf: SubchannelBuffer::new(scid, stl),
+            pad_decoder: PadDecoder::new(),
+            sf_work_buf: Vec::new(),
+            out: ServiceAdtsDecodeOutput {
+                sid: svc.sid,
+                label: svc.label.clone(),
+                adts_bytes: Vec::new(),
+                metadata_jsonl: Vec::new(),
+            },
         },
+        adts_packer: AdtsPacker::new(),
     };
 
-    emit_ensemble_if_ready(fic, &mut ctx.metadata_state, &mut ctx.out.metadata_jsonl);
-    emit_service_if_needed(
+    emit_initial_all_services_metadata(
         fic,
         svc.sid,
-        &mut ctx.metadata_state,
-        &mut ctx.out.metadata_jsonl,
-    );
-    emit_subchannel_if_changed(
-        fic,
         scid,
-        &mut ctx.metadata_state,
-        &mut ctx.out.metadata_jsonl,
+        options,
+        &mut ctx.core.metadata_state,
+        &mut ctx.core.out.metadata_jsonl,
     );
+    ctx
+}
+
+#[cfg(feature = "wasm-faad2")]
+fn make_all_services_faad_context(
+    fic: &FicDecoder,
+    svc: &ServiceInfo,
+    scid: u8,
+    stl: u16,
+    options: &WasmAllServicesDecodeOptions,
+) -> WasmAllServicesFaadContext {
+    let bitrate_kbps = (u32::from(stl) * 64) / 24;
+    let mut ctx = WasmAllServicesFaadContext {
+        core: AllServicesContextCore {
+            sid: svc.sid,
+            scid,
+            bitrate_kbps,
+            metadata_state: WasmMetadataState::default(),
+            subch_buf: SubchannelBuffer::new(scid, stl),
+            pad_decoder: PadDecoder::new(),
+            sf_work_buf: Vec::new(),
+            out: ServiceFaadDecodeOutput {
+                sid: svc.sid,
+                label: svc.label.clone(),
+                pcm_bytes: Vec::new(),
+                metadata_jsonl: Vec::new(),
+            },
+        },
+        aac_decoder: None,
+    };
+
+    emit_initial_all_services_metadata(
+        fic,
+        svc.sid,
+        scid,
+        options,
+        &mut ctx.core.metadata_state,
+        &mut ctx.core.out.metadata_jsonl,
+    );
+    ctx
+}
+
+fn emit_initial_all_services_metadata(
+    fic: &FicDecoder,
+    sid: u32,
+    scid: u8,
+    options: &WasmAllServicesDecodeOptions,
+    metadata_state: &mut WasmMetadataState,
+    metadata_jsonl: &mut Vec<String>,
+) {
+    emit_ensemble_if_ready(fic, metadata_state, metadata_jsonl);
+    emit_service_if_needed(fic, sid, metadata_state, metadata_jsonl);
+    emit_subchannel_if_changed(fic, scid, metadata_state, metadata_jsonl);
     emit_time_with_mode_if_changed(
         fic,
         datetime_mode_from_option(options.datetime_format.as_ref()),
-        &mut ctx.metadata_state,
-        &mut ctx.out.metadata_jsonl,
+        metadata_state,
+        metadata_jsonl,
     );
-    ctx
 }
 
 impl LatmDecodeOutput {
@@ -882,72 +1167,23 @@ pub fn decode_eti_to_latm_all_services_memory_with_options(
     eti_bytes: &[u8],
     options: &WasmAllServicesDecodeOptions,
 ) -> Result<AllServicesLatmDecodeOutput> {
-    if eti_bytes.len() < ETI_FRAME_SIZE {
-        bail!("no complete ETI frame in input");
-    }
-
-    let mut fic = FicDecoder::new();
-    let mut contexts: BTreeMap<u32, WasmAllServicesContext> = BTreeMap::new();
-    let datetime_mode = datetime_mode_from_option(options.datetime_format.as_ref());
-
-    for raw in eti_bytes.chunks_exact(ETI_FRAME_SIZE) {
-        let Ok(frame) = parse_frame(raw) else {
-            continue;
-        };
-
-        if frame.ficf && !frame.fic.is_empty() {
-            fic.process_fic(frame.fic);
-        }
-
-        for svc in &fic.services {
-            if svc.components.is_empty() || contexts.contains_key(&svc.sid) {
-                continue;
-            }
-            let scid = svc.components[0].subch_id;
-            if !fic.is_dabplus(scid) {
-                continue;
-            }
-            let Some(stc) = frame.stc.iter().find(|entry| entry.scid == scid) else {
-                continue;
-            };
-
-            let ctx = make_all_services_context(&fic, svc, scid, stc.stl, options);
-            contexts.insert(svc.sid, ctx);
-        }
-
-        if contexts.is_empty() {
-            continue;
-        }
-
-        update_all_services_label_sync(&fic, &mut contexts);
-        for ctx in contexts.values_mut() {
+    decode_eti_to_all_services_memory_with_options_generic(
+        eti_bytes,
+        options,
+        make_all_services_context,
+        update_all_services_label_sync,
+        process_one_all_services_context,
+        |ctx| ctx.core.scid,
+        |fic, datetime_mode, ctx| {
             emit_time_with_mode_if_changed(
-                &fic,
+                fic,
                 datetime_mode,
-                &mut ctx.metadata_state,
-                &mut ctx.out.metadata_jsonl,
+                &mut ctx.core.metadata_state,
+                &mut ctx.core.out.metadata_jsonl,
             );
-
-            let Some(cif_data) = extract_subchannel(&frame, ctx.scid) else {
-                continue;
-            };
-            process_one_all_services_context(&fic, options, ctx, cif_data);
-        }
-    }
-
-    if contexts.is_empty() {
-        bail!("no DAB+ service discovered in ETI input");
-    }
-
-    let mut out = AllServicesLatmDecodeOutput {
-        services: contexts.into_values().map(|ctx| ctx.out).collect(),
-    };
-    out.services.retain(|svc| !svc.latm_bytes.is_empty());
-    if out.services.is_empty() {
-        bail!("no decodable LATM output produced from ETI input");
-    }
-
-    Ok(out)
+        },
+        finalize_latm_all_services_output,
+    )
 }
 
 // ── ADTS single-service decode ────────────────────────────────────────────
@@ -1101,72 +1337,23 @@ pub fn decode_eti_to_adts_all_services_memory_with_options(
     eti_bytes: &[u8],
     options: &WasmAllServicesDecodeOptions,
 ) -> Result<AllServicesAdtsDecodeOutput> {
-    if eti_bytes.len() < ETI_FRAME_SIZE {
-        bail!("no complete ETI frame in input");
-    }
-
-    let mut fic = FicDecoder::new();
-    let mut contexts: BTreeMap<u32, WasmAllServicesAdtsContext> = BTreeMap::new();
-    let datetime_mode = datetime_mode_from_option(options.datetime_format.as_ref());
-
-    for raw in eti_bytes.chunks_exact(ETI_FRAME_SIZE) {
-        let Ok(frame) = parse_frame(raw) else {
-            continue;
-        };
-
-        if frame.ficf && !frame.fic.is_empty() {
-            fic.process_fic(frame.fic);
-        }
-
-        for svc in &fic.services {
-            if svc.components.is_empty() || contexts.contains_key(&svc.sid) {
-                continue;
-            }
-            let scid = svc.components[0].subch_id;
-            if !fic.is_dabplus(scid) {
-                continue;
-            }
-            let Some(stc) = frame.stc.iter().find(|entry| entry.scid == scid) else {
-                continue;
-            };
-
-            let ctx = make_all_services_adts_context(&fic, svc, scid, stc.stl, options);
-            contexts.insert(svc.sid, ctx);
-        }
-
-        if contexts.is_empty() {
-            continue;
-        }
-
-        update_all_services_adts_label_sync(&fic, &mut contexts);
-        for ctx in contexts.values_mut() {
+    decode_eti_to_all_services_memory_with_options_generic(
+        eti_bytes,
+        options,
+        make_all_services_adts_context,
+        update_all_services_adts_label_sync,
+        process_one_all_services_adts_context,
+        |ctx| ctx.core.scid,
+        |fic, datetime_mode, ctx| {
             emit_time_with_mode_if_changed(
-                &fic,
+                fic,
                 datetime_mode,
-                &mut ctx.metadata_state,
-                &mut ctx.out.metadata_jsonl,
+                &mut ctx.core.metadata_state,
+                &mut ctx.core.out.metadata_jsonl,
             );
-
-            let Some(cif_data) = extract_subchannel(&frame, ctx.scid) else {
-                continue;
-            };
-            process_one_all_services_adts_context(&fic, options, ctx, cif_data);
-        }
-    }
-
-    if contexts.is_empty() {
-        bail!("no DAB+ service discovered in ETI input");
-    }
-
-    let mut out = AllServicesAdtsDecodeOutput {
-        services: contexts.into_values().map(|ctx| ctx.out).collect(),
-    };
-    out.services.retain(|svc| !svc.adts_bytes.is_empty());
-    if out.services.is_empty() {
-        bail!("no decodable ADTS output produced from ETI input");
-    }
-
-    Ok(out)
+        },
+        finalize_adts_all_services_output,
+    )
 }
 
 // ── FAAD single-service decode ────────────────────────────────────────────
@@ -1187,9 +1374,6 @@ pub fn decode_eti_to_faad_memory_with_options(
     eti_bytes: &[u8],
     options: &WasmLatmDecodeOptions,
 ) -> Result<FaadDecodeOutput> {
-    use crate::cli::AacGap;
-    use crate::dablin::audio::AacDecoder;
-
     if eti_bytes.len() < ETI_FRAME_SIZE {
         bail!("no complete ETI frame in input");
     }
@@ -1315,6 +1499,43 @@ pub fn decode_eti_to_faad_memory_with_options(
     }
 
     Ok(out)
+}
+
+/// Decode ETI bytes to raw s16le PCM + fd3-equivalent JSONL metadata for all DAB+ services.
+#[cfg(feature = "wasm-faad2")]
+pub fn decode_eti_to_faad_all_services_memory(
+    eti_bytes: &[u8],
+) -> Result<AllServicesFaadDecodeOutput> {
+    decode_eti_to_faad_all_services_memory_with_options(
+        eti_bytes,
+        &WasmAllServicesDecodeOptions::default(),
+    )
+}
+
+/// Decode ETI bytes to raw s16le PCM + fd3-equivalent JSONL metadata for all DAB+ services
+/// with explicit options.
+#[cfg(feature = "wasm-faad2")]
+pub fn decode_eti_to_faad_all_services_memory_with_options(
+    eti_bytes: &[u8],
+    options: &WasmAllServicesDecodeOptions,
+) -> Result<AllServicesFaadDecodeOutput> {
+    decode_eti_to_all_services_memory_with_options_generic(
+        eti_bytes,
+        options,
+        make_all_services_faad_context,
+        update_all_services_faad_label_sync,
+        process_one_all_services_faad_context,
+        |ctx| ctx.core.scid,
+        |fic, datetime_mode, ctx| {
+            emit_time_with_mode_if_changed(
+                fic,
+                datetime_mode,
+                &mut ctx.core.metadata_state,
+                &mut ctx.core.out.metadata_jsonl,
+            );
+        },
+        finalize_faad_all_services_output,
+    )
 }
 
 #[cfg(test)]
@@ -1513,6 +1734,35 @@ mod tests {
 
         assert!(out.services.len() > 1);
         assert!(out.services.iter().all(|svc| !svc.adts_bytes.is_empty()));
+        assert!(out.services.iter().all(|svc| svc
+            .metadata_jsonl
+            .iter()
+            .any(|line| line.contains("\"service\""))));
+    }
+
+    #[cfg(feature = "wasm-faad2")]
+    #[test]
+    fn decode_faad_fixture_produces_pcm_and_fd3_events() {
+        let eti = fs::read("test-local/multiplex.eti").expect("fixture ETI must exist");
+        let out = decode_eti_to_faad_memory(&eti).expect("decode should succeed");
+
+        assert!(!out.pcm_bytes.is_empty());
+        assert!(!out.metadata_jsonl.is_empty());
+        assert!(out
+            .metadata_jsonl
+            .iter()
+            .any(|line| line.contains("\"service\"")));
+    }
+
+    #[cfg(feature = "wasm-faad2")]
+    #[test]
+    fn decode_faad_all_services_produces_multiple_service_outputs() {
+        let eti = fs::read("test-local/multiplex.eti").expect("fixture ETI must exist");
+        let out = decode_eti_to_faad_all_services_memory(&eti)
+            .expect("all-services decode should succeed");
+
+        assert!(out.services.len() > 1);
+        assert!(out.services.iter().all(|svc| !svc.pcm_bytes.is_empty()));
         assert!(out.services.iter().all(|svc| svc
             .metadata_jsonl
             .iter()

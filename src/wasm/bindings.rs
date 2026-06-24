@@ -17,7 +17,9 @@ use crate::wasm::runtime::{
 
 #[cfg(feature = "wasm-faad2")]
 use crate::wasm::runtime::{
-    decode_eti_to_faad_memory, decode_eti_to_faad_memory_with_options, FaadDecodeOutput,
+    decode_eti_to_faad_all_services_memory, decode_eti_to_faad_all_services_memory_with_options,
+    decode_eti_to_faad_memory, decode_eti_to_faad_memory_with_options, AllServicesFaadDecodeOutput,
+    FaadDecodeOutput, ServiceFaadDecodeOutput,
 };
 
 #[wasm_bindgen(js_name = "WasmLatmDecodeOptions")]
@@ -448,6 +450,69 @@ impl WasmFaadDecodeOutputJs {
     }
 }
 
+#[cfg(feature = "wasm-faad2")]
+#[wasm_bindgen(js_name = "WasmFaadServiceOutput")]
+pub struct WasmFaadServiceOutputJs {
+    inner: ServiceFaadDecodeOutput,
+}
+
+#[cfg(feature = "wasm-faad2")]
+#[wasm_bindgen(js_class = "WasmFaadServiceOutput")]
+impl WasmFaadServiceOutputJs {
+    #[wasm_bindgen(getter, js_name = "sid")]
+    pub fn sid(&self) -> String {
+        format!("{:#06x}", self.inner.sid)
+    }
+
+    #[wasm_bindgen(getter, js_name = "label")]
+    pub fn label(&self) -> Option<String> {
+        self.inner.label.clone()
+    }
+
+    #[wasm_bindgen(getter, js_name = "pcmBytes")]
+    pub fn pcm_bytes(&self) -> Vec<u8> {
+        self.inner.pcm_bytes.clone()
+    }
+
+    #[wasm_bindgen(getter, js_name = "metadataJsonl")]
+    pub fn metadata_jsonl(&self) -> Array {
+        self.inner
+            .metadata_jsonl
+            .iter()
+            .map(|line| JsValue::from_str(line))
+            .collect::<Array>()
+    }
+
+    #[wasm_bindgen(js_name = "fd3Preview")]
+    pub fn fd3_preview(&self) -> String {
+        self.inner.metadata_jsonl.join("\n")
+    }
+}
+
+#[cfg(feature = "wasm-faad2")]
+#[wasm_bindgen(js_name = "WasmAllServicesFaadDecodeOutput")]
+pub struct WasmAllServicesFaadDecodeOutputJs {
+    inner: AllServicesFaadDecodeOutput,
+}
+
+#[cfg(feature = "wasm-faad2")]
+#[wasm_bindgen(js_class = "WasmAllServicesFaadDecodeOutput")]
+impl WasmAllServicesFaadDecodeOutputJs {
+    #[wasm_bindgen(getter, js_name = "serviceCount")]
+    pub fn service_count(&self) -> usize {
+        self.inner.services.len()
+    }
+
+    #[wasm_bindgen(js_name = "getService")]
+    pub fn get_service(&self, index: usize) -> Option<WasmFaadServiceOutputJs> {
+        self.inner
+            .services
+            .get(index)
+            .cloned()
+            .map(|inner| WasmFaadServiceOutputJs { inner })
+    }
+}
+
 /// Decode ETI bytes to raw s16le PCM using the faad2 AAC decoder (default options).
 #[cfg(feature = "wasm-faad2")]
 #[wasm_bindgen(js_name = "decodeEtiToFaadMemory")]
@@ -471,5 +536,31 @@ pub fn decode_eti_to_faad_memory_with_options_js(
 
     decode_eti_to_faad_memory_with_options(eti_bytes, &decoded_options)
         .map(|inner| WasmFaadDecodeOutputJs { inner })
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// Decode ETI bytes to raw s16le PCM for all DAB+ services using faad2 (default options).
+#[cfg(feature = "wasm-faad2")]
+#[wasm_bindgen(js_name = "decodeEtiToFaadAllServicesMemory")]
+pub fn decode_eti_to_faad_all_services_memory_js(
+    eti_bytes: &[u8],
+) -> std::result::Result<WasmAllServicesFaadDecodeOutputJs, JsValue> {
+    decode_eti_to_faad_all_services_memory(eti_bytes)
+        .map(|inner| WasmAllServicesFaadDecodeOutputJs { inner })
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+/// Decode ETI bytes to raw s16le PCM for all DAB+ services using faad2 with explicit options.
+#[cfg(feature = "wasm-faad2")]
+#[wasm_bindgen(js_name = "decodeEtiToFaadAllServicesMemoryWithOptions")]
+pub fn decode_eti_to_faad_all_services_memory_with_options_js(
+    eti_bytes: &[u8],
+    options: &WasmAllServicesDecodeOptionsJs,
+) -> std::result::Result<WasmAllServicesFaadDecodeOutputJs, JsValue> {
+    let decoded_options = WasmAllServicesDecodeOptions::try_from(options)
+        .map_err(|e| JsValue::from_str(&format!("invalid all-services options: {}", e)))?;
+
+    decode_eti_to_faad_all_services_memory_with_options(eti_bytes, &decoded_options)
+        .map(|inner| WasmAllServicesFaadDecodeOutputJs { inner })
         .map_err(|e| JsValue::from_str(&e.to_string()))
 }

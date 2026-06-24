@@ -128,9 +128,11 @@ WASM memory API (wasm32 + `wasm-runtime`):
   - `decode_eti_to_adts_all_services_memory_with_options`
   - `decode_eti_to_faad_memory` (`wasm-faad2` only)
   - `decode_eti_to_faad_memory_with_options` (`wasm-faad2` only)
+  - `decode_eti_to_faad_all_services_memory` (`wasm-faad2` only)
+  - `decode_eti_to_faad_all_services_memory_with_options` (`wasm-faad2` only)
 - wasm-bindgen exports: `src/wasm/bindings.rs`
-  - functions: `decodeEtiToLatmMemory`, `decodeEtiToLatmMemoryWithOptions`, `decodeEtiToLatmAllServicesMemory`, `decodeEtiToLatmAllServicesMemoryWithOptions`, `decodeEtiToAdtsMemory`, `decodeEtiToAdtsMemoryWithOptions`, `decodeEtiToAdtsAllServicesMemory`, `decodeEtiToAdtsAllServicesMemoryWithOptions`, `decodeEtiToFaadMemory` (`wasm-faad2` only), `decodeEtiToFaadMemoryWithOptions` (`wasm-faad2` only), `dabctlVersion`
-  - classes: `WasmLatmDecodeOptions`, `WasmAllServicesDecodeOptions`, `WasmLatmDecodeOutput`, `WasmLatmServiceOutput`, `WasmAllServicesLatmDecodeOutput`, `WasmAdtsDecodeOutput`, `WasmAdtsServiceOutput`, `WasmAllServicesAdtsDecodeOutput`, `WasmFaadDecodeOutput` (`wasm-faad2` only)
+  - functions: `decodeEtiToLatmMemory`, `decodeEtiToLatmMemoryWithOptions`, `decodeEtiToLatmAllServicesMemory`, `decodeEtiToLatmAllServicesMemoryWithOptions`, `decodeEtiToAdtsMemory`, `decodeEtiToAdtsMemoryWithOptions`, `decodeEtiToAdtsAllServicesMemory`, `decodeEtiToAdtsAllServicesMemoryWithOptions`, `decodeEtiToFaadMemory` (`wasm-faad2` only), `decodeEtiToFaadMemoryWithOptions` (`wasm-faad2` only), `decodeEtiToFaadAllServicesMemory` (`wasm-faad2` only), `decodeEtiToFaadAllServicesMemoryWithOptions` (`wasm-faad2` only), `dabctlVersion`
+  - classes: `WasmLatmDecodeOptions`, `WasmAllServicesDecodeOptions`, `WasmLatmDecodeOutput`, `WasmLatmServiceOutput`, `WasmAllServicesLatmDecodeOutput`, `WasmAdtsDecodeOutput`, `WasmAdtsServiceOutput`, `WasmAllServicesAdtsDecodeOutput`, `WasmFaadDecodeOutput` (`wasm-faad2` only), `WasmFaadServiceOutput` (`wasm-faad2` only), `WasmAllServicesFaadDecodeOutput` (`wasm-faad2` only)
 - Returned payloads:
   - `latm_bytes`: concatenated LOAS/LATM bytes (stdout-equivalent)
   - `adts_bytes`: concatenated ADTS bytes (stdout-equivalent)
