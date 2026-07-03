@@ -152,6 +152,11 @@ impl AacDecoder {
     /// Initialize the backend with the DAB+ superframe format.
     /// Must be called before decode(). Safe to call multiple times (idempotent).
     pub fn init_format(&mut self, fmt: &SuperframeFormat) -> bool {
+        // Always refresh runtime format parameters so channel/sample layout can
+        // recover after transient resync glitches.
+        self.channels = fmt.core_ch_config() as usize;
+        self.output_samples_per_au = expected_output_samples_per_au(fmt);
+
         if self.initialized {
             return true;
         }
@@ -171,8 +176,6 @@ impl AacDecoder {
         };
         if ok {
             self.initialized = true;
-            self.channels = fmt.core_ch_config() as usize;
-            self.output_samples_per_au = expected_output_samples_per_au(fmt);
         }
         ok
     }
