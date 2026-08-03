@@ -20,6 +20,7 @@ jobs:
 
     env:
       LIBFEC_WASM_LIB_DIR: third_party/libfec/wasm
+      LIBFAAD_WASM_LIB_DIR: third_party/libfaad/wasm
 
     steps:
       - uses: actions/checkout@v4
@@ -61,6 +62,12 @@ jobs:
             --target web \
             --out-dir "pkg-${VARIANT}" \
             --out-name dabctl
+
+      - name: Verify FAAD bindgen exports
+        if: matrix.variant == 'faad2'
+        run: |
+          grep -q "decodeFaadServiceBySid" pkg-faad2/dabctl.d.ts
+          grep -q "decodeFaadServiceBySidWithOptions" pkg-faad2/dabctl.d.ts
 
       - name: Package wasm artifacts
         env:
