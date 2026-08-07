@@ -74,6 +74,8 @@ pub enum EtiError {
     #[allow(dead_code)]
     #[error("invalid FSYNC bytes: {0:02x} {1:02x} {2:02x}")]
     InvalidFsync(u8, u8, u8),
+    #[error("invalid ETI header CRC: expected {expected:04x}, got {got:04x}")]
+    HeaderCrcMismatch { expected: u16, got: u16 },
     #[error("unsupported mode: {0}")]
     UnsupportedMode(u8),
     #[error("io error: {0}")]
@@ -171,7 +173,14 @@ pub fn parse_frame(raw: &[u8]) -> Result<EtiFrame<'_>, EtiError> {
     // EOH: MNSC (2 bytes) + HCRC (2 bytes)
     let eoh_start = stc_start + stc_bytes;
     let mnsc = ((raw[eoh_start] as u16) << 8) | raw[eoh_start + 1] as u16;
-    // HCRC at eoh_start+2 (not verified here but available)
+    let header_crc_stored = ((raw[eoh_start + 2] as u16) << 8) | raw[eoh_start + 3] as u16;
+    let header_crc_calced = crc16_ccitt(&raw[4..eoh_start + 2]);
+    if header_crc_stored != header_crc_calced {
+        return Err(EtiError::HeaderCrcMismatch {
+            expected: header_crc_calced,
+            got: header_crc_stored,
+        });
+    }
 
     // MST starts after EOH
     let mst_start = eoh_start + 4;
@@ -219,6 +228,21 @@ pub fn parse_frame(raw: &[u8]) -> Result<EtiFrame<'_>, EtiError> {
         fic,
         streams,
     })
+}
+
+fn crc16_ccitt(data: &[u8]) -> u16 {
+    let mut crc: u16 = 0xFFFF;
+    for &byte in data {
+        crc ^= (byte as u16) << 8;
+        for _ in 0..8 {
+            if crc & 0x8000 != 0 {
+                crc = (crc << 1) ^ 0x1021;
+            } else {
+                crc <<= 1;
+            }
+        }
+    }
+    crc ^ 0xFFFF
 }
 
 #[cfg(test)]
@@ -271,6 +295,9 @@ mod tests {
         for i in 0..stream_size {
             frame[mst_start + fic_size + i] = 0xA5;
         }
+        let header_crc = crc16_ccitt(&frame[4..eoh_start + 2]);
+        frame[eoh_start + 2] = (header_crc >> 8) as u8;
+        frame[eoh_start + 3] = (header_crc & 0xff) as u8;
         frame
     }
 
