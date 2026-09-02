@@ -23,7 +23,7 @@ pub(crate) struct EtiStep<'a> {
 }
 
 enum ScanDecision {
-    EmitAligned,
+    EmitAligned(usize),
     BadFrame,
     NeedMore,
 }
@@ -110,7 +110,10 @@ impl EtiFrameReader {
             }?;
 
             match decision {
-                ScanDecision::EmitAligned => {
+                ScanDecision::EmitAligned(offset) => {
+                    if offset > 0 {
+                        self.pending.drain(..offset);
+                    }
                     self.copy_front_frame(frame_buf);
                     let frame = match parse_frame(frame_buf) {
                         Ok(frame) => frame,
@@ -158,60 +161,59 @@ impl EtiFrameReader {
             return Ok(ScanDecision::BadFrame);
         }
 
-        Ok(ScanDecision::EmitAligned)
+        Ok(ScanDecision::EmitAligned(0))
     }
 
     fn scan_resync_step(&mut self) -> Result<ScanDecision> {
-        enum ResyncResult {
-            NeedMore,
-            EmitAligned([u8; 3]),
-        }
+        let pending = self.pending.make_contiguous();
+        let max_offset = pending.len().saturating_sub(ETI_FRAME_SIZE);
 
-        let result = {
-            let pending = self.pending.make_contiguous();
-            match parse_frame(&pending[..ETI_FRAME_SIZE]) {
-                Ok(candidate) => {
-                    let fsync = [pending[1], pending[2], pending[3]];
+        for offset in 0..=max_offset {
+            let window = &pending[offset..offset + ETI_FRAME_SIZE];
+            let candidate = match parse_frame(window) {
+                Ok(frame) => frame,
+                Err(_) => continue,
+            };
 
-                    if self.eof && pending.len() < ETI_FRAME_SIZE * 2 {
-                        ResyncResult::EmitAligned(fsync)
-                    } else if pending.len() < ETI_FRAME_SIZE * 2 {
-                        ResyncResult::NeedMore
-                    } else {
-                        let next_fsync = [
-                            pending[ETI_FRAME_SIZE + 1],
-                            pending[ETI_FRAME_SIZE + 2],
-                            pending[ETI_FRAME_SIZE + 3],
-                        ];
-                        let second_fct =
-                            match parse_frame(&pending[ETI_FRAME_SIZE..ETI_FRAME_SIZE * 2]) {
-                                Ok(frame) => frame.fct,
-                                Err(_) => return Ok(ScanDecision::NeedMore),
-                            };
-                        let fsync_b = [!fsync[0], !fsync[1], !fsync[2]];
-                        if next_fsync == fsync_b && second_fct == candidate.fct.wrapping_add(1) {
-                            ResyncResult::EmitAligned(fsync)
-                        } else {
-                            ResyncResult::NeedMore
-                        }
-                    }
-                }
-                Err(_) => ResyncResult::NeedMore,
-            }
-        };
+            let fsync = [
+                pending[offset + 1],
+                pending[offset + 2],
+                pending[offset + 3],
+            ];
 
-        match result {
-            ResyncResult::EmitAligned(fsync) => {
+            if self.eof && pending.len() - offset < ETI_FRAME_SIZE * 2 {
                 self.fsync_state.reset();
                 self.fsync_state.check(fsync);
                 self.synced = true;
-                Ok(ScanDecision::EmitAligned)
+                return Ok(ScanDecision::EmitAligned(offset));
             }
-            ResyncResult::NeedMore => {
-                self.pending.pop_front();
-                Ok(ScanDecision::NeedMore)
+
+            if pending.len() - offset < ETI_FRAME_SIZE * 2 {
+                break;
+            }
+
+            let next_offset = offset + ETI_FRAME_SIZE;
+            let next_fsync = [
+                pending[next_offset + 1],
+                pending[next_offset + 2],
+                pending[next_offset + 3],
+            ];
+            let second_fct = match parse_frame(&pending[next_offset..next_offset + ETI_FRAME_SIZE])
+            {
+                Ok(frame) => frame.fct,
+                Err(_) => continue,
+            };
+            let fsync_b = [!fsync[0], !fsync[1], !fsync[2]];
+            if next_fsync == fsync_b && second_fct == candidate.fct.wrapping_add(1) {
+                self.fsync_state.reset();
+                self.fsync_state.check(fsync);
+                self.synced = true;
+                return Ok(ScanDecision::EmitAligned(offset));
             }
         }
+
+        self.pending.pop_front();
+        Ok(ScanDecision::NeedMore)
     }
 
     fn fill_pending(&mut self, reader: &mut impl Read) -> Result<()> {
@@ -314,6 +316,26 @@ mod tests {
 
         let second = reader.read_step(&mut cursor, &mut frame_buf).unwrap();
         assert_eq!(second.status(), EtiStepStatus::Eof);
+    }
+
+    #[test]
+    fn resync_handles_prefix_before_first_valid_frame() {
+        let mut reader = EtiFrameReader::new();
+        let mut input = vec![0x55u8; 2048];
+        input.extend(load_fixture_frame(0));
+        input.extend(load_fixture_frame(1));
+        let mut cursor = Cursor::new(input);
+        let mut frame_buf = vec![0u8; ETI_FRAME_SIZE];
+
+        let first = reader.read_step(&mut cursor, &mut frame_buf).unwrap();
+        assert_eq!(first.status(), EtiStepStatus::Frame);
+        let _ = first.into_frame().unwrap();
+        assert_eq!(reader.frame_count(), 1);
+
+        let second = reader.read_step(&mut cursor, &mut frame_buf).unwrap();
+        assert_eq!(second.status(), EtiStepStatus::Frame);
+        let _ = second.into_frame().unwrap();
+        assert_eq!(reader.frame_count(), 2);
     }
 
     #[test]

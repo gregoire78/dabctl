@@ -34,9 +34,20 @@ impl MetadataEmitter {
     /// FD 3 must be opened by the shell before dabctl starts (e.g. `3>meta.json`).
     #[cfg(not(target_arch = "wasm32"))]
     pub fn open() -> anyhow::Result<Self> {
+        // Guard against invalid/closed FD 3 before taking ownership.
+        let fd = 3;
+        let rc = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if rc == -1 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EBADF) {
+                anyhow::bail!("fd3 metadata emitter is not available: fd 3 is not open");
+            }
+            return Err(err.into());
+        }
+
         // SAFETY: FD 3 is expected to be opened by the shell before dabctl starts.
-        // We don't own the fd's lifetime – we just wrap it.
-        let writer = unsafe { std::fs::File::from_raw_fd(3) };
+        // We take ownership only after validating the descriptor is still valid.
+        let writer = unsafe { std::fs::File::from_raw_fd(fd) };
         Ok(Self { writer })
     }
 
@@ -183,5 +194,11 @@ mod tests {
         assert!(s.contains("\"utc\""));
         assert!(s.contains("\"local\""));
         assert!(s.contains("\"lto\""));
+    }
+
+    #[test]
+    fn test_metadata_fd3_missing_is_graceful() {
+        let _ = unsafe { libc::close(3) };
+        assert!(super::MetadataEmitter::open().is_err());
     }
 }

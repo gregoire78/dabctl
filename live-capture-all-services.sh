@@ -11,7 +11,7 @@
 
 set -e
 
-ETI_FILE="${1:-multiplex.eti}"
+ETI_FILE="${1:-8C-20260902-081801.part0002.eti}"
 OUT_DIR="all-services"
 DATETIME_LOCALE="${DATETIME_LOCALE:-fr_FR.UTF-8}"
 

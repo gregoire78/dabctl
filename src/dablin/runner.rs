@@ -82,6 +82,105 @@ struct ServiceDumpContext {
 }
 
 const OUTPUT_SAMPLE_RATE_HZ: u32 = 48_000;
+const LIST_SERVICES_STABLE_FIC_FRAMES: u32 = 500;
+
+#[derive(Debug, Eq, PartialEq)]
+struct ListServiceSnapshot {
+    sid: u32,
+    label: Option<String>,
+    component_subch_ids: Vec<u8>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ListServicesSnapshot {
+    ensemble_eid: u16,
+    ensemble_label: Option<String>,
+    services: Vec<ListServiceSnapshot>,
+    dabplus_subch_ids: Vec<u8>,
+    subchannel_protection: Vec<(u8, String)>,
+}
+
+impl ListServicesSnapshot {
+    fn from_fic(fic: &FicDecoder) -> Self {
+        let mut services = fic
+            .services
+            .iter()
+            .map(|service| {
+                let mut component_subch_ids: Vec<u8> = service
+                    .components
+                    .iter()
+                    .map(|component| component.subch_id)
+                    .collect();
+                component_subch_ids.sort_unstable();
+                ListServiceSnapshot {
+                    sid: service.sid,
+                    label: service.label.clone(),
+                    component_subch_ids,
+                }
+            })
+            .collect::<Vec<_>>();
+        services.sort_by_key(|service| service.sid);
+
+        let mut dabplus_subch_ids = fic.dabplus_subch_ids.clone();
+        dabplus_subch_ids.sort_unstable();
+
+        let mut subchannel_protection = fic
+            .subchannels
+            .iter()
+            .map(|subchannel| {
+                (
+                    subchannel.subch_id,
+                    protection_label(&subchannel.protection),
+                )
+            })
+            .collect::<Vec<_>>();
+        subchannel_protection.sort_by_key(|(subch_id, _)| *subch_id);
+
+        Self {
+            ensemble_eid: fic.ensemble.eid,
+            ensemble_label: fic.ensemble.label.clone(),
+            services,
+            dabplus_subch_ids,
+            subchannel_protection,
+        }
+    }
+}
+
+struct ListServicesStability {
+    inventory: Option<ListServicesSnapshot>,
+    unchanged_fic_frames: u32,
+}
+
+impl ListServicesStability {
+    fn new() -> Self {
+        Self {
+            inventory: None,
+            unchanged_fic_frames: 0,
+        }
+    }
+
+    fn observe(&mut self, fic: &FicDecoder) -> bool {
+        let inventory = ListServicesSnapshot::from_fic(fic);
+        if inventory.services.is_empty() {
+            self.inventory = None;
+            self.unchanged_fic_frames = 0;
+            return false;
+        }
+
+        if self.inventory.as_ref() == Some(&inventory) {
+            self.unchanged_fic_frames = self.unchanged_fic_frames.saturating_add(1);
+        } else {
+            self.inventory = Some(inventory);
+            self.unchanged_fic_frames = 0;
+        }
+
+        self.unchanged_fic_frames >= LIST_SERVICES_STABLE_FIC_FRAMES
+    }
+}
+
+fn should_print_discovered_services(fic: &FicDecoder) -> bool {
+    !fic.services.is_empty()
+}
 
 /// Initialize the tracing logger on stderr unless `silent` is set.
 fn init_logger(silent: bool) {
@@ -347,7 +446,7 @@ fn run_list_services(reader: &mut CommandReader, running: &CommandRuntime) -> Re
     let mut fic = FicDecoder::new();
     let mut frame_reader = EtiFrameReader::new();
     let mut frame_buf = vec![0u8; ETI_FRAME_SIZE];
-    let mut list_services_frames: u32 = 0;
+    let mut stability = ListServicesStability::new();
 
     loop {
         if !running.load(Ordering::Relaxed) {
@@ -372,17 +471,15 @@ fn run_list_services(reader: &mut CommandReader, running: &CommandRuntime) -> Re
 
         if frame.ficf && !frame.fic.is_empty() {
             fic.process_fic(frame.fic);
-        }
-
-        if !fic.services.is_empty() {
-            let all_known =
-                fic.ensemble.label.is_some() && fic.services.iter().all(|s| s.label.is_some());
-            if all_known || list_services_frames >= 500 {
+            if stability.observe(&fic) {
                 print_services(&fic);
                 return Ok(());
             }
-            list_services_frames += 1;
         }
+    }
+
+    if should_print_discovered_services(&fic) {
+        print_services(&fic);
     }
 
     Ok(())
@@ -532,17 +629,77 @@ mod tests {
     #[cfg(feature = "latm-only")]
     use super::enforce_latm_only_constraints;
     use super::meta_helpers::{save_slide_file, should_emit_slide_metadata};
-    use super::service_dir_name;
+    use super::{service_dir_name, should_print_discovered_services, ListServicesStability};
     #[cfg(feature = "latm-only")]
     use crate::cli::{
         AacDecoder, AacGap, AllServicesOutArgs, AudioOut, DablinCommand, ListServicesArgs,
         OneServiceOutArgs,
     };
+    use crate::dablin::fic::{FicDecoder, ServiceInfo};
     use crate::dablin::shared::{
         audio_codec_label, audio_mode_label, current_subchannel_protection, encode_slide_base64,
         hash_bytes, protection_label,
     };
     use std::path::Path;
+
+    #[test]
+    fn list_services_waits_for_a_stable_inventory() {
+        let mut fic = FicDecoder::new();
+        fic.services.push(ServiceInfo {
+            sid: 0xf201,
+            label: Some("FRANCE INTER".to_string()),
+            components: Vec::new(),
+        });
+
+        let mut stability = ListServicesStability::new();
+        assert!(!stability.observe(&fic));
+
+        for _ in 0..499 {
+            assert!(!stability.observe(&fic));
+        }
+        assert!(stability.observe(&fic));
+    }
+
+    #[test]
+    fn list_services_resets_stability_when_inventory_grows() {
+        let mut fic = FicDecoder::new();
+        fic.services.push(ServiceInfo {
+            sid: 0xf201,
+            label: Some("FRANCE INTER".to_string()),
+            components: Vec::new(),
+        });
+
+        let mut stability = ListServicesStability::new();
+        assert!(!stability.observe(&fic));
+        for _ in 0..100 {
+            assert!(!stability.observe(&fic));
+        }
+
+        fic.services.push(ServiceInfo {
+            sid: 0xf202,
+            label: Some("FRANCE CULTURE".to_string()),
+            components: Vec::new(),
+        });
+        assert!(!stability.observe(&fic));
+
+        for _ in 0..499 {
+            assert!(!stability.observe(&fic));
+        }
+        assert!(stability.observe(&fic));
+    }
+
+    #[test]
+    fn list_services_prints_partial_inventory_at_end_of_input() {
+        let mut fic = FicDecoder::new();
+        assert!(!should_print_discovered_services(&fic));
+
+        fic.services.push(ServiceInfo {
+            sid: 0xf201,
+            label: None,
+            components: Vec::new(),
+        });
+        assert!(should_print_discovered_services(&fic));
+    }
 
     #[test]
     fn service_dir_name_with_label() {
