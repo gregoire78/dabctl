@@ -1,6 +1,6 @@
 [package]
 name = "dabctl"
-version = "4.6.6"
+version = "4.6.7"
 edition = "2021"
 authors = ["gregoire78"]
 
