@@ -13,15 +13,17 @@ use crate::cli::DateTimeFormat;
 use crate::dablin::audio::adts::AdtsPacker;
 use crate::dablin::audio::latm::LatmPacker;
 use crate::dablin::dabplus::{process_superframe_inplace, SuperframeFormat};
-use crate::dablin::eti::{parse_frame, EtiFrame, ETI_FRAME_SIZE};
+use crate::dablin::eti::{EtiFrame, ETI_FRAME_SIZE};
 use crate::dablin::fic::{FicDecoder, ServiceInfo};
 use crate::dablin::msc::{extract_subchannel, SubchannelBuffer};
 use crate::dablin::pad::PadDecoder;
+use crate::dablin::runner::frame_loop::{EtiFrameReader, EtiStep, EtiStepStatus};
 use crate::dablin::shared::{
     audio_codec_label, audio_mode_label, current_subchannel_protection, datetime_mode_from_option,
     encode_slide_base64, hash_bytes, DateTimeMode,
 };
 use std::collections::BTreeMap;
+use std::io::Cursor;
 
 #[cfg(feature = "wasm-faad2")]
 use crate::cli::AacGap;
@@ -692,9 +694,18 @@ fn decode_eti_to_all_services_memory_with_options_generic<C, O>(
     let mut contexts: BTreeMap<u32, C> = BTreeMap::new();
     let datetime_mode = datetime_mode_from_option(options.datetime_format.as_ref());
 
-    for raw in eti_bytes.chunks_exact(ETI_FRAME_SIZE) {
-        let Ok(frame) = parse_frame(raw) else {
-            continue;
+    let mut cursor = Cursor::new(eti_bytes);
+    let mut frame_reader = EtiFrameReader::new();
+    let mut frame_buf = vec![0u8; ETI_FRAME_SIZE];
+
+    loop {
+        let step: EtiStep = frame_reader.read_step(&mut cursor, &mut frame_buf)?;
+        let frame = match step.status() {
+            EtiStepStatus::Eof => break,
+            EtiStepStatus::BadFrame => continue,
+            EtiStepStatus::Frame => step
+                .into_frame()
+                .expect("EtiStepStatus::Frame must carry parsed frame"),
         };
 
         if frame.ficf && !frame.fic.is_empty() {
@@ -1192,9 +1203,18 @@ pub fn decode_eti_to_latm_memory_with_options(
     let mut pad_decoder = PadDecoder::new();
     let mut sf_work_buf: Vec<u8> = Vec::new();
 
-    for raw in eti_bytes.chunks_exact(ETI_FRAME_SIZE) {
-        let Ok(frame) = parse_frame(raw) else {
-            continue;
+    let mut cursor = Cursor::new(eti_bytes);
+    let mut frame_reader = EtiFrameReader::new();
+    let mut frame_buf = vec![0u8; ETI_FRAME_SIZE];
+
+    loop {
+        let step: EtiStep = frame_reader.read_step(&mut cursor, &mut frame_buf)?;
+        let frame = match step.status() {
+            EtiStepStatus::Eof => break,
+            EtiStepStatus::BadFrame => continue,
+            EtiStepStatus::Frame => step
+                .into_frame()
+                .expect("EtiStepStatus::Frame must carry parsed frame"),
         };
 
         if frame.ficf && !frame.fic.is_empty() {
@@ -1398,9 +1418,18 @@ pub fn decode_eti_to_adts_memory_with_options(
     let mut pad_decoder = PadDecoder::new();
     let mut sf_work_buf: Vec<u8> = Vec::new();
 
-    for raw in eti_bytes.chunks_exact(ETI_FRAME_SIZE) {
-        let Ok(frame) = parse_frame(raw) else {
-            continue;
+    let mut cursor = Cursor::new(eti_bytes);
+    let mut frame_reader = EtiFrameReader::new();
+    let mut frame_buf = vec![0u8; ETI_FRAME_SIZE];
+
+    loop {
+        let step: EtiStep = frame_reader.read_step(&mut cursor, &mut frame_buf)?;
+        let frame = match step.status() {
+            EtiStepStatus::Eof => break,
+            EtiStepStatus::BadFrame => continue,
+            EtiStepStatus::Frame => step
+                .into_frame()
+                .expect("EtiStepStatus::Frame must carry parsed frame"),
         };
 
         if frame.ficf && !frame.fic.is_empty() {
@@ -1572,9 +1601,18 @@ pub fn decode_eti_to_faad_memory_with_options(
     let mut pad_decoder = PadDecoder::new();
     let mut sf_work_buf: Vec<u8> = Vec::new();
 
-    for raw in eti_bytes.chunks_exact(ETI_FRAME_SIZE) {
-        let Ok(frame) = parse_frame(raw) else {
-            continue;
+    let mut cursor = Cursor::new(eti_bytes);
+    let mut frame_reader = EtiFrameReader::new();
+    let mut frame_buf = vec![0u8; ETI_FRAME_SIZE];
+
+    loop {
+        let step: EtiStep = frame_reader.read_step(&mut cursor, &mut frame_buf)?;
+        let frame = match step.status() {
+            EtiStepStatus::Eof => break,
+            EtiStepStatus::BadFrame => continue,
+            EtiStepStatus::Frame => step
+                .into_frame()
+                .expect("EtiStepStatus::Frame must carry parsed frame"),
         };
 
         if frame.ficf && !frame.fic.is_empty() {
@@ -1952,5 +1990,17 @@ mod tests {
             .metadata_jsonl
             .iter()
             .any(|line| line.contains("\"service\""))));
+    }
+
+    // Regression: real-world captures aren't always frame-aligned from byte 0
+    // (e.g. split/partial recordings); decode must resync like the native reader.
+    #[test]
+    #[ignore]
+    fn decode_all_services_metadata_handles_misaligned_real_capture() {
+        let eti = fs::read("test-local/8C-20260901-175501.part0002.eti")
+            .expect("repro fixture ETI must exist");
+        let out = decode_eti_to_all_services_memory(&eti)
+            .expect("all-services metadata decode should succeed on a real capture");
+        assert!(!out.services.is_empty());
     }
 }

@@ -22,7 +22,7 @@ use tracing::{debug, info, warn};
 
 mod all_services_helpers;
 mod command_helpers;
-mod frame_loop;
+pub(crate) mod frame_loop;
 mod meta_helpers;
 mod one_service_helpers;
 mod output;

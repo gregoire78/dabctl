@@ -183,10 +183,11 @@ impl EtiFrameReader {
                             pending[ETI_FRAME_SIZE + 2],
                             pending[ETI_FRAME_SIZE + 3],
                         ];
-                        let second_fct = match parse_frame(&pending[ETI_FRAME_SIZE..ETI_FRAME_SIZE * 2]) {
-                            Ok(frame) => frame.fct,
-                            Err(_) => return Ok(ScanDecision::NeedMore),
-                        };
+                        let second_fct =
+                            match parse_frame(&pending[ETI_FRAME_SIZE..ETI_FRAME_SIZE * 2]) {
+                                Ok(frame) => frame.fct,
+                                Err(_) => return Ok(ScanDecision::NeedMore),
+                            };
                         let fsync_b = [!fsync[0], !fsync[1], !fsync[2]];
                         if next_fsync == fsync_b && second_fct == candidate.fct.wrapping_add(1) {
                             ResyncResult::EmitAligned(fsync)
