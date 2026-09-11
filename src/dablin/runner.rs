@@ -54,6 +54,7 @@ use crate::dablin::runner::one_service_helpers::{
     maybe_process_fic_and_time, maybe_select_service_and_init, process_one_service_superframes,
     sync_one_service_metadata, FicTimeRuntime, OneServiceInitRuntime, OneServiceMetadataState,
     OneServicePadState, OneServiceSelectionState, OneServiceSuperframeRuntime,
+    OneServiceSuperframeState,
 };
 use crate::dablin::shared::{datetime_mode_from_option, protection_label};
 use crate::dablin::utils::path::sanitize_for_path;
@@ -312,6 +313,9 @@ fn run_one_service(
         emitted_audio_format: None,
         emitted_subchannel_protection: None,
     };
+    let mut superframe_state = OneServiceSuperframeState {
+        latm_stereo_hold_remaining: 0,
+    };
     let datetime_mode = datetime_mode_from_option(args.datetime_format.as_ref());
 
     let mut aac: Option<AacDecoder> = None;
@@ -414,6 +418,7 @@ fn run_one_service(
             sf_work_buf: &mut sf_work_buf,
             aac: &mut aac,
             metadata_state: &mut metadata_state,
+            superframe_state: &mut superframe_state,
             meta: &mut meta,
             pad_decoder: &mut pad_decoder,
             slide_dir,

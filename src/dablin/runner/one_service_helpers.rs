@@ -19,10 +19,12 @@ use crate::dablin::runner::pad_helpers::emit_one_service_pad_events;
 use crate::dablin::runner::superframe_helpers::{
     apply_superframe_action, classify_superframe_action, decode_next_superframe,
     handle_non_decodable_superframe, maybe_update_emitted_audio_format,
-    process_au_with_pad_and_pcm, process_pad_au, resolve_mot_app_type, write_raw_au_or_exit,
-    SuperframeAction,
+    process_au_with_pad_and_pcm, process_pad_au, resolve_mot_app_type,
+    select_raw_aac_output_format, write_raw_au_or_exit, SuperframeAction,
 };
 use crate::dablin::shared::{current_subchannel_protection, DateTimeMode};
+
+const LATM_STEREO_HOLD_SUPERFRAMES_AFTER_CORRUPT: u8 = 5;
 
 pub(super) struct OneServiceSelectionState {
     pub(super) selected_scid: Option<u8>,
@@ -39,6 +41,10 @@ pub(super) struct OneServiceMetadataState {
     pub(super) emitted_time: Option<(String, String, String)>,
     pub(super) emitted_audio_format: Option<SuperframeFormat>,
     pub(super) emitted_subchannel_protection: Option<String>,
+}
+
+pub(super) struct OneServiceSuperframeState {
+    pub(super) latm_stereo_hold_remaining: u8,
 }
 
 pub(super) struct OneServicePadState {
@@ -69,6 +75,7 @@ pub(super) struct OneServiceSuperframeRuntime<'a, W: Write> {
     pub(super) sf_work_buf: &'a mut Vec<u8>,
     pub(super) aac: &'a mut Option<AacDecoder>,
     pub(super) metadata_state: &'a mut OneServiceMetadataState,
+    pub(super) superframe_state: &'a mut OneServiceSuperframeState,
     pub(super) meta: &'a mut Option<MetadataEmitter>,
     pub(super) pad_decoder: &'a mut PadDecoder,
     pub(super) slide_dir: Option<&'a Path>,
@@ -273,17 +280,35 @@ pub(super) fn process_one_service_superframes<W: Write>(
         }
 
         if action != SuperframeAction::DecodeUnits {
-            let closed = handle_non_decodable_superframe(
-                runtime.buf,
-                runtime.aac.as_ref(),
-                action,
-                |pcm| {
-                    Ok(matches!(
-                        write_pcm_or_exit(runtime.out, pcm, runtime.pcm_write_scratch)?,
-                        WriteOutcome::Closed
-                    ))
-                },
-            )?;
+            let closed = match runtime.args.audio_out {
+                AudioOut::Latm => {
+                    runtime.superframe_state.latm_stereo_hold_remaining =
+                        LATM_STEREO_HOLD_SUPERFRAMES_AFTER_CORRUPT;
+                    handle_non_decodable_superframe(
+                        runtime.buf,
+                        runtime.aac.as_ref(),
+                        action,
+                        |_| Ok(false),
+                    )?
+                }
+                AudioOut::Pcm => handle_non_decodable_superframe(
+                    runtime.buf,
+                    runtime.aac.as_ref(),
+                    action,
+                    |pcm| {
+                        Ok(matches!(
+                            write_pcm_or_exit(runtime.out, pcm, runtime.pcm_write_scratch)?,
+                            WriteOutcome::Closed
+                        ))
+                    },
+                )?,
+                AudioOut::Adts => handle_non_decodable_superframe(
+                    runtime.buf,
+                    runtime.aac.as_ref(),
+                    action,
+                    |_| Ok(false),
+                )?,
+            };
             if closed {
                 return Ok(true);
             }
@@ -296,9 +321,25 @@ pub(super) fn process_one_service_superframes<W: Write>(
             debug!("RS corrected {} codewords", result.rs_corrected);
         }
 
+        let raw_aac_output_format = select_raw_aac_output_format(
+            &runtime.args.audio_out,
+            runtime.superframe_state.latm_stereo_hold_remaining,
+            result.format.as_ref(),
+            runtime.metadata_state.emitted_audio_format.as_ref(),
+        );
+
+        if raw_aac_output_format
+            .as_ref()
+            .map(SuperframeFormat::core_ch_config)
+            != result.format.as_ref().map(SuperframeFormat::core_ch_config)
+            && runtime.superframe_state.latm_stereo_hold_remaining > 0
+        {
+            runtime.superframe_state.latm_stereo_hold_remaining -= 1;
+        }
+
         maybe_update_emitted_audio_format(
             &mut runtime.metadata_state.emitted_audio_format,
-            result.format.as_ref(),
+            raw_aac_output_format.as_ref(),
             |fmt| {
                 if let Some(aac_dec) = runtime.aac.as_mut() {
                     aac_dec.init_format(fmt);
@@ -329,7 +370,7 @@ pub(super) fn process_one_service_superframes<W: Write>(
                         runtime,
                         au,
                         mot_app_type,
-                        result.format.as_ref(),
+                        raw_aac_output_format.as_ref(),
                     )? {
                         return Ok(true);
                     }

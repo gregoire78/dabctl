@@ -105,6 +105,28 @@ pub(crate) fn maybe_update_emitted_audio_format(
     }
 }
 
+pub(crate) fn select_raw_aac_output_format(
+    audio_out: &AudioOut,
+    latm_stereo_hold_remaining: u8,
+    current_format: Option<&SuperframeFormat>,
+    last_emitted_format: Option<&SuperframeFormat>,
+) -> Option<SuperframeFormat> {
+    let current = current_format?;
+
+    if *audio_out == AudioOut::Latm
+        && latm_stereo_hold_remaining > 0
+        && current.core_ch_config() == 1
+        && last_emitted_format
+            .map(SuperframeFormat::core_ch_config)
+            .unwrap_or(0)
+            == 2
+    {
+        return last_emitted_format.cloned();
+    }
+
+    Some(current.clone())
+}
+
 pub(crate) fn resolve_mot_app_type(
     fic: &FicDecoder,
     sid: Option<u32>,
@@ -189,5 +211,66 @@ pub(crate) fn write_raw_au_or_exit<W: Write>(
             ))
         }
         AudioOut::Pcm => Ok(false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fmt_stereo() -> SuperframeFormat {
+        SuperframeFormat {
+            dac_rate: true,
+            sbr_flag: true,
+            aac_channel_mode: true,
+            ps_flag: false,
+            mpeg_surround_config: 0,
+        }
+    }
+
+    fn fmt_mono() -> SuperframeFormat {
+        SuperframeFormat {
+            dac_rate: true,
+            sbr_flag: false,
+            aac_channel_mode: false,
+            ps_flag: false,
+            mpeg_surround_config: 0,
+        }
+    }
+
+    #[test]
+    fn test_select_raw_aac_output_format_keeps_current_without_hold() {
+        let out = select_raw_aac_output_format(
+            &AudioOut::Latm,
+            0,
+            Some(&fmt_mono()),
+            Some(&fmt_stereo()),
+        )
+        .expect("format expected");
+        assert_eq!(out.core_ch_config(), 1);
+    }
+
+    #[test]
+    fn test_select_raw_aac_output_format_keeps_stereo_during_hold() {
+        let out = select_raw_aac_output_format(
+            &AudioOut::Latm,
+            5,
+            Some(&fmt_mono()),
+            Some(&fmt_stereo()),
+        )
+        .expect("format expected");
+        assert_eq!(out.core_ch_config(), 2);
+    }
+
+    #[test]
+    fn test_select_raw_aac_output_format_no_hold_for_adts() {
+        let out = select_raw_aac_output_format(
+            &AudioOut::Adts,
+            5,
+            Some(&fmt_mono()),
+            Some(&fmt_stereo()),
+        )
+        .expect("format expected");
+        assert_eq!(out.core_ch_config(), 1);
     }
 }

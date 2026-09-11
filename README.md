@@ -201,6 +201,7 @@ Notes:
 
 - `--aac-decoder` and `--aac-gap` apply only when `--audio-out pcm`.
 - With `--audio-out adts` or `--audio-out latm`, AAC is not decoded to PCM; AUs are emitted as framed AAC.
+- With `--audio-out latm`, on corrupted superframes the last emitted stereo signaling is held for a short bounded window (5 superframes) to reduce transient mono glitches.
 - In `latm-only` builds, `--audio-out` must be `latm`.
 
 ### ADTS output example
